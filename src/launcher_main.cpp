@@ -2297,6 +2297,15 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     EnableDpiAwareness();
 
+    // SHGetFileInfoW 等 Shell API 需要 STA COM 才能正确解析 .lnk 的自定义图标；
+    // 未初始化时图标索引会退回 0（系统默认空白文件图标）
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        MessageBoxW(nullptr, L"COM 初始化失败。", L"DesktopLauncher",
+                    MB_OK | MB_ICONERROR);
+        CloseHandle(mutex);
+        return 1;
+    }
+
     ULONG_PTR gdiplusToken = 0;
     GdiplusStartupInput gsi;
     if (GdiplusStartup(&gdiplusToken, &gsi, nullptr) != Ok) {
@@ -2355,6 +2364,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
 
     GdiplusShutdown(gdiplusToken);
+    CoUninitialize();
     CloseHandle(mutex);
     return static_cast<int>(msg.wParam);
 }
