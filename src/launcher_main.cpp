@@ -2045,258 +2045,21 @@ void ShowContextMenu(AppState& s, POINT client) {
     }
 }
 
-// ---------- OLE 文件 / Shell 对象拖入 ----------
+// ---------- 文件拖入 ----------
 
-CLIPFORMAT g_cfShellIdList = 0;
-
-struct ShellIdList {
-    UINT cidl;
-    UINT aoffset[1];
-};
-
-std::wstring GetShellShortcutDir() {
-    wchar_t appdata[MAX_PATH] = {};
-    const DWORD len = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) return L"";
-    std::wstring dir = appdata;
-    dir += L"\\MyWigets\\Launcher\\Shortcuts";
-    SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
-    return dir;
-}
-
-std::wstring MakeSafeFileName(const std::wstring& name) {
-    const std::wstring bad = L"\\/:*?\"<>|";
-    std::wstring safe;
-    for (wchar_t ch : name) {
-        if (ch < 32 || bad.find(ch) != std::wstring::npos) {
-            safe.push_back(L'_');
-        } else {
-            safe.push_back(ch);
-        }
-    }
-    while (!safe.empty() && (safe.back() == L' ' || safe.back() == L'.')) {
-        safe.pop_back();
-    }
-    if (safe.empty()) safe = L"项目";
-    if (safe.size() > 40) safe = safe.substr(0, 40);
-    return safe;
-}
-
-std::wstring BuildUniqueShortcutPath(const std::wstring& dir,
-                                     const std::wstring& baseName) {
-    for (int i = 0; i < 1000; ++i) {
-        std::wstring file = dir + L"\\" + baseName;
-        if (i > 0) file += L" (" + std::to_wstring(i + 1) + L")";
-        file += L".lnk";
-        const DWORD attr = GetFileAttributesW(file.c_str());
-        if (attr == INVALID_FILE_ATTRIBUTES &&
-            GetLastError() == ERROR_FILE_NOT_FOUND) {
-            return file;
-        }
-    }
-    return dir + L"\\" + baseName + L"_" +
-           std::to_wstring(GetTickCount64()) + L".lnk";
-}
-
-std::wstring CreateShellLinkForPidl(PCIDLIST_ABSOLUTE pidl) {
-    std::wstring name = L"项目";
-    PWSTR display = nullptr;
-    if (SUCCEEDED(SHGetNameFromIDList(pidl, SIGDN_NORMALDISPLAY, &display)) &&
-        display) {
-        name = display;
-        CoTaskMemFree(display);
-    }
-
-    const std::wstring dir = GetShellShortcutDir();
-    if (dir.empty()) return L"";
-
-    IShellLinkW* shellLink = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
-                                IID_IShellLinkW,
-                                reinterpret_cast<void**>(&shellLink)))) {
-        return L"";
-    }
-
-    shellLink->SetIDList(pidl);
-    IPersistFile* persist = nullptr;
-    if (FAILED(shellLink->QueryInterface(IID_IPersistFile,
-                                         reinterpret_cast<void**>(&persist)))) {
-        shellLink->Release();
-        return L"";
-    }
-
-    const std::wstring shortcutPath =
-        BuildUniqueShortcutPath(dir, MakeSafeFileName(name));
-    const HRESULT hr = persist->Save(shortcutPath.c_str(), TRUE);
-    persist->Release();
-    shellLink->Release();
-    return SUCCEEDED(hr) ? shortcutPath : L"";
-}
-
-void AddDroppedPidl(AppState& s, PCIDLIST_ABSOLUTE pidl) {
-    wchar_t path[MAX_PATH] = {};
-    if (SHGetPathFromIDListW(pidl, path) && path[0]) {
-        const std::wstring filePath = path;
-        if (IsAcceptableDrop(filePath)) {
-            AddAppSomewhere(s, filePath);
-            return;
-        }
-    }
-
-    // 虚拟 Shell 对象（此电脑、回收站等）没有文件路径：
-    // 自动生成一个指向该对象的 .lnk，再放入启动器
-    const std::wstring shortcut = CreateShellLinkForPidl(pidl);
-    if (!shortcut.empty()) {
-        AddAppSomewhere(s, shortcut);
-    }
-}
-
-// 返回 true 表示至少成功处理了一项（HDROP 未处理成功时上层应尝试 CF_SHELLIDLIST）
-bool ProcessHdrop(AppState& s, HDROP drop) {
+void HandleDroppedFiles(AppState& s, WPARAM wParam) {
+    HDROP drop = reinterpret_cast<HDROP>(wParam);
     const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
-    bool handled = false;
     for (UINT i = 0; i < count; ++i) {
         const UINT len = DragQueryFileW(drop, i, nullptr, 0);
         if (len == 0) continue;
         std::wstring path(len + 1, L'\0');
         DragQueryFileW(drop, i, &path[0], static_cast<UINT>(path.size()));
         while (!path.empty() && path.back() == L'\0') path.pop_back();
-
         if (IsAcceptableDrop(path)) {
             AddAppSomewhere(s, path);
-            handled = true;
-        } else if (path.compare(0, 2, L"::") == 0 ||
-                   path.compare(0, 8, L"shell:::") == 0) {
-            PIDLIST_ABSOLUTE pidl = nullptr;
-            if (SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &pidl,
-                                              0, nullptr)) && pidl) {
-                AddDroppedPidl(s, pidl);
-                ILFree(pidl);
-                handled = true;
-            }
         }
     }
-    return handled;
-}
-
-void ProcessShellIdList(AppState& s, IDataObject* data) {
-    if (!g_cfShellIdList) return;
-
-    FORMATETC fmt{};
-    fmt.cfFormat = g_cfShellIdList;
-    fmt.dwAspect = DVASPECT_CONTENT;
-    fmt.lindex = -1;
-    fmt.tymed = TYMED_HGLOBAL;
-    STGMEDIUM medium{};
-
-    if (FAILED(data->GetData(&fmt, &medium)) || !medium.hGlobal) return;
-
-    HGLOBAL hGlobal = medium.hGlobal;
-    auto* ida = static_cast<ShellIdList*>(GlobalLock(hGlobal));
-    if (ida && ida->cidl >= 1) {
-        const auto* bytes = reinterpret_cast<const BYTE*>(ida);
-        auto* parent = reinterpret_cast<PCIDLIST_ABSOLUTE>(
-            bytes + ida->aoffset[0]);
-        for (UINT i = 1; i < ida->cidl; ++i) {
-            auto* child = reinterpret_cast<PCUITEMID_CHILD>(
-                bytes + ida->aoffset[i]);
-            PIDLIST_ABSOLUTE full = ILCombine(parent, child);
-            if (full) {
-                AddDroppedPidl(s, full);
-                ILFree(full);
-            }
-        }
-        GlobalUnlock(hGlobal);
-    }
-
-    ReleaseStgMedium(&medium);
-}
-
-void ProcessDroppedDataObject(AppState& s, IDataObject* data) {
-    if (!data) return;
-
-    // 1) 普通文件：HDROP 已足够
-    FORMATETC hdropFmt{};
-    hdropFmt.cfFormat = CF_HDROP;
-    hdropFmt.dwAspect = DVASPECT_CONTENT;
-    hdropFmt.lindex = -1;
-    hdropFmt.tymed = TYMED_HGLOBAL;
-    STGMEDIUM medium{};
-    if (SUCCEEDED(data->GetData(&hdropFmt, &medium)) && medium.hGlobal) {
-        HDROP drop = static_cast<HDROP>(medium.hGlobal);
-        const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
-        if (count > 0) {
-            const bool handled = ProcessHdrop(s, drop);
-            ReleaseStgMedium(&medium);
-            // HDROP 里没有可解析的项（虚拟对象可能给出空路径/未知格式）：
-            // 继续尝试 CF_SHELLIDLIST，不要提前返回
-            if (handled) return;
-        } else {
-            ReleaseStgMedium(&medium);
-        }
-    }
-
-    // 2) 虚拟对象：此电脑 / 回收站 / 控制面板等
-    ProcessShellIdList(s, data);
-}
-
-class LauncherDropTarget : public IDropTarget {
-public:
-    void SetHwnd(HWND hwnd) { m_hwnd = hwnd; }
-
-    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
-        if (!ppv) return E_POINTER;
-        if (riid == IID_IUnknown || riid == IID_IDropTarget) {
-            *ppv = static_cast<IDropTarget*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-
-    STDMETHODIMP_(ULONG) AddRef() override { return 1; }
-    STDMETHODIMP_(ULONG) Release() override { return 1; }
-
-    STDMETHODIMP DragEnter(IDataObject*, DWORD, POINTL,
-                           DWORD* pdwEffect) override {
-        // 同时接受 COPY（文件）与 LINK（回收站/此电脑等虚拟 Shell 对象），
-        // 否则系统应用的拖放会被 Explorer 拒绝（效果位清零 -> Drop 不触发）
-        if (pdwEffect) *pdwEffect = DROPEFFECT_COPY | DROPEFFECT_LINK;
-        return S_OK;
-    }
-
-    STDMETHODIMP DragOver(DWORD, POINTL, DWORD* pdwEffect) override {
-        if (pdwEffect) *pdwEffect = DROPEFFECT_COPY | DROPEFFECT_LINK;
-        return S_OK;
-    }
-
-    STDMETHODIMP DragLeave() override { return S_OK; }
-
-    STDMETHODIMP Drop(IDataObject* data, DWORD, POINTL,
-                      DWORD* pdwEffect) override {
-        if (pdwEffect) *pdwEffect = DROPEFFECT_COPY | DROPEFFECT_LINK;
-        if (m_hwnd) {
-            auto* s = reinterpret_cast<AppState*>(
-                GetWindowLongPtrW(m_hwnd, GWLP_USERDATA));
-            if (s) {
-                ProcessDroppedDataObject(*s, data);
-                SavePages(*s);
-                DrawLauncher(*s);
-            }
-        }
-        return S_OK;
-    }
-
-private:
-    HWND m_hwnd = nullptr;
-};
-
-LauncherDropTarget g_dropTarget;
-
-void HandleDroppedFiles(AppState& s, WPARAM wParam) {
-    HDROP drop = reinterpret_cast<HDROP>(wParam);
-    ProcessHdrop(s, drop);
     DragFinish(drop);
     SavePages(s);
     DrawLauncher(s);
@@ -2341,11 +2104,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         MB_OK | MB_ICONERROR);
             return -1;
         }
-        if (!g_cfShellIdList) {
-            g_cfShellIdList = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_SHELLIDLIST));
-        }
-        g_dropTarget.SetHwnd(hwnd);
-        RegisterDragDrop(hwnd, &g_dropTarget);
+        DragAcceptFiles(hwnd, TRUE);
         SetTimer(hwnd, kDrawTimerId, kDrawIntervalMs, nullptr);
         DrawLauncher(*s);
         return 0;
@@ -2512,7 +2271,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_DESTROY:
         KillTimer(hwnd, kDrawTimerId);
-        RevokeDragDrop(hwnd);
         SavePosition(hwnd);
         if (s && s->renamingFolder) {
             CommitFolderRename(*s);
@@ -2538,13 +2296,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
 
     EnableDpiAwareness();
-
-    if (FAILED(OleInitialize(nullptr))) {
-        MessageBoxW(nullptr, L"OLE 初始化失败。", L"DesktopLauncher",
-                    MB_OK | MB_ICONERROR);
-        CloseHandle(mutex);
-        return 1;
-    }
 
     ULONG_PTR gdiplusToken = 0;
     GdiplusStartupInput gsi;
@@ -2604,7 +2355,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
 
     GdiplusShutdown(gdiplusToken);
-    OleUninitialize();
     CloseHandle(mutex);
     return static_cast<int>(msg.wParam);
 }
