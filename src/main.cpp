@@ -549,6 +549,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
+    case WM_WINDOWPOSCHANGING: {
+        // 防御：任何 Z 序变化都强制回到桌面层底部，防止覆盖普通窗口
+        auto* wp = reinterpret_cast<WINDOWPOS*>(lParam);
+        if ((wp->flags & SWP_NOZORDER) == 0 && wp->hwndInsertAfter != HWND_BOTTOM) {
+            wp->hwndInsertAfter = HWND_BOTTOM;
+            wp->flags |= SWP_NOACTIVATE;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
     case WM_NCHITTEST: {
         // 只有圆形表盘区域接收鼠标，四角完全“穿透”到桌面
         if (!s || s->width <= 0 || s->height <= 0) {

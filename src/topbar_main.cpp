@@ -855,6 +855,16 @@ LRESULT CALLBACK VolumePanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_NCHITTEST:
         return HTCLIENT;
 
+    case WM_WINDOWPOSCHANGING: {
+        // 防御：任何 Z 序变化都强制回到桌面层底部，防止覆盖普通窗口
+        auto* wp = reinterpret_cast<WINDOWPOS*>(lParam);
+        if ((wp->flags & SWP_NOZORDER) == 0 && wp->hwndInsertAfter != HWND_BOTTOM) {
+            wp->hwndInsertAfter = HWND_BOTTOM;
+            wp->flags |= SWP_NOACTIVATE;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
     case WM_MOUSEMOVE: {
         if (!s) {
             return 0;
@@ -1364,6 +1374,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_NCHITTEST:
         // 整条顶栏接收鼠标（顶栏在桌面层，点击不会覆盖/抢占任何窗口）
         return HTCLIENT;
+
+    case WM_WINDOWPOSCHANGING: {
+        // 防御：任何 Z 序变化都强制回到桌面层底部，防止覆盖普通窗口
+        auto* wp = reinterpret_cast<WINDOWPOS*>(lParam);
+        if ((wp->flags & SWP_NOZORDER) == 0 && wp->hwndInsertAfter != HWND_BOTTOM) {
+            wp->hwndInsertAfter = HWND_BOTTOM;
+            wp->flags |= SWP_NOACTIVATE;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
 
     case WM_MOUSEMOVE: {
         if (!s) {
