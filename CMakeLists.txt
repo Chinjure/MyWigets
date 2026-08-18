@@ -14,10 +14,11 @@ endif()
 
 add_executable(DesktopClock WIN32 src/main.cpp)
 add_executable(DesktopCalendar WIN32 src/calendar_main.cpp)
+add_executable(DesktopTopBar WIN32 src/topbar_main.cpp)
 add_executable(MyWigets WIN32 src/mywigets_main.cpp src/app.rc)
 add_executable(DesktopLauncher WIN32 src/launcher_main.cpp src/app.rc)
 
-foreach(target IN ITEMS DesktopClock DesktopCalendar)
+foreach(target IN ITEMS DesktopClock DesktopCalendar DesktopTopBar)
     target_compile_definitions(${target} PRIVATE
         UNICODE
         _UNICODE
@@ -32,6 +33,12 @@ foreach(target IN ITEMS DesktopClock DesktopCalendar)
         advapi32
     )
 endforeach()
+
+# DesktopTopBar 使用 Core Audio（按进程调音量），需要 COM 库
+target_link_libraries(DesktopTopBar PRIVATE
+    ole32
+    oleaut32
+)
 
 target_compile_definitions(MyWigets PRIVATE
     UNICODE

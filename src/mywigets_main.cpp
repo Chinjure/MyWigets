@@ -53,6 +53,7 @@ constexpr int kMenuOpenAll = 1001;
 constexpr int kMenuOpenClock = 1002;
 constexpr int kMenuOpenCalendar = 1003;
 constexpr int kMenuOpenLauncher = 1006;
+constexpr int kMenuOpenTopBar = 1007;
 constexpr int kMenuAutoStart = 1004;
 constexpr int kMenuExit = 1005;
 
@@ -60,10 +61,12 @@ constexpr int kMenuExit = 1005;
 constexpr wchar_t kClockExe[] = L"DesktopClock-x64.exe";
 constexpr wchar_t kCalendarExe[] = L"DesktopCalendar-x64.exe";
 constexpr wchar_t kLauncherExe[] = L"DesktopLauncher-x64.exe";
+constexpr wchar_t kTopBarExe[] = L"DesktopTopBar-x64.exe";
 #else
 constexpr wchar_t kClockExe[] = L"DesktopClock-x86.exe";
 constexpr wchar_t kCalendarExe[] = L"DesktopCalendar-x86.exe";
 constexpr wchar_t kLauncherExe[] = L"DesktopLauncher-x86.exe";
+constexpr wchar_t kTopBarExe[] = L"DesktopTopBar-x86.exe";
 #endif
 
 bool GetMyWigetsDir(wchar_t* dir, size_t count) {
@@ -125,6 +128,7 @@ void LaunchAllWidgets() {
     LaunchWidget(kClockExe, L"Local\\DesktopClock_SingleInstance");
     LaunchWidget(kCalendarExe, L"Local\\DesktopCalendar_SingleInstance");
     LaunchWidget(kLauncherExe, L"Local\\DesktopLauncher_SingleInstance");
+    LaunchWidget(kTopBarExe, L"Local\\DesktopTopBar_SingleInstance");
 }
 
 bool IsAutoStartEnabled() {
@@ -190,7 +194,7 @@ bool AddTrayIcon(HWND hwnd) {
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = kTrayMessage;
     nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP));
-    wcscpy_s(nid.szTip, L"MyWigets - 桌面时钟 + 日历");
+    wcscpy_s(nid.szTip, L"MyWigets - 桌面时钟 + 日历 + 顶栏");
     return Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
 }
 
@@ -225,6 +229,9 @@ void ExecuteMenuCommand(HWND hwnd, int cmd) {
     case kMenuOpenLauncher:
         LaunchWidget(kLauncherExe, L"Local\\DesktopLauncher_SingleInstance");
         break;
+    case kMenuOpenTopBar:
+        LaunchWidget(kTopBarExe, L"Local\\DesktopTopBar_SingleInstance");
+        break;
     case kMenuAutoStart:
         ToggleAutoStart(hwnd);
         break;
@@ -250,6 +257,7 @@ void ShowTrayMenu(HWND hwnd) {
     AppendMenuW(menu, MF_STRING, kMenuOpenClock, L"打开时钟");
     AppendMenuW(menu, MF_STRING, kMenuOpenCalendar, L"打开日历");
     AppendMenuW(menu, MF_STRING, kMenuOpenLauncher, L"打开应用管理");
+    AppendMenuW(menu, MF_STRING, kMenuOpenTopBar, L"打开顶栏");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
     const bool autoStart = IsAutoStartEnabled();
