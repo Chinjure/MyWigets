@@ -856,10 +856,10 @@ LRESULT CALLBACK VolumePanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return HTCLIENT;
 
     case WM_WINDOWPOSCHANGING: {
-        // 防御：任何 Z 序变化都强制回到桌面层底部，防止覆盖普通窗口
+        // 音量面板是置顶浮层：任何 Z 序变化都强制保持置顶，防止被普通窗口覆盖
         auto* wp = reinterpret_cast<WINDOWPOS*>(lParam);
-        if ((wp->flags & SWP_NOZORDER) == 0 && wp->hwndInsertAfter != HWND_BOTTOM) {
-            wp->hwndInsertAfter = HWND_BOTTOM;
+        if ((wp->flags & SWP_NOZORDER) == 0 && wp->hwndInsertAfter != HWND_TOPMOST) {
+            wp->hwndInsertAfter = HWND_TOPMOST;
             wp->flags |= SWP_NOACTIVATE;
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -990,7 +990,7 @@ void ShowVolumePanel(AppState& s) {
 
     if (!s.volumePanelHwnd) {
         s.volumePanelHwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             L"DesktopTopBarVolumePanelWindow", L"",
             WS_POPUP,
             x, y, pw, ph,
@@ -999,12 +999,7 @@ void ShowVolumePanel(AppState& s) {
         if (!s.volumePanelHwnd) {
             return;
         }
-        // 挂到桌面层，避免覆盖普通窗口
-        HWND hProgman = FindWindowW(L"Progman", nullptr);
-        if (hProgman) {
-            SetWindowLongPtrW(s.volumePanelHwnd, GWLP_HWNDPARENT,
-                              reinterpret_cast<LONG_PTR>(hProgman));
-        }
+        // 音量面板是独立置顶窗口：不挂到桌面层，始终显示在普通窗口之上
     }
 
     if (!CreatePanelBacking(s, pw, ph)) {
@@ -1014,10 +1009,9 @@ void ShowVolumePanel(AppState& s) {
     DrawVolumePanelContent(g, s);
     PresentVolumePanel(s);
 
-    // 先显示，再压回桌面层底部——重新显示时若不压底，
-    // Windows 会把面板窗口提升到普通窗口之上，造成"重合"。
+    // 显示并保持置顶（音量面板与顶栏不同，允许覆盖普通窗口）
     ShowWindow(s.volumePanelHwnd, SW_SHOWNOACTIVATE);
-    SetWindowPos(s.volumePanelHwnd, HWND_BOTTOM, x, y, pw, ph,
+    SetWindowPos(s.volumePanelHwnd, HWND_TOPMOST, x, y, pw, ph,
                  SWP_NOACTIVATE);
 }
 
