@@ -1742,28 +1742,28 @@ void DrawBar(AppState& s) {
                 activePath.AddArc(x1 - rTop * 2.0f, y0,
                                   rTop * 2.0f, rTop * 2.0f, 270.0f, 90.0f);
 
-                // 右侧：有相邻未打开标签时用相同下圆角贴合
+                // 右侧：有相邻未打开标签时，填充延伸到右侧共用圆角，贴合未打开标签
                 if (hasRight) {
                     activePath.AddLine(x1, y0 + rTop, x1, y1 - rBot);
-                    RectF brBox(x1 - rBot * 2.0f,
+                    RectF brBox(x1,
                                 y1 - rBot * 2.0f,
                                 rBot * 2.0f, rBot * 2.0f);
-                    activePath.AddArc(brBox, 0.0f, 90.0f);
+                    activePath.AddArc(brBox, 180.0f, -90.0f);
                 } else {
                     activePath.AddLine(x1, y0 + rTop, x1, y1);
                 }
 
-                // 底边
-                const float bottomRightX = hasRight ? x1 - rBot : x1;
-                const float bottomLeftX = hasLeft ? x0 + rBot : x0;
+                // 底边：有相邻未打开标签时延伸到其圆角末端，填充到共用边框
+                const float bottomRightX = hasRight ? x1 + rBot : x1;
+                const float bottomLeftX = hasLeft ? x0 - rBot : x0;
                 activePath.AddLine(bottomRightX, y1, bottomLeftX, y1);
 
-                // 左侧：有相邻未打开标签时用相同下圆角贴合
+                // 左侧：有相邻未打开标签时，填充延伸到左侧共用圆角，贴合未打开标签
                 if (hasLeft) {
-                    RectF blBox(x0,
+                    RectF blBox(x0 - rBot * 2.0f,
                                 y1 - rBot * 2.0f,
                                 rBot * 2.0f, rBot * 2.0f);
-                    activePath.AddArc(blBox, 90.0f, 90.0f);
+                    activePath.AddArc(blBox, 90.0f, -90.0f);
                 }
                 activePath.CloseFigure();
 
@@ -1803,30 +1803,21 @@ void DrawBar(AppState& s) {
                     g.DrawLine(&borderPen, x0, y1, x0, y0 + rTop);
                 }
             }
-        } else if (activeIndex >= 0 &&
-                   (static_cast<int>(i) == activeIndex - 1 ||
-                    static_cast<int>(i) == activeIndex + 1)) {
-            // 相邻未激活标签：拥有与已打开标签相同的下圆角，彼此贴合。
-            const float rBot = (std::min)(8.0f * k, r.Width * 0.25f);
-            Pen cornerPen(Color(140, 255, 255, 255), 1.0f);
-            if (static_cast<int>(i) == activeIndex - 1) {
-                // 左侧相邻标签：右下角内凹，圆心在左边框左侧
-                const float x1 = r.X + r.Width;
-                RectF box(x1 - rBot * 2.0f,
-                          barH - rBot * 2.0f,
-                          rBot * 2.0f, rBot * 2.0f);
-                g.DrawArc(&cornerPen, box, 0.0f, 90.0f);
-            } else {
-                // 右侧相邻标签：左下角内凹，圆心在右边框右侧
-                const float x0 = r.X;
-                RectF box(x0,
-                          barH - rBot * 2.0f,
-                          rBot * 2.0f, rBot * 2.0f);
-                g.DrawArc(&cornerPen, box, 90.0f, 90.0f);
-            }
         }
 
-        // 文字：未激活标签没有边框/背景，只显示文字
+    }
+
+    // 所有标签文字统一在所有背景绘制完之后再绘制，避免已打开标签延伸的背景盖住左侧未打开标签
+    for (size_t i = 0; i < s.tabs.size(); ++i) {
+        const TabInfo& tab = s.tabs[i];
+        const RectF& r = tab.rect;
+        if (r.Width <= 0.0f || r.Height <= 0.0f) {
+            continue;
+        }
+        const bool active = (tab.hwnd == s.targetHwnd);
+        const bool hover = (s.hoverButton == kHitTab &&
+                            s.hoverTab == static_cast<int>(i));
+
         RectF textR;
         if (active) {
             const float inset = kTabTopInset * k;
@@ -1843,7 +1834,6 @@ void DrawBar(AppState& s) {
         tabSf.SetLineAlignment(StringAlignmentCenter);
         tabSf.SetTrimming(StringTrimmingNone);  // 不用省略号，按渲染宽度截断
 
-        // 右侧末尾用渐变淡出代替省略号：文字在前段不透明，最后一点宽度渐变到透明
         const Color textCol = active ? Color(255, 255, 255, 255)
                            : hover ? Color(255, 255, 255, 255)
                                    : Color(190, 255, 255, 255);
@@ -1862,9 +1852,32 @@ void DrawBar(AppState& s) {
                                       LinearGradientModeHorizontal);
         textBrush.SetInterpolationColors(fadeColors, fadePos, 3);
         GraphicsState state = g.Save();
-        g.SetClip(textR);  // 严格按可显示宽度截断，允许最后一个字符被部分裁掉
+        g.SetClip(textR);
         g.DrawString(tab.title.c_str(), -1, &tabFont, textR, &tabSf, &textBrush);
         g.Restore(state);
+    }
+
+    // 相邻未打开标签的下圆角统一最后绘制，覆盖在已打开标签延伸出来的填充之上
+    if (activeIndex >= 0) {
+        Pen cornerPen(Color(140, 255, 255, 255), 1.0f);
+        if (activeIndex > 0) {
+            const RectF& r = s.tabs[activeIndex - 1].rect;
+            const float rBot = (std::min)(8.0f * k, r.Width * 0.25f);
+            const float x1 = r.X + r.Width;
+            RectF box(x1 - rBot * 2.0f,
+                      barH - rBot * 2.0f,
+                      rBot * 2.0f, rBot * 2.0f);
+            g.DrawArc(&cornerPen, box, 0.0f, 90.0f);
+        }
+        if (activeIndex + 1 < static_cast<int>(s.tabs.size())) {
+            const RectF& r = s.tabs[activeIndex + 1].rect;
+            const float rBot = (std::min)(8.0f * k, r.Width * 0.25f);
+            const float x0 = r.X;
+            RectF box(x0,
+                      barH - rBot * 2.0f,
+                      rBot * 2.0f, rBot * 2.0f);
+            g.DrawArc(&cornerPen, box, 90.0f, 90.0f);
+        }
     }
 
     // ---- 右侧三个 Chrome 风格按钮 ----
