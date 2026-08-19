@@ -1718,16 +1718,21 @@ void DrawBar(AppState& s) {
                             s.hoverTab == static_cast<int>(i));
 
         if (active) {
-            // 当前标签：只保留上圆角，底部平直；相邻未激活标签再补下圆角
+            // 当前标签：只保留上圆角；底部在相邻未打开标签处贴合其下圆角，
+            // 没有相邻未打开标签的一侧才保持平直。
             const float inset = kTabTopInset * k;
             RectF visual(r.X, inset, r.Width, barH - inset);
             if (visual.Height > 0.0f) {
                 GraphicsPath activePath;
                 const float rTop = (std::min)(8.0f * k, visual.Width * 0.5f);
+                const float rBot = (std::min)(8.0f * k, visual.Width * 0.25f);
                 const float x0 = visual.X;
                 const float y0 = visual.Y;
                 const float x1 = visual.X + visual.Width;
                 const float y1 = visual.Y + visual.Height;
+                const bool hasLeft = activeIndex > 0;
+                const bool hasRight = activeIndex >= 0 &&
+                                      activeIndex + 1 < static_cast<int>(s.tabs.size());
 
                 // 左上外凸圆角
                 activePath.AddArc(x0, y0, rTop * 2.0f, rTop * 2.0f,
@@ -1736,26 +1741,72 @@ void DrawBar(AppState& s) {
                 // 右上外凸圆角
                 activePath.AddArc(x1 - rTop * 2.0f, y0,
                                   rTop * 2.0f, rTop * 2.0f, 270.0f, 90.0f);
-                // 右侧直下、底边直通、左侧直上
-                activePath.AddLine(x1, y0 + rTop, x1, y1);
-                activePath.AddLine(x1, y1, x0, y1);
-                activePath.AddLine(x0, y1, x0, y0 + rTop);
+
+                // 右侧：有相邻未打开标签时用相同下圆角贴合
+                if (hasRight) {
+                    activePath.AddLine(x1, y0 + rTop, x1, y1 - rBot);
+                    RectF brBox(x1 - rBot * 2.0f,
+                                y1 - rBot * 2.0f,
+                                rBot * 2.0f, rBot * 2.0f);
+                    activePath.AddArc(brBox, 0.0f, 90.0f);
+                } else {
+                    activePath.AddLine(x1, y0 + rTop, x1, y1);
+                }
+
+                // 底边
+                const float bottomRightX = hasRight ? x1 - rBot : x1;
+                const float bottomLeftX = hasLeft ? x0 + rBot : x0;
+                activePath.AddLine(bottomRightX, y1, bottomLeftX, y1);
+
+                // 左侧：有相邻未打开标签时用相同下圆角贴合
+                if (hasLeft) {
+                    RectF blBox(x0,
+                                y1 - rBot * 2.0f,
+                                rBot * 2.0f, rBot * 2.0f);
+                    activePath.AddArc(blBox, 90.0f, 90.0f);
+                }
                 activePath.CloseFigure();
 
                 SolidBrush fillBrush(hover ? Color(80, 255, 255, 255)
                                            : Color(45, 255, 255, 255));
                 g.FillPath(&fillBrush, &activePath);
-                // 边框尽量细：固定 1 像素，不随 DPI 加粗
+                // 边框尽量细：固定 1 像素，不随 DPI 加粗。
+                // 只画上圆角和侧边；底部圆角由相邻未打开标签提供，避免出现对称的重复圆角。
                 Pen borderPen(hover ? Color(220, 255, 255, 255)
                                     : Color(160, 255, 255, 255),
                               1.0f);
-                g.DrawPath(&borderPen, &activePath);
+                g.DrawArc(&borderPen, RectF(x0, y0, rTop * 2.0f, rTop * 2.0f),
+                          180.0f, 90.0f);
+                g.DrawLine(&borderPen, x0 + rTop, y0, x1 - rTop, y0);
+                g.DrawArc(&borderPen,
+                          RectF(x1 - rTop * 2.0f, y0,
+                                rTop * 2.0f, rTop * 2.0f),
+                          270.0f, 90.0f);
+                if (hasRight) {
+                    g.DrawLine(&borderPen, x1, y0 + rTop, x1, y1 - rBot);
+                } else {
+                    g.DrawLine(&borderPen, x1, y0 + rTop, x1, y1);
+                }
+                // 底部边框只在没有相邻未打开标签的一侧绘制
+                if (!hasLeft) {
+                    g.DrawLine(&borderPen, x0, y1,
+                               hasRight ? x1 - rBot : x1, y1);
+                }
+                if (!hasRight) {
+                    g.DrawLine(&borderPen,
+                               hasLeft ? x0 + rBot : x0, y1,
+                               x1, y1);
+                }
+                if (hasLeft) {
+                    g.DrawLine(&borderPen, x0, y1 - rBot, x0, y0 + rTop);
+                } else {
+                    g.DrawLine(&borderPen, x0, y1, x0, y0 + rTop);
+                }
             }
         } else if (activeIndex >= 0 &&
                    (static_cast<int>(i) == activeIndex - 1 ||
                     static_cast<int>(i) == activeIndex + 1)) {
-            // 与当前标签相邻的未激活标签：只画与上圆角相反对称的下圆角。
-            // 边框先沿侧边向下，经过四分之一圆后汇入该未激活标签的下边框。
+            // 相邻未激活标签：拥有与已打开标签相同的下圆角，彼此贴合。
             const float rBot = (std::min)(8.0f * k, r.Width * 0.25f);
             Pen cornerPen(Color(140, 255, 255, 255), 1.0f);
             if (static_cast<int>(i) == activeIndex - 1) {
