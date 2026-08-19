@@ -48,6 +48,17 @@
 using namespace Gdiplus;
 using Microsoft::WRL::ComPtr;
 
+// SDK 头文件未定义的窗口状态事件（值来自 WinUser.h 文档，稳定）
+#ifndef EVENT_SYSTEM_RESTORE
+#define EVENT_SYSTEM_RESTORE 0x000A
+#endif
+#ifndef EVENT_SYSTEM_MAXIMIZESTART
+#define EVENT_SYSTEM_MAXIMIZESTART 0x0018
+#endif
+#ifndef EVENT_SYSTEM_MAXIMIZEEND
+#define EVENT_SYSTEM_MAXIMIZEEND 0x0019
+#endif
+
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"DesktopTopBarWindow";
@@ -67,10 +78,6 @@ constexpr int kVolumePanelMargin = 2;   // 按键/面板贴合左上角的小边
 constexpr int kMuteButtonW = 30;        // 面板内静音按钮宽度
 constexpr UINT kVolumeApplyDelayMs = 40;
 
-constexpr UINT kTrackTimerId = 1;        // 前台窗口轮询定时器
-constexpr UINT kTrackIntervalMs = 250;
-constexpr UINT kRedrawTimerId = 2;       // 定时重绘（用于按钮按下/最大化态刷新）
-constexpr UINT kRedrawIntervalMs = 500;
 constexpr int kMenuExit = 1001;
 
 enum ButtonHit {
@@ -101,6 +108,7 @@ struct AppState {
     bool hasTarget = false;              // 是否有可操作的有效目标窗口
     wchar_t targetTitle[256] = {};
     bool targetMaximized = false;        // 目标当前是否处于最大化
+    bool targetSticky = false;           // 目标最小化后保持跟踪，不跟随系统自动转移的焦点
 
     int hoverButton = kHitNone;          // 当前悬停的按钮
     bool trackingMouse = false;
@@ -249,6 +257,12 @@ void ComputeButtonRects(AppState& s,
     minRect.Height = h;
 }
 
+// 全局钩子：用户"显式选择窗口"的信号（鼠标点击 / Alt+Tab），
+// 供目标跟踪区分系统自动转移焦点与用户主动切换窗口
+HWND g_lastClickWindow = nullptr;
+bool g_altTabPressed = false;
+HHOOK g_keyHook = nullptr;
+
 // 判断一个窗口是否应视为"可控制的有效目标窗口"
 bool IsControlTarget(HWND hwnd, HWND self) {    if (!hwnd || hwnd == self) {
         return false;
@@ -304,35 +318,84 @@ void PresentVolumePanel(AppState& s);
 void ShowVolumePanel(AppState& s);
 void HideVolumePanel(AppState& s);
 
+// 把某个窗口设为当前目标并刷新标题/最大化/音量会话
+void ApplyTargetInfo(AppState& s, HWND hwnd) {
+    s.targetHwnd = hwnd;
+    s.hasTarget = true;
+    s.targetMaximized = IsZoomed(hwnd) != FALSE;
+
+    const int got = GetWindowTextW(hwnd, s.targetTitle, 255);
+    if (got <= 0) {
+        // 无标题的窗口回退为类名
+        wchar_t cls[64] = {};
+        if (GetClassNameW(hwnd, cls, 63) > 0) {
+            wcscpy_s(s.targetTitle, cls);
+        } else {
+            wcscpy_s(s.targetTitle, L"窗口");
+        }
+    }
+
+    // 目标窗口变化时重新解析其进程的音频会话，供音量面板使用
+    if (s.targetHwnd != s.volumeTargetHwnd) {
+        s.volumeTargetHwnd = s.targetHwnd;
+        ResolveVolumeSession(s);
+    }
+}
+
 // 轮询前台窗口，更新目标与标题。轮询而不是事件绑定，
 // 是为了在 WS_EX_NOACTIVATE（点击不抢占焦点）的前提下，
 // 稳定跟踪"鼠标最后一次聚焦"的窗口。
+//
+// 特殊处理：当当前目标被最小化时，Windows 会自动把前台让给下一个窗口
+// （如 A 最小化后 B 成为前台）。此时顶栏不跟随系统转移——目标保持 A，
+// 直到用户显式点击其他窗口或 Alt+Tab 切换，避免"最小化 A 却变成操作 B"。
 void UpdateTarget(AppState& s) {
     HWND fg = GetForegroundWindow();
-    if (IsControlTarget(fg, s.hwnd)) {
-        s.targetHwnd = fg;
-        s.hasTarget = true;
-        s.targetMaximized = IsZoomed(fg) != FALSE;
 
-        const int got = GetWindowTextW(fg, s.targetTitle, 255);
-        if (got <= 0) {
-            // 无标题的窗口回退为类名
-            wchar_t cls[64] = {};
-            if (GetClassNameW(fg, cls, 63) > 0) {
-                wcscpy_s(s.targetTitle, cls);
-            } else {
-                wcscpy_s(s.targetTitle, L"窗口");
+    // 目标粘住：当前目标因最小化而失去前台时，保持跟踪它
+    if (s.hasTarget && s.targetHwnd && IsWindow(s.targetHwnd)) {
+        if (IsIconic(s.targetHwnd)) {
+            s.targetSticky = true;
+        }
+        if (s.targetSticky) {
+            // 用户显式选择：鼠标点击其他窗口 / Alt+Tab
+            HWND explicitHwnd = nullptr;
+            if (g_lastClickWindow && g_lastClickWindow != s.targetHwnd &&
+                IsControlTarget(g_lastClickWindow, s.hwnd)) {
+                explicitHwnd = g_lastClickWindow;
+            } else if (g_altTabPressed && IsControlTarget(fg, s.hwnd)) {
+                explicitHwnd = fg;
             }
-        }
+            g_lastClickWindow = nullptr;
+            g_altTabPressed = false;
 
-        // 目标窗口变化时重新解析其进程的音频会话，供音量面板使用
-        if (s.targetHwnd != s.volumeTargetHwnd) {
-            s.volumeTargetHwnd = s.targetHwnd;
-            ResolveVolumeSession(s);
+            if (explicitHwnd) {
+                // 用户主动切到其他窗口：解除粘住并切换
+                ApplyTargetInfo(s, explicitHwnd);
+                s.targetSticky = false;
+            } else if (fg == s.targetHwnd) {
+                // 目标被恢复（win+↑ / 点击任务栏）
+                s.targetSticky = false;
+                ApplyTargetInfo(s, s.targetHwnd);
+            } else {
+                // 系统自动转移（最小化目标导致前台跳到别的窗口）：保持目标
+                s.targetMaximized = IsZoomed(s.targetHwnd) != FALSE;
+            }
+            return;
         }
+    }
+
+    // 非粘住：正常跟随前台窗口；顺带清掉历史显式选择信号
+    g_lastClickWindow = nullptr;
+    g_altTabPressed = false;
+
+    if (IsControlTarget(fg, s.hwnd)) {
+        ApplyTargetInfo(s, fg);
+        s.targetSticky = false;
     } else {
         s.targetHwnd = nullptr;
         s.hasTarget = false;
+        s.targetSticky = false;
         s.targetTitle[0] = L'\0';
         s.targetMaximized = false;
         if (s.volumeTargetHwnd != nullptr) {
@@ -352,7 +415,11 @@ void HitButton(HWND self, HWND target, ButtonHit hit) {
         ShowWindow(target, SW_MINIMIZE);
         break;
     case kHitMaximize:
-        if (IsZoomed(target)) {
+        if (IsIconic(target)) {
+            // 最小化时先还原显示（窗口化），不直接最大化；
+            // 再次点击才执行最大化/还原切换
+            ShowWindow(target, SW_RESTORE);
+        } else if (IsZoomed(target)) {
             ShowWindow(target, SW_RESTORE);
         } else {
             ShowWindow(target, SW_MAXIMIZE);
@@ -588,8 +655,12 @@ void ToggleMute(AppState& s) {
     s.volumeSession->SetMute(BOOL(s.volumeMuted), nullptr);
 }
 
-// ---- 全局鼠标钩子：点击面板外任意处（含桌面/其他窗口）时收起音量面板 ----
+// ---- 全局鼠标/键盘钩子 ----
+// 用途：1) 点击面板外任意处（含桌面/其他窗口）时收起音量面板；
+//      2) 记录用户"显式"点击 / Alt+Tab 切换窗口的信号，
+//         供目标跟踪区分"系统自动转移焦点"与"用户主动切换窗口"。
 constexpr UINT kCloseVolumeMsg = WM_APP + 2;
+constexpr UINT kUserSwitchMsg = WM_APP + 3;  // 用户显式点击/Alt+Tab 其他窗口时通知刷新目标
 HHOOK g_volumeHook = nullptr;
 HWND g_volumeHookHwnd = nullptr;
 
@@ -599,6 +670,25 @@ LRESULT CALLBACK VolumeLowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam
         HWND hwnd = g_volumeHookHwnd;
         AppState* s = hwnd ? reinterpret_cast<AppState*>(
             GetWindowLongPtrW(hwnd, GWLP_USERDATA)) : nullptr;
+
+        // 记录用户显式点击的顶层窗口（排除顶栏自身与音量面板）
+        HWND clicked = WindowFromPoint(info->pt);
+        if (clicked) {
+            clicked = GetAncestor(clicked, GA_ROOT);
+            if (clicked == hwnd ||
+                (s && s->volumePanelHwnd && clicked == s->volumePanelHwnd)) {
+                clicked = nullptr;
+            }
+        }
+        g_lastClickWindow = clicked;
+
+        // 目标粘住时，用户显式点击其他窗口应立即解除粘住并切换，
+        // 不依赖 WinEvent 事件（事件可能延迟或不触发）
+        if (s && s->targetSticky && clicked &&
+            clicked != s->targetHwnd && IsControlTarget(clicked, hwnd)) {
+            PostMessageW(hwnd, kUserSwitchMsg, 0, 0);
+        }
+
         if (s && s->volumeOpen) {
             // 音量按钮屏幕区域（点它不收起，由顶栏自己 toggle）
             RECT rc{};
@@ -629,13 +719,90 @@ LRESULT CALLBACK VolumeLowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 
-void InstallVolumeHook(HWND hwnd) {
-    if (g_volumeHook) {
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        const auto* info = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+        // Alt+Tab：系统键按下 Tab 且 Alt 处于按下状态
+        if ((wParam == WM_SYSKEYDOWN || wParam == WM_KEYDOWN) &&
+            info->vkCode == VK_TAB &&
+            (GetAsyncKeyState(VK_MENU) & 0x8000) != 0) {
+            g_altTabPressed = true;
+            HWND bar = g_volumeHookHwnd;
+            AppState* s = bar ? reinterpret_cast<AppState*>(
+                GetWindowLongPtrW(bar, GWLP_USERDATA)) : nullptr;
+            // 目标粘住时，Alt+Tab 也立即通知刷新（不依赖 WinEvent）
+            if (s && s->targetSticky) {
+                PostMessageW(bar, kUserSwitchMsg, 0, 0);
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+// ---- WinEvent 钩子：替代前台窗口 / 最大化状态的轮询 ----
+// 前台切换、最小化/最大化/还原均由系统事件驱动，不再用定时器轮询。
+HWINEVENTHOOK g_winEventHook[3] = {nullptr, nullptr, nullptr};
+
+void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
+                           LONG idObject, LONG idChild, DWORD, DWORD) {
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) {
         return;
     }
-    g_volumeHookHwnd = hwnd;
-    g_volumeHook = SetWindowsHookExW(WH_MOUSE_LL, VolumeLowLevelMouseProc,
-                                     GetModuleHandleW(nullptr), 0);
+    HWND bar = g_volumeHookHwnd;
+    AppState* s = bar ? reinterpret_cast<AppState*>(
+        GetWindowLongPtrW(bar, GWLP_USERDATA)) : nullptr;
+    if (!s) {
+        return;
+    }
+
+    if (event == EVENT_SYSTEM_FOREGROUND) {
+        UpdateTarget(*s);
+        DrawBarAndPresent(*s);
+        return;
+    }
+
+    // 窗口状态事件：只关心当前目标或前台窗口
+    HWND top = GetAncestor(hwnd, GA_ROOT);
+    switch (event) {
+    case EVENT_SYSTEM_MINIMIZESTART:
+    case EVENT_SYSTEM_MINIMIZEEND:
+    case EVENT_SYSTEM_MAXIMIZESTART:
+    case EVENT_SYSTEM_MAXIMIZEEND:
+    case EVENT_SYSTEM_RESTORE:
+        if (top == s->targetHwnd || top == GetForegroundWindow()) {
+            UpdateTarget(*s);
+            DrawBarAndPresent(*s);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+void InstallVolumeHook(HWND hwnd) {
+    if (!g_volumeHook) {
+        g_volumeHookHwnd = hwnd;
+        g_volumeHook = SetWindowsHookExW(WH_MOUSE_LL, VolumeLowLevelMouseProc,
+                                         GetModuleHandleW(nullptr), 0);
+    }
+    if (!g_keyHook) {
+        g_keyHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
+                                      GetModuleHandleW(nullptr), 0);
+    }
+    if (!g_winEventHook[0]) {
+        // 前台窗口切换
+        g_winEventHook[0] = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+            nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+        // 最小化 / 最大化
+        g_winEventHook[1] = SetWinEventHook(
+            EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MAXIMIZEEND,
+            nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+        // 还原
+        g_winEventHook[2] = SetWinEventHook(
+            EVENT_SYSTEM_RESTORE, EVENT_SYSTEM_RESTORE,
+            nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+    }
 }
 
 void UninstallVolumeHook() {
@@ -643,7 +810,19 @@ void UninstallVolumeHook() {
         UnhookWindowsHookEx(g_volumeHook);
         g_volumeHook = nullptr;
     }
+    if (g_keyHook) {
+        UnhookWindowsHookEx(g_keyHook);
+        g_keyHook = nullptr;
+    }
+    for (auto& h : g_winEventHook) {
+        if (h) {
+            UnhookWinEvent(h);
+            h = nullptr;
+        }
+    }
     g_volumeHookHwnd = nullptr;
+    g_lastClickWindow = nullptr;
+    g_altTabPressed = false;
 }
 
 // ---- 独立音量面板窗口 ----
@@ -1028,10 +1207,8 @@ void SetVolumeOpen(AppState& s, bool open) {
     }
     s.volumeOpen = open;
     if (open) {
-        InstallVolumeHook(s.hwnd);
         ShowVolumePanel(s);
     } else {
-        UninstallVolumeHook();
         HideVolumePanel(s);
     }
 }
@@ -1352,6 +1529,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         s->hwnd = hwnd;
         s->dpi = GetWindowDpi(hwnd);
         s->scale = static_cast<float>(s->dpi) / 96.0f;
+        InstallVolumeHook(hwnd); // 常驻全局钩子：显式点击/Alt+Tab 检测 + 面板外点击收起
         return 0;
     }
 
@@ -1457,22 +1635,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
 
-    case WM_TIMER:
-        if (!s) {
-            return 0;
-        }
-        if (wParam == kTrackTimerId) {
+    case kUserSwitchMsg:
+        // 用户显式点击/Alt+Tab 其他窗口：立即解除粘住并切换目标
+        if (s) {
             UpdateTarget(*s);
             DrawBarAndPresent(*s);
-        } else if (wParam == kRedrawTimerId) {
-            // 定期刷新，及时反映最大化/还原后的字形变化
-            if (s->targetHwnd && s->hasTarget && IsWindow(s->targetHwnd)) {
-                const bool zoomed = IsZoomed(s->targetHwnd) != FALSE;
-                if (zoomed != s->targetMaximized) {
-                    s->targetMaximized = zoomed;
-                    DrawBarAndPresent(*s);
-                }
-            }
         }
         return 0;
 
@@ -1500,8 +1667,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_DESTROY:
-        KillTimer(hwnd, kTrackTimerId);
-        KillTimer(hwnd, kRedrawTimerId);
         UninstallVolumeHook();
         if (s) {
             if (s->volumePanelHwnd) {
@@ -1607,8 +1772,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         return 1;
     }
 
-    SetTimer(hwnd, kTrackTimerId, kTrackIntervalMs, nullptr);
-    SetTimer(hwnd, kRedrawTimerId, kRedrawIntervalMs, nullptr);
     UpdateTarget(state);
     DrawBarAndPresent(state);
 
