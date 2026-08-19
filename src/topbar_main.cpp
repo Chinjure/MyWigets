@@ -4,7 +4,8 @@
 //   1. 固定在桌面顶部的一条半透明顶栏，外观与其他组件一致（GDI+ 逐像素透明）
 //   2. 通过 Progman 属主 + HWND_BOTTOM 挂在桌面层，与其它三个组件一样
 //      只展现在桌面上：不覆盖任何普通窗口，也不出现在任务栏/Alt-Tab 中
-//   3. 顶栏居中显示"当前聚焦窗口"的名称（鼠标最后一次聚焦 / 前台窗口）
+//   3. 从音量键右侧到右侧三键之间显示 Chrome 风格标签：
+//      标签为聚焦窗口所属应用打开的全部窗口，名字为对应窗口名
 //   4. 顶栏右侧提供 Chrome 浏览器风格的 最小化 / 最大化 / 关闭 三个按钮，
 //      用于控制当前聚焦窗口
 //   5. 高度等于 Chrome 浏览器标签栏的高度（约 40px，随 DPI 缩放）
@@ -34,8 +35,11 @@
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <memory>
+#include <string>
 #include <tlhelp32.h>   // 进程快照：解析应用子进程的音频会话
 #include <unordered_map>
+#include <vector>
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "user32.lib")
@@ -70,6 +74,10 @@ constexpr int kBaseTabHeight = 40;
 constexpr int kButtonWidthBase = 46;
 constexpr int kButtonGap = 4;
 
+// Chrome 风格标签的视觉留白（相对 96 DPI，绘制时乘 scale）
+constexpr float kTabTopInset = 5.0f;        // 活动标签顶部留白，底部贴住标签栏
+constexpr float kTabDividerInset = 8.0f;    // 未激活标签之间竖线的上下留白
+
 // 左上角音量按钮与展开面板
 constexpr int kVolumeButtonW = 46;      // 音量按钮宽度（与窗口控制按钮一致，便于点击）
 constexpr int kVolumePanelW = 260;      // 展开的音量面板宽度
@@ -77,6 +85,7 @@ constexpr int kVolumePanelH = 60;       // 展开的音量面板高度
 constexpr int kVolumePanelMargin = 2;   // 按键/面板贴合左上角的小边距
 constexpr int kMuteButtonW = 30;        // 面板内静音按钮宽度
 constexpr UINT kVolumeApplyDelayMs = 40;
+constexpr UINT_PTR kTabRefreshTimerId = 1;  // 定时刷新同应用窗口标签
 
 constexpr int kMenuExit = 1001;
 
@@ -88,6 +97,13 @@ enum ButtonHit {
     kHitMinimize = 0,
     kHitMaximize = 1,
     kHitClose = 2,
+    kHitTab = 6,        // Chrome 风格标签区域
+};
+
+struct TabInfo {
+    HWND hwnd = nullptr;
+    std::wstring title;
+    RectF rect;  // 顶栏客户区坐标
 };
 
 struct AppState {
@@ -106,12 +122,15 @@ struct AppState {
     // 当前要控制的"前台/最后一次聚焦"窗口
     HWND targetHwnd = nullptr;
     bool hasTarget = false;              // 是否有可操作的有效目标窗口
-    wchar_t targetTitle[256] = {};
     bool targetMaximized = false;        // 目标当前是否处于最大化
     bool targetSticky = false;           // 目标最小化后保持跟踪，不跟随系统自动转移的焦点
 
     int hoverButton = kHitNone;          // 当前悬停的按钮
+    int hoverTab = -1;                   // 当前悬停的 Chrome 标签索引
     bool trackingMouse = false;
+
+    // Chrome 风格标签：聚焦窗口所属应用打开的全部顶层窗口
+    std::vector<TabInfo> tabs;
 
     // ---- 音量调节（类似 Windows 音量合成器，控制前台窗口所在进程）----
     bool volumeOpen = false;             // 音量面板是否展开
@@ -293,6 +312,9 @@ bool IsControlTarget(HWND hwnd, HWND self) {    if (!hwnd || hwnd == self) {
 }
 
 void ResolveVolumeSession(AppState& s);  // 前置声明（定义在前台窗口轮询之后）
+bool ProcessTreeContains(DWORD rootPid, DWORD sessionPid);  // 前置声明（定义在下方）
+bool RefreshTabs(AppState& s);             // 前置声明（定义在下方）
+int HitTestTab(AppState& s, int x, int y); // 前置声明（定义在下方）
 
 // 音量面板几何 / 操作的前置声明（定义在下方，供命中测试与消息处理使用）
 int BarHeight(AppState& s);
@@ -318,31 +340,23 @@ void PresentVolumePanel(AppState& s);
 void ShowVolumePanel(AppState& s);
 void HideVolumePanel(AppState& s);
 
-// 把某个窗口设为当前目标并刷新标题/最大化/音量会话
+// 把某个窗口设为当前目标并刷新最大化状态、音量会话与 Chrome 标签
 void ApplyTargetInfo(AppState& s, HWND hwnd) {
     s.targetHwnd = hwnd;
     s.hasTarget = true;
     s.targetMaximized = IsZoomed(hwnd) != FALSE;
-
-    const int got = GetWindowTextW(hwnd, s.targetTitle, 255);
-    if (got <= 0) {
-        // 无标题的窗口回退为类名
-        wchar_t cls[64] = {};
-        if (GetClassNameW(hwnd, cls, 63) > 0) {
-            wcscpy_s(s.targetTitle, cls);
-        } else {
-            wcscpy_s(s.targetTitle, L"窗口");
-        }
-    }
 
     // 目标窗口变化时重新解析其进程的音频会话，供音量面板使用
     if (s.targetHwnd != s.volumeTargetHwnd) {
         s.volumeTargetHwnd = s.targetHwnd;
         ResolveVolumeSession(s);
     }
+
+    // 刷新 Chrome 风格标签：显示该应用打开的全部窗口
+    RefreshTabs(s);
 }
 
-// 轮询前台窗口，更新目标与标题。轮询而不是事件绑定，
+// 轮询前台窗口，更新目标与 Chrome 标签。轮询而不是事件绑定，
 // 是为了在 WS_EX_NOACTIVATE（点击不抢占焦点）的前提下，
 // 稳定跟踪"鼠标最后一次聚焦"的窗口。
 //
@@ -396,8 +410,10 @@ void UpdateTarget(AppState& s) {
         s.targetHwnd = nullptr;
         s.hasTarget = false;
         s.targetSticky = false;
-        s.targetTitle[0] = L'\0';
         s.targetMaximized = false;
+        s.tabs.clear();
+        s.hoverButton = kHitNone;
+        s.hoverTab = -1;
         if (s.volumeTargetHwnd != nullptr) {
             s.volumeTargetHwnd = nullptr;
             ResolveVolumeSession(s);
@@ -434,6 +450,19 @@ void HitButton(HWND self, HWND target, ButtonHit hit) {
     }
 }
 
+int HitTestTab(AppState& s, int x, int y) {
+    if (y < 0 || y >= BarAreaHeight(s) || x < 0 || x >= s.width) {
+        return -1;
+    }
+    for (size_t i = 0; i < s.tabs.size(); ++i) {
+        const RectF& r = s.tabs[i].rect;
+        if (x >= static_cast<int>(r.X) && x < static_cast<int>(r.X + r.Width)) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
 ButtonHit HitTestButton(AppState& s, int x, int y) {
     if (y < 0 || y >= s.height || x < 0 || x >= s.width) {
         return kHitNone;
@@ -445,6 +474,11 @@ ButtonHit HitTestButton(AppState& s, int x, int y) {
     if (x >= static_cast<int>(volR.X) && x < static_cast<int>(volR.X + volR.Width) &&
         y < BarAreaHeight(s)) {
         return kHitVolume;
+    }
+
+    // Chrome 风格标签区域
+    if (HitTestTab(s, x, y) >= 0) {
+        return kHitTab;
     }
 
     RectF minR, maxR, closeR;
@@ -546,6 +580,278 @@ bool ProcessTreeContains(DWORD rootPid, DWORD sessionPid) {
         cur = parent;
     }
     return false;
+}
+
+// ---- Chrome 风格标签：同应用窗口枚举 / 布局 ----
+
+std::wstring GetWindowTitleText(HWND hwnd) {
+    wchar_t buf[256] = {};
+    const int n = GetWindowTextW(hwnd, buf, 255);
+    if (n > 0) {
+        return std::wstring(buf, n);
+    }
+    wchar_t cls[64] = {};
+    if (GetClassNameW(hwnd, cls, 63) > 0) {
+        return std::wstring(cls);
+    }
+    return L"窗口";
+}
+
+std::wstring GetProcessName(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) {
+        return L"";
+    }
+    wchar_t path[MAX_PATH] = {};
+    DWORD size = MAX_PATH;
+    std::wstring name;
+    if (QueryFullProcessImageNameW(h, 0, path, &size)) {
+        wchar_t* slash = wcsrchr(path, L'\\');
+        name = slash ? (slash + 1) : path;
+    }
+    CloseHandle(h);
+    return name;
+}
+
+// 判断两个顶层窗口是否属于同一个"应用"：
+// 同进程，或同可执行文件名（覆盖多进程/多窗口应用）。
+// 注意不能使用进程树判断：Explorer 启动的子进程会把资源管理器和其他应用误判为同一应用。
+bool IsSameApplication(HWND candidate, HWND target) {
+    DWORD candPid = 0;
+    DWORD targetPid = 0;
+    GetWindowThreadProcessId(candidate, &candPid);
+    GetWindowThreadProcessId(target, &targetPid);
+    if (candPid == 0 || targetPid == 0) {
+        return false;
+    }
+    if (candPid == targetPid) {
+        return true;
+    }
+    const std::wstring candName = GetProcessName(candPid);
+    const std::wstring targetName = GetProcessName(targetPid);
+    return !candName.empty() && candName == targetName;
+}
+
+bool IsShellSystemWindow(HWND hwnd) {
+    wchar_t cls[64] = {};
+    if (GetClassNameW(hwnd, cls, 63) <= 0) {
+        return false;
+    }
+    return wcscmp(cls, L"Progman") == 0 ||
+           wcscmp(cls, L"WorkerW") == 0 ||
+           wcscmp(cls, L"SHELLDLL_DefView") == 0 ||
+           wcscmp(cls, L"Shell_TrayWnd") == 0 ||
+           wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0;
+}
+
+struct EnumTabsContext {
+    HWND self = nullptr;
+    HWND target = nullptr;
+    DWORD selfPid = 0;
+    std::vector<TabInfo>* tabs = nullptr;
+};
+
+BOOL CALLBACK EnumAppWindowsProc(HWND hwnd, LPARAM lParam) {
+    auto* ctx = reinterpret_cast<EnumTabsContext*>(lParam);
+    if (!ctx || !ctx->tabs || !ctx->target || hwnd == ctx->self) {
+        return TRUE;
+    }
+    if (!IsWindowVisible(hwnd)) {
+        return TRUE;
+    }
+    // 忽略桌面 / 任务栏等系统 Shell 窗口，避免资源管理器标签混入系统窗口
+    if (IsShellSystemWindow(hwnd)) {
+        return TRUE;
+    }
+    // 只收集普通应用主窗口：忽略属主窗口（对话框/浮层）和工具窗口
+    if (GetWindow(hwnd, GW_OWNER) != nullptr) {
+        return TRUE;
+    }
+    if ((GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) {
+        return TRUE;
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0 || pid == ctx->selfPid) {
+        return TRUE;
+    }
+    if (!IsSameApplication(hwnd, ctx->target)) {
+        return TRUE;
+    }
+
+    TabInfo info;
+    info.hwnd = hwnd;
+    info.title = GetWindowTitleText(hwnd);
+    ctx->tabs->push_back(info);
+    return TRUE;
+}
+
+// 根据当前宽度计算每个标签的矩形（从音量键右侧到右侧三键左侧）。
+// measureG 可传入正在绘制的 Graphics，避免对同一 Bitmap 重复创建 Graphics。
+void LayoutTabs(AppState& s, std::vector<TabInfo>& tabs,
+                Graphics* measureG = nullptr) {
+    if (tabs.empty()) {
+        return;
+    }
+    const float k = s.scale;
+
+    RectF volR;
+    VolumeButtonRect(s, volR);
+    RectF minR, maxR, closeR;
+    ComputeButtonRects(s, minR, maxR, closeR);
+
+    const float left = volR.X + volR.Width + 6.0f * k;
+    const float right = minR.X - 6.0f * k;
+    const float available = right - left;
+    if (available <= 0.0f) {
+        return;
+    }
+
+    const float minW = 60.0f * k;
+    const float maxW = 220.0f * k;
+    const float pad = 20.0f * k;
+
+    std::vector<float> desired;
+    desired.reserve(tabs.size());
+    FontFamily family(L"Segoe UI");
+    Font font(&family, 12.0f * k, FontStyleRegular, UnitPixel);
+    StringFormat sf;
+    sf.SetFormatFlags(StringFormatFlagsNoWrap);
+
+    std::unique_ptr<Graphics> localG;
+    Graphics* mg = measureG;
+    if (!mg && s.bitmap) {
+        localG.reset(new Graphics(s.bitmap));
+        mg = localG.get();
+    }
+
+    for (const auto& tab : tabs) {
+        float textW = 0.0f;
+        if (mg) {
+            RectF layoutRect(0, 0, 10000.0f, 100.0f);
+            RectF bound;
+            mg->MeasureString(tab.title.c_str(), -1, &font, layoutRect, &sf, &bound);
+            textW = bound.Width;
+        } else {
+            textW = static_cast<float>(tab.title.size()) * 7.0f * k;
+        }
+        desired.push_back(std::clamp(textW + pad, minW, maxW));
+    }
+
+    float totalDesired = 0.0f;
+    for (float w : desired) {
+        totalDesired += w;
+    }
+    float scaleFactor = totalDesired > 0.0f ? available / totalDesired : 0.0f;
+    if (scaleFactor > 1.0f) {
+        scaleFactor = 1.0f;
+    }
+
+    float x = left;
+    for (size_t i = 0; i < tabs.size(); ++i) {
+        float w = desired[i] * scaleFactor;
+        if (w < minW) {
+            w = minW;
+        }
+        tabs[i].rect.X = x;
+        tabs[i].rect.Y = 0.0f;
+        tabs[i].rect.Width = w;
+        tabs[i].rect.Height = static_cast<float>(BarAreaHeight(s));
+        x += w;
+    }
+
+    // 标签过多时强制均分，保证不侵入右侧三键区域
+    if (x > right + 0.5f) {
+        const float step = (right - left) / static_cast<float>(tabs.size());
+        x = left;
+        for (auto& tab : tabs) {
+            tab.rect.X = x;
+            tab.rect.Width = step;
+            x += step;
+        }
+    }
+}
+
+// 重新枚举当前目标应用的全部顶层窗口并刷新标签列表。
+// 返回 true 表示列表内容有变化（供定时器决定是否需要重绘）。
+bool RefreshTabs(AppState& s) {
+    std::vector<TabInfo> next;
+    if (s.hasTarget && s.targetHwnd && IsWindow(s.targetHwnd)) {
+        EnumTabsContext ctx;
+        ctx.self = s.hwnd;
+        ctx.target = s.targetHwnd;
+        ctx.selfPid = GetCurrentProcessId();
+        ctx.tabs = &next;
+        EnumWindows(EnumAppWindowsProc, reinterpret_cast<LPARAM>(&ctx));
+    }
+
+    // 保持已有标签顺序：切换聚焦/置顶不会让窗口跳到第一位，新窗口追加到末尾。
+    // EnumWindows 返回的是 Z 序，直接用会让聚焦窗口总排在第一。
+    bool hasCommonWindow = false;
+    if (!s.tabs.empty() && !next.empty()) {
+        for (const auto& old : s.tabs) {
+            for (const auto& n : next) {
+                if (old.hwnd == n.hwnd) {
+                    hasCommonWindow = true;
+                    break;
+                }
+            }
+            if (hasCommonWindow) {
+                break;
+            }
+        }
+    }
+    if (!hasCommonWindow && !next.empty()) {
+        // 首次遇到该应用（或刚从别的应用切换过来）时按 Z 序倒序排列，
+        // 近似“打开顺序”，避免聚焦窗口固定第一。
+        std::reverse(next.begin(), next.end());
+    }
+    if (!s.tabs.empty() && !next.empty()) {
+        std::vector<TabInfo> ordered;
+        ordered.reserve(next.size());
+        std::vector<bool> used(next.size(), false);
+        for (const auto& old : s.tabs) {
+            for (size_t i = 0; i < next.size(); ++i) {
+                if (!used[i] && next[i].hwnd == old.hwnd) {
+                    ordered.push_back(next[i]);
+                    used[i] = true;
+                    break;
+                }
+            }
+        }
+        for (size_t i = 0; i < next.size(); ++i) {
+            if (!used[i]) {
+                ordered.push_back(next[i]);
+            }
+        }
+        next.swap(ordered);
+    }
+
+    if (s.bitmap) {
+        Graphics g(s.bitmap);
+        LayoutTabs(s, next, &g);
+    } else {
+        LayoutTabs(s, next, nullptr);
+    }
+
+    bool changed = s.tabs.size() != next.size();
+    if (!changed) {
+        for (size_t i = 0; i < next.size(); ++i) {
+            if (s.tabs[i].hwnd != next[i].hwnd ||
+                s.tabs[i].title != next[i].title) {
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    if (changed) {
+        s.tabs.swap(next);
+        if (s.hoverTab >= static_cast<int>(s.tabs.size())) {
+            s.hoverTab = -1;
+        }
+    }
+    return changed;
 }
 
 // 枚举默认渲染端点的音频会话，返回与目标进程匹配的会话。
@@ -1367,35 +1673,150 @@ void DrawBar(AppState& s) {
                                                 : Color(200, 255, 255, 255),
                     s.volumeMuted);
 
-    // ---- 居中显示聚焦窗口名称 ----
-    // 左右各预留对称空间（以两侧控件区较宽者为准），保证标题真正居中
-    if (s.targetTitle[0] != L'\0') {
-        FontFamily titleFamily(L"Segoe UI");
-        Gdiplus::Font titleFont(&titleFamily, 14.0f * k, FontStyleRegular, UnitPixel);
+    // ---- Chrome 风格标签：从音量键右侧到右侧三键之间 ----
+    LayoutTabs(s, s.tabs, &g);
+    RectF minR, maxR, closeR;
+    ComputeButtonRects(s, minR, maxR, closeR);
 
-        const float leftBlock = volR.X + volR.Width + 6.0f * k;
-        const float rightBlock = 3.0f * kButtonWidthBase * k + 6.0f * k;
-        const float reserve = (std::max)(leftBlock, rightBlock);
-        RectF textRect(reserve, 0,
-                       (std::max)(static_cast<float>(s.width) - 2.0f * reserve, 1.0f),
-                       barH);
-        StringFormat sf;
-        sf.SetAlignment(StringAlignmentCenter);
-        sf.SetLineAlignment(StringAlignmentCenter);
-        sf.SetTrimming(StringTrimmingEllipsisCharacter);
+    FontFamily tabFamily(L"Segoe UI");
+    Gdiplus::Font tabFont(&tabFamily, 12.0f * k, FontStyleRegular, UnitPixel);
 
-        SolidBrush shadowBrush(Color(70, 0, 0, 0));
-        RectF shadowRect(textRect.X, textRect.Y + 1.0f, textRect.Width, textRect.Height);
-        g.DrawString(s.targetTitle, -1, &titleFont, shadowRect, &sf, &shadowBrush);
+    int activeIndex = -1;
+    for (size_t i = 0; i < s.tabs.size(); ++i) {
+        if (s.tabs[i].hwnd == s.targetHwnd) {
+            activeIndex = static_cast<int>(i);
+            break;
+        }
+    }
 
-        SolidBrush textBrush(s.hasTarget ? Color(235, 255, 255, 255)
-                                         : Color(110, 255, 255, 255));
-        g.DrawString(s.targetTitle, -1, &titleFont, textRect, &sf, &textBrush);
+    // 未激活标签之间的竖线：高度略小于标签栏高度，上下留白相等
+    for (size_t i = 0; i + 1 < s.tabs.size(); ++i) {
+        const bool leftActive = (s.tabs[i].hwnd == s.targetHwnd);
+        const bool rightActive = (s.tabs[i + 1].hwnd == s.targetHwnd);
+        if (leftActive || rightActive) {
+            continue;
+        }
+        const float sepX = s.tabs[i].rect.X + s.tabs[i].rect.Width;
+        const float sepInset = kTabDividerInset * k;
+        const float sepY0 = sepInset;
+        const float sepY1 = barH - sepInset;
+        if (sepY1 > sepY0) {
+            Pen sepPen(Color(120, 255, 255, 255), 1.0f * k);
+            g.DrawLine(&sepPen, sepX, sepY0, sepX, sepY1);
+        }
+    }
+
+    for (size_t i = 0; i < s.tabs.size(); ++i) {
+        const TabInfo& tab = s.tabs[i];
+        const RectF& r = tab.rect;
+        if (r.Width <= 0.0f || r.Height <= 0.0f) {
+            continue;
+        }
+
+        const bool active = (tab.hwnd == s.targetHwnd);
+        const bool hover = (s.hoverButton == kHitTab &&
+                            s.hoverTab == static_cast<int>(i));
+
+        if (active) {
+            // 当前标签：只保留上圆角，底部平直；相邻未激活标签再补下圆角
+            const float inset = kTabTopInset * k;
+            RectF visual(r.X, inset, r.Width, barH - inset);
+            if (visual.Height > 0.0f) {
+                GraphicsPath activePath;
+                const float rTop = (std::min)(8.0f * k, visual.Width * 0.5f);
+                const float x0 = visual.X;
+                const float y0 = visual.Y;
+                const float x1 = visual.X + visual.Width;
+                const float y1 = visual.Y + visual.Height;
+
+                // 左上外凸圆角
+                activePath.AddArc(x0, y0, rTop * 2.0f, rTop * 2.0f,
+                                  180.0f, 90.0f);
+                activePath.AddLine(x0 + rTop, y0, x1 - rTop, y0);
+                // 右上外凸圆角
+                activePath.AddArc(x1 - rTop * 2.0f, y0,
+                                  rTop * 2.0f, rTop * 2.0f, 270.0f, 90.0f);
+                // 右侧直下、底边直通、左侧直上
+                activePath.AddLine(x1, y0 + rTop, x1, y1);
+                activePath.AddLine(x1, y1, x0, y1);
+                activePath.AddLine(x0, y1, x0, y0 + rTop);
+                activePath.CloseFigure();
+
+                SolidBrush fillBrush(hover ? Color(80, 255, 255, 255)
+                                           : Color(45, 255, 255, 255));
+                g.FillPath(&fillBrush, &activePath);
+                // 边框尽量细：固定 1 像素，不随 DPI 加粗
+                Pen borderPen(hover ? Color(220, 255, 255, 255)
+                                    : Color(160, 255, 255, 255),
+                              1.0f);
+                g.DrawPath(&borderPen, &activePath);
+            }
+        } else if (activeIndex >= 0 &&
+                   (static_cast<int>(i) == activeIndex - 1 ||
+                    static_cast<int>(i) == activeIndex + 1)) {
+            // 与当前标签相邻的未激活标签：只画与上圆角相反对称的下圆角。
+            // 边框先沿侧边向下，经过四分之一圆后汇入该未激活标签的下边框。
+            const float rBot = (std::min)(8.0f * k, r.Width * 0.25f);
+            Pen cornerPen(Color(140, 255, 255, 255), 1.0f);
+            if (static_cast<int>(i) == activeIndex - 1) {
+                // 左侧相邻标签：右下角内凹，圆心在左边框左侧
+                const float x1 = r.X + r.Width;
+                RectF box(x1 - rBot * 2.0f,
+                          barH - rBot * 2.0f,
+                          rBot * 2.0f, rBot * 2.0f);
+                g.DrawArc(&cornerPen, box, 0.0f, 90.0f);
+            } else {
+                // 右侧相邻标签：左下角内凹，圆心在右边框右侧
+                const float x0 = r.X;
+                RectF box(x0,
+                          barH - rBot * 2.0f,
+                          rBot * 2.0f, rBot * 2.0f);
+                g.DrawArc(&cornerPen, box, 90.0f, 90.0f);
+            }
+        }
+
+        // 文字：未激活标签没有边框/背景，只显示文字
+        RectF textR;
+        if (active) {
+            const float inset = kTabTopInset * k;
+            textR = RectF(r.X + 8.0f * k, inset,
+                          (std::max)(r.Width - 16.0f * k, 1.0f),
+                          barH - inset);
+        } else {
+            textR = RectF(r.X + 8.0f * k, r.Y,
+                          (std::max)(r.Width - 16.0f * k, 1.0f), r.Height);
+        }
+        StringFormat tabSf;
+        tabSf.SetFormatFlags(StringFormatFlagsNoWrap);  // 只显示一行，超出宽度直接截断
+        tabSf.SetAlignment(StringAlignmentNear);  // 从左开始，超出部分在右侧淡出
+        tabSf.SetLineAlignment(StringAlignmentCenter);
+        tabSf.SetTrimming(StringTrimmingNone);  // 不用省略号，按渲染宽度截断
+
+        // 右侧末尾用渐变淡出代替省略号：文字在前段不透明，最后一点宽度渐变到透明
+        const Color textCol = active ? Color(255, 255, 255, 255)
+                           : hover ? Color(255, 255, 255, 255)
+                                   : Color(190, 255, 255, 255);
+        const float fadeWidth = 14.0f * k;
+        float fadeStart = 0.0f;
+        if (textR.Width > fadeWidth) {
+            fadeStart = 1.0f - fadeWidth / textR.Width;
+        }
+        Color fadeColors[3] = {
+            textCol,
+            textCol,
+            Color(0, textCol.GetRed(), textCol.GetGreen(), textCol.GetBlue())
+        };
+        REAL fadePos[3] = { 0.0f, fadeStart, 1.0f };
+        LinearGradientBrush textBrush(textR, fadeColors[0], fadeColors[2],
+                                      LinearGradientModeHorizontal);
+        textBrush.SetInterpolationColors(fadeColors, fadePos, 3);
+        GraphicsState state = g.Save();
+        g.SetClip(textR);  // 严格按可显示宽度截断，允许最后一个字符被部分裁掉
+        g.DrawString(tab.title.c_str(), -1, &tabFont, textR, &tabSf, &textBrush);
+        g.Restore(state);
     }
 
     // ---- 右侧三个 Chrome 风格按钮 ----
-    RectF minR, maxR, closeR;
-    ComputeButtonRects(s, minR, maxR, closeR);
 
     const Color glyph(200, 255, 255, 255);
     const Color glyphHover(255, 255, 255, 255);
@@ -1530,6 +1951,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         s->dpi = GetWindowDpi(hwnd);
         s->scale = static_cast<float>(s->dpi) / 96.0f;
         InstallVolumeHook(hwnd); // 常驻全局钩子：显式点击/Alt+Tab 检测 + 面板外点击收起
+        SetTimer(hwnd, kTabRefreshTimerId, 1000, nullptr); // 标签列表定期刷新
         return 0;
     }
 
@@ -1570,9 +1992,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             s->trackingMouse = true;
         }
         POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const int tabIndex = HitTestTab(*s, pt.x, pt.y);
         const ButtonHit hit = HitTestButton(*s, pt.x, pt.y);
-        if (hit != s->hoverButton) {
+        const int newHoverTab = (hit == kHitTab) ? tabIndex : -1;
+        if (hit != s->hoverButton || newHoverTab != s->hoverTab) {
             s->hoverButton = hit;
+            s->hoverTab = newHoverTab;
             DrawBarAndPresent(*s);
         }
         return 0;
@@ -1581,8 +2006,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_MOUSELEAVE:
         if (s) {
             s->trackingMouse = false;
-            if (!s->volumeDragging && s->hoverButton != kHitNone) {
+            if (!s->volumeDragging &&
+                (s->hoverButton != kHitNone || s->hoverTab != -1)) {
                 s->hoverButton = kHitNone;
+                s->hoverTab = -1;
                 DrawBarAndPresent(*s);
             }
         }
@@ -1593,11 +2020,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const int tabIndex = HitTestTab(*s, pt.x, pt.y);
         const ButtonHit hit = HitTestButton(*s, pt.x, pt.y);
 
         switch (hit) {
         case kHitVolume:
             SetVolumeOpen(*s, !s->volumeOpen);
+            break;
+        case kHitTab:
+            if (tabIndex >= 0 && tabIndex < static_cast<int>(s->tabs.size())) {
+                HWND tabHwnd = s->tabs[tabIndex].hwnd;
+                if (IsIconic(tabHwnd)) {
+                    ShowWindow(tabHwnd, SW_RESTORE);
+                }
+                SetForegroundWindow(tabHwnd);
+                ApplyTargetInfo(*s, tabHwnd);
+                s->targetSticky = false;
+                DrawBarAndPresent(*s);
+            }
             break;
         case kHitMinimize:
         case kHitMaximize:
@@ -1643,6 +2083,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
 
+    case WM_TIMER:
+        if (s && wParam == kTabRefreshTimerId) {
+            if (RefreshTabs(*s)) {
+                DrawBarAndPresent(*s);
+            }
+        }
+        return 0;
+
     case WM_DPICHANGED: {
         if (!s) {
             return 0;
@@ -1667,6 +2115,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_DESTROY:
+        KillTimer(hwnd, kTabRefreshTimerId);
         UninstallVolumeHook();
         if (s) {
             if (s->volumePanelHwnd) {
