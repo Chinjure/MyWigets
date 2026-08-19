@@ -22,6 +22,7 @@
 
 #include <windows.h>
 #include <windowsx.h>
+#include <shellapi.h>
 #include <objidl.h>  // GDI+ 需要 IStream 等 COM 类型，先于 gdiplus.h 包含
 #include <gdiplus.h>
 
@@ -48,6 +49,7 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "Mmdevapi.lib")
+#pragma comment(lib, "shell32.lib")
 
 using namespace Gdiplus;
 using Microsoft::WRL::ComPtr;
@@ -86,6 +88,13 @@ constexpr int kVolumePanelMargin = 2;   // 按键/面板贴合左上角的小边
 constexpr int kMuteButtonW = 30;        // 面板内静音按钮宽度
 constexpr UINT kVolumeApplyDelayMs = 40;
 constexpr UINT_PTR kTabRefreshTimerId = 1;  // 定时刷新同应用窗口标签
+// 前台窗口创建瞬间尚未可见时的延迟复查（一次性定时器）
+constexpr UINT_PTR kTargetRetryTimerId = 2;
+// 前台窗口创建中不可见时最多复查次数（每次间隔 150ms，
+// 资源管理器等窗口从激活到可见可能需要数百毫秒）
+constexpr int kMaxTargetRetry = 5;
+// 右键新建窗口后抢前台的失败重试次数（随标签刷新定时器触发，约每 1s 一次）
+constexpr int kMaxPendingFocusAttempts = 5;
 
 constexpr int kMenuExit = 1001;
 
@@ -102,6 +111,7 @@ enum ButtonHit {
 
 struct TabInfo {
     HWND hwnd = nullptr;
+    DWORD pid = 0;
     std::wstring title;
     RectF rect;  // 顶栏客户区坐标
 };
@@ -131,6 +141,17 @@ struct AppState {
 
     // Chrome 风格标签：聚焦窗口所属应用打开的全部顶层窗口
     std::vector<TabInfo> tabs;
+
+    // 右键“新建窗口”后的待插入状态：新窗口出现时插入到该标签右侧
+    HWND insertAfterTab = nullptr;
+    bool insertPending = false;
+
+    // 右键新建窗口的聚焦重试：新窗口出现后反复尝试抢前台，
+    // 直到窗口真正成为前台、用户已切到其他应用或达到重试上限
+    HWND pendingFocusHwnd = nullptr;
+    HWND pendingFocusOriginHwnd = nullptr;  // 挂起时的前台窗口：用户未切换则继续抢
+    int pendingFocusAttempts = 0;
+    int targetRetryCount = 0;   // 前台窗口创建中不可见的复查次数
 
     // ---- 音量调节（类似 Windows 音量合成器，控制前台窗口所在进程）----
     bool volumeOpen = false;             // 音量面板是否展开
@@ -407,6 +428,17 @@ void UpdateTarget(AppState& s) {
         ApplyTargetInfo(s, fg);
         s.targetSticky = false;
     } else {
+        // 前台是顶栏自身：忽略（顶栏 WS_EX_NOACTIVATE 本不应成为前台，
+        // 若发生不应因此清掉目标）
+        if (fg == s.hwnd) {
+            return;
+        }
+        // 前台窗口激活瞬间可能尚未可见（新建窗口创建中）：
+        // 保持当前目标，由 fg 事件处理里的延迟定时器在可见后复查，
+        // 避免"右键新建资源管理器窗口"等场景误清目标导致标签全丢
+        if (fg && IsWindow(fg) && !IsWindowVisible(fg)) {
+            return;
+        }
         s.targetHwnd = nullptr;
         s.hasTarget = false;
         s.targetSticky = false;
@@ -461,6 +493,72 @@ int HitTestTab(AppState& s, int x, int y) {
         }
     }
     return -1;
+}
+
+// 强制把窗口带到前台：附加到前台线程输入队列后依次执行
+// BringWindowToTop / SetForegroundWindow / SetActiveWindow / SetFocus。
+// SetActiveWindow / SetFocus 跨进程调用必须依赖输入队列附加，否则直接失败；
+// 顶栏自身是 WS_EX_NOACTIVATE 背景窗口，单独调 SetForegroundWindow
+// 很容易被系统前台锁拦截。全程不做按键模拟。
+// 返回窗口是否已成为前台窗口。
+bool ForceForegroundWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return false;
+    }
+    if (IsIconic(hwnd)) {
+        ShowWindow(hwnd, SW_RESTORE);
+    }
+    const DWORD curThread = GetCurrentThreadId();
+    const HWND fg = GetForegroundWindow();
+    const DWORD fgThread = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    const bool attached = fgThread && fgThread != curThread &&
+                          AttachThreadInput(curThread, fgThread, TRUE) != FALSE;
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+    if (attached) {
+        // 附加后目标窗口与当前线程共享输入队列，跨进程激活/聚焦才被允许
+        SetActiveWindow(hwnd);
+        if (IsWindow(hwnd)) {
+            SetFocus(hwnd);
+        }
+        AttachThreadInput(curThread, fgThread, FALSE);
+    }
+    return GetForegroundWindow() == hwnd;
+}
+
+// 右键标签：启动该应用的新进程/新窗口，并记录待插入位置
+std::wstring GetProcessPath(DWORD pid);  // 定义在下方
+void OpenNewAppWindow(AppState& s, HWND tabHwnd) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(tabHwnd, &pid);
+    if (pid == 0) {
+        return;
+    }
+    const std::wstring path = GetProcessPath(pid);
+    if (path.empty()) {
+        return;
+    }
+
+    // 顶栏是 WS_EX_NOACTIVATE 背景窗口，平时没有设置前台的权限，
+    // 直接 AllowSetForegroundWindow 不会生效（调用者必须自己能设置前台）。
+    // 先附加到前台线程输入队列，使本线程被视为前台进程，
+    // 再授权后，资源管理器等由 Shell 代建窗口的系统应用才能把新窗口带到前台。
+    const DWORD curThread = GetCurrentThreadId();
+    HWND fg = GetForegroundWindow();
+    const DWORD fgThread = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    const bool attached = fgThread && fgThread != curThread &&
+                          AttachThreadInput(curThread, fgThread, TRUE) != FALSE;
+    AllowSetForegroundWindow(ASFW_ANY);
+    // 用 ShellExecute 启动，交给 Shell 处理前台/焦点
+    HINSTANCE result = ShellExecuteW(nullptr, L"open", path.c_str(),
+                                     nullptr, nullptr, SW_SHOWNORMAL);
+    if (attached) {
+        AttachThreadInput(curThread, fgThread, FALSE);
+    }
+    if (reinterpret_cast<INT_PTR>(result) > 32) {
+        s.insertAfterTab = tabHwnd;
+        s.insertPending = true;
+    }
 }
 
 ButtonHit HitTestButton(AppState& s, int x, int y) {
@@ -613,6 +711,21 @@ std::wstring GetProcessName(DWORD pid) {
     return name;
 }
 
+std::wstring GetProcessPath(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) {
+        return L"";
+    }
+    wchar_t path[MAX_PATH] = {};
+    DWORD size = MAX_PATH;
+    if (QueryFullProcessImageNameW(h, 0, path, &size)) {
+        CloseHandle(h);
+        return std::wstring(path);
+    }
+    CloseHandle(h);
+    return L"";
+}
+
 // 判断两个顶层窗口是否属于同一个"应用"：
 // 同进程，或同可执行文件名（覆盖多进程/多窗口应用）。
 // 注意不能使用进程树判断：Explorer 启动的子进程会把资源管理器和其他应用误判为同一应用。
@@ -681,6 +794,7 @@ BOOL CALLBACK EnumAppWindowsProc(HWND hwnd, LPARAM lParam) {
 
     TabInfo info;
     info.hwnd = hwnd;
+    info.pid = pid;
     info.title = GetWindowTitleText(hwnd);
     ctx->tabs->push_back(info);
     return TRUE;
@@ -819,12 +933,72 @@ bool RefreshTabs(AppState& s) {
                 }
             }
         }
+
+        // 右键新建窗口的待插入：新出现的标签插入到指定标签右侧
+        if (s.insertAfterTab && s.insertPending) {
+            bool foundAnchor = false;
+            bool inserted = false;
+            HWND newHwnd = nullptr;
+            for (size_t pos = 0; pos < ordered.size(); ++pos) {
+                if (ordered[pos].hwnd == s.insertAfterTab) {
+                    foundAnchor = true;
+                    for (size_t i = 0; i < next.size(); ++i) {
+                        if (!used[i]) {
+                            newHwnd = next[i].hwnd;
+                            ordered.insert(ordered.begin() + pos + 1, next[i]);
+                            used[i] = true;
+                            inserted = true;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            if (inserted && newHwnd) {
+                // 新窗口出现后主动抢前台，解决 ShellExecute 打开后无法聚焦的问题；
+                // 单次尝试可能撞上前台锁 / 窗口初始化等瞬时状态，
+                // 因此挂起重试，直到窗口真正成为前台、用户切走或达到上限
+                s.pendingFocusHwnd = newHwnd;
+                s.pendingFocusOriginHwnd = GetForegroundWindow();
+                s.pendingFocusAttempts = 0;
+                ForceForegroundWindow(newHwnd);
+            }
+            if (!foundAnchor || inserted) {
+                s.insertAfterTab = nullptr;
+                s.insertPending = false;
+            }
+        }
+
         for (size_t i = 0; i < next.size(); ++i) {
             if (!used[i]) {
                 ordered.push_back(next[i]);
             }
         }
         next.swap(ordered);
+    }
+
+    // 右键新建窗口的聚焦重试：新窗口出现后可能因前台锁 / 初始化时序
+    // 第一次抢前台失败，随标签刷新定时器（约 1s）重试。
+    // 窗口消失、已成为前台、用户已切到其他应用或达到次数上限即停止。
+    if (s.pendingFocusHwnd) {
+        const HWND fg = GetForegroundWindow();
+        const bool done = !IsWindow(s.pendingFocusHwnd) || fg == s.pendingFocusHwnd;
+        if (done || ++s.pendingFocusAttempts > kMaxPendingFocusAttempts) {
+            s.pendingFocusHwnd = nullptr;
+            s.pendingFocusOriginHwnd = nullptr;
+            s.pendingFocusAttempts = 0;
+        } else {
+            // 用户已主动切到其他窗口（不是挂起时的前台窗口，
+            // 也不是桌面/任务栏等系统窗口）：不再抢前台，避免打扰用户
+            if (fg && fg != s.pendingFocusOriginHwnd &&
+                !IsShellSystemWindow(fg)) {
+                s.pendingFocusHwnd = nullptr;
+                s.pendingFocusOriginHwnd = nullptr;
+                s.pendingFocusAttempts = 0;
+            } else {
+                ForceForegroundWindow(s.pendingFocusHwnd);
+            }
+        }
     }
 
     if (s.bitmap) {
@@ -1062,6 +1236,14 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
     }
 
     if (event == EVENT_SYSTEM_FOREGROUND) {
+        // 新窗口激活瞬间可能尚未可见（正在创建）：立即按前台处理会
+        // 把目标误清（见 UpdateTarget）。延迟 150ms 等窗口可见后再复查，
+        // 期间保持当前目标不变；复查时仍不可见则继续（见 kMaxTargetRetry）。
+        if (hwnd && IsWindow(hwnd) && !IsWindowVisible(hwnd)) {
+            s->targetRetryCount = 0;
+            SetTimer(bar, kTargetRetryTimerId, 150, nullptr);
+            return;
+        }
         UpdateTarget(*s);
         DrawBarAndPresent(*s);
         return;
@@ -1681,14 +1863,6 @@ void DrawBar(AppState& s) {
     FontFamily tabFamily(L"Segoe UI");
     Gdiplus::Font tabFont(&tabFamily, 12.0f * k, FontStyleRegular, UnitPixel);
 
-    int activeIndex = -1;
-    for (size_t i = 0; i < s.tabs.size(); ++i) {
-        if (s.tabs[i].hwnd == s.targetHwnd) {
-            activeIndex = static_cast<int>(i);
-            break;
-        }
-    }
-
     // 未激活标签之间的竖线：高度略小于标签栏高度，上下留白相等
     for (size_t i = 0; i + 1 < s.tabs.size(); ++i) {
         const bool leftActive = (s.tabs[i].hwnd == s.targetHwnd);
@@ -1718,8 +1892,7 @@ void DrawBar(AppState& s) {
                             s.hoverTab == static_cast<int>(i));
 
         if (active) {
-            // 当前标签：只保留上圆角；底部在相邻未打开标签处贴合其下圆角，
-            // 没有相邻未打开标签的一侧才保持平直。
+            // 当前标签：两侧始终使用相同的下圆角样式，即使没有相邻未打开标签也不出现平直底部。
             const float inset = kTabTopInset * k;
             RectF visual(r.X, inset, r.Width, barH - inset);
             if (visual.Height > 0.0f) {
@@ -1730,9 +1903,6 @@ void DrawBar(AppState& s) {
                 const float y0 = visual.Y;
                 const float x1 = visual.X + visual.Width;
                 const float y1 = visual.Y + visual.Height;
-                const bool hasLeft = activeIndex > 0;
-                const bool hasRight = activeIndex >= 0 &&
-                                      activeIndex + 1 < static_cast<int>(s.tabs.size());
 
                 // 左上外凸圆角
                 activePath.AddArc(x0, y0, rTop * 2.0f, rTop * 2.0f,
@@ -1741,25 +1911,19 @@ void DrawBar(AppState& s) {
                 // 右上外凸圆角
                 activePath.AddArc(x1 - rTop * 2.0f, y0,
                                   rTop * 2.0f, rTop * 2.0f, 270.0f, 90.0f);
-
-                // 右侧：有相邻未打开标签时，填充延伸到右侧共用圆角，贴合未打开标签
-                if (hasRight) {
-                    activePath.AddLine(x1, y0 + rTop, x1, y1 - rBot);
+                // 右侧边框向下到右下圆角起点
+                activePath.AddLine(x1, y0 + rTop, x1, y1 - rBot);
+                // 右下圆角（与未打开标签共用的样式）
+                {
                     RectF brBox(x1,
                                 y1 - rBot * 2.0f,
                                 rBot * 2.0f, rBot * 2.0f);
                     activePath.AddArc(brBox, 180.0f, -90.0f);
-                } else {
-                    activePath.AddLine(x1, y0 + rTop, x1, y1);
                 }
-
-                // 底边：有相邻未打开标签时延伸到其圆角末端，填充到共用边框
-                const float bottomRightX = hasRight ? x1 + rBot : x1;
-                const float bottomLeftX = hasLeft ? x0 - rBot : x0;
-                activePath.AddLine(bottomRightX, y1, bottomLeftX, y1);
-
-                // 左侧：有相邻未打开标签时，填充延伸到左侧共用圆角，贴合未打开标签
-                if (hasLeft) {
+                // 底边
+                activePath.AddLine(x1 + rBot, y1, x0 - rBot, y1);
+                // 左下圆角（与未打开标签共用的样式）
+                {
                     RectF blBox(x0 - rBot * 2.0f,
                                 y1 - rBot * 2.0f,
                                 rBot * 2.0f, rBot * 2.0f);
@@ -1770,38 +1934,7 @@ void DrawBar(AppState& s) {
                 SolidBrush fillBrush(hover ? Color(80, 255, 255, 255)
                                            : Color(45, 255, 255, 255));
                 g.FillPath(&fillBrush, &activePath);
-                // 边框尽量细：固定 1 像素，不随 DPI 加粗。
-                // 只画上圆角和侧边；底部圆角由相邻未打开标签提供，避免出现对称的重复圆角。
-                Pen borderPen(hover ? Color(220, 255, 255, 255)
-                                    : Color(160, 255, 255, 255),
-                              1.0f);
-                g.DrawArc(&borderPen, RectF(x0, y0, rTop * 2.0f, rTop * 2.0f),
-                          180.0f, 90.0f);
-                g.DrawLine(&borderPen, x0 + rTop, y0, x1 - rTop, y0);
-                g.DrawArc(&borderPen,
-                          RectF(x1 - rTop * 2.0f, y0,
-                                rTop * 2.0f, rTop * 2.0f),
-                          270.0f, 90.0f);
-                if (hasRight) {
-                    g.DrawLine(&borderPen, x1, y0 + rTop, x1, y1 - rBot);
-                } else {
-                    g.DrawLine(&borderPen, x1, y0 + rTop, x1, y1);
-                }
-                // 底部边框只在没有相邻未打开标签的一侧绘制
-                if (!hasLeft) {
-                    g.DrawLine(&borderPen, x0, y1,
-                               hasRight ? x1 - rBot : x1, y1);
-                }
-                if (!hasRight) {
-                    g.DrawLine(&borderPen,
-                               hasLeft ? x0 + rBot : x0, y1,
-                               x1, y1);
-                }
-                if (hasLeft) {
-                    g.DrawLine(&borderPen, x0, y1 - rBot, x0, y0 + rTop);
-                } else {
-                    g.DrawLine(&borderPen, x0, y1, x0, y0 + rTop);
-                }
+                // 不绘制边框，只保留浅色背景填充
             }
         }
 
@@ -1814,70 +1947,23 @@ void DrawBar(AppState& s) {
         if (r.Width <= 0.0f || r.Height <= 0.0f) {
             continue;
         }
-        const bool active = (tab.hwnd == s.targetHwnd);
-        const bool hover = (s.hoverButton == kHitTab &&
-                            s.hoverTab == static_cast<int>(i));
-
-        RectF textR;
-        if (active) {
-            const float inset = kTabTopInset * k;
-            textR = RectF(r.X + 8.0f * k, inset,
-                          (std::max)(r.Width - 16.0f * k, 1.0f),
-                          barH - inset);
-        } else {
-            textR = RectF(r.X + 8.0f * k, r.Y,
-                          (std::max)(r.Width - 16.0f * k, 1.0f), r.Height);
-        }
+        // 所有标签标题使用相同的高度和垂直居中，避免已打开/未打开标题高度不一致
+        RectF textR = RectF(r.X + 8.0f * k, r.Y,
+                            (std::max)(r.Width - 16.0f * k, 1.0f),
+                            r.Height);
         StringFormat tabSf;
         tabSf.SetFormatFlags(StringFormatFlagsNoWrap);  // 只显示一行，超出宽度直接截断
-        tabSf.SetAlignment(StringAlignmentNear);  // 从左开始，超出部分在右侧淡出
+        tabSf.SetAlignment(StringAlignmentNear);  // 从左开始，超出部分在右侧截断
         tabSf.SetLineAlignment(StringAlignmentCenter);
         tabSf.SetTrimming(StringTrimmingNone);  // 不用省略号，按渲染宽度截断
 
-        const Color textCol = active ? Color(255, 255, 255, 255)
-                           : hover ? Color(255, 255, 255, 255)
-                                   : Color(190, 255, 255, 255);
-        const float fadeWidth = 14.0f * k;
-        float fadeStart = 0.0f;
-        if (textR.Width > fadeWidth) {
-            fadeStart = 1.0f - fadeWidth / textR.Width;
-        }
-        Color fadeColors[3] = {
-            textCol,
-            textCol,
-            Color(0, textCol.GetRed(), textCol.GetGreen(), textCol.GetBlue())
-        };
-        REAL fadePos[3] = { 0.0f, fadeStart, 1.0f };
-        LinearGradientBrush textBrush(textR, fadeColors[0], fadeColors[2],
-                                      LinearGradientModeHorizontal);
-        textBrush.SetInterpolationColors(fadeColors, fadePos, 3);
+        // 未打开标签与已打开标签使用相同亮度的文字颜色；不绘制末尾渐变
+        const Color textCol(255, 255, 255, 255);
+        SolidBrush textBrush(textCol);
         GraphicsState state = g.Save();
         g.SetClip(textR);
         g.DrawString(tab.title.c_str(), -1, &tabFont, textR, &tabSf, &textBrush);
         g.Restore(state);
-    }
-
-    // 相邻未打开标签的下圆角统一最后绘制，覆盖在已打开标签延伸出来的填充之上
-    if (activeIndex >= 0) {
-        Pen cornerPen(Color(140, 255, 255, 255), 1.0f);
-        if (activeIndex > 0) {
-            const RectF& r = s.tabs[activeIndex - 1].rect;
-            const float rBot = (std::min)(8.0f * k, r.Width * 0.25f);
-            const float x1 = r.X + r.Width;
-            RectF box(x1 - rBot * 2.0f,
-                      barH - rBot * 2.0f,
-                      rBot * 2.0f, rBot * 2.0f);
-            g.DrawArc(&cornerPen, box, 0.0f, 90.0f);
-        }
-        if (activeIndex + 1 < static_cast<int>(s.tabs.size())) {
-            const RectF& r = s.tabs[activeIndex + 1].rect;
-            const float rBot = (std::min)(8.0f * k, r.Width * 0.25f);
-            const float x0 = r.X;
-            RectF box(x0,
-                      barH - rBot * 2.0f,
-                      rBot * 2.0f, rBot * 2.0f);
-            g.DrawArc(&cornerPen, box, 90.0f, 90.0f);
-        }
     }
 
     // ---- 右侧三个 Chrome 风格按钮 ----
@@ -2097,7 +2183,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (IsIconic(tabHwnd)) {
                     ShowWindow(tabHwnd, SW_RESTORE);
                 }
-                SetForegroundWindow(tabHwnd);
+                ForceForegroundWindow(tabHwnd);
                 ApplyTargetInfo(*s, tabHwnd);
                 s->targetSticky = false;
                 DrawBarAndPresent(*s);
@@ -2128,9 +2214,33 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
-    case WM_RBUTTONUP:
-        ShowExitMenu(hwnd);
+    case WM_MBUTTONDOWN: {
+        // 中键点击标签：关闭对应窗口
+        if (!s) {
+            return 0;
+        }
+        POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const int tabIndex = HitTestTab(*s, pt.x, pt.y);
+        if (tabIndex >= 0 && tabIndex < static_cast<int>(s->tabs.size())) {
+            PostMessageW(s->tabs[tabIndex].hwnd, WM_CLOSE, 0, 0);
+        }
         return 0;
+    }
+
+    case WM_RBUTTONUP: {
+        // 右键标签：在该标签右侧打开应用新窗口；右键空白处仍显示退出菜单
+        if (!s) {
+            return 0;
+        }
+        POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const int tabIndex = HitTestTab(*s, pt.x, pt.y);
+        if (tabIndex >= 0 && tabIndex < static_cast<int>(s->tabs.size())) {
+            OpenNewAppWindow(*s, s->tabs[tabIndex].hwnd);
+        } else {
+            ShowExitMenu(hwnd);
+        }
+        return 0;
+    }
 
     case kCloseVolumeMsg:
         // 全局鼠标钩子检测到点击面板外（桌面/其他窗口）时请求收起
@@ -2148,9 +2258,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_TIMER:
-        if (s && wParam == kTabRefreshTimerId) {
+        if (!s) {
+            return 0;
+        }
+        if (wParam == kTabRefreshTimerId) {
             if (RefreshTabs(*s)) {
                 DrawBarAndPresent(*s);
+            }
+        } else if (wParam == kTargetRetryTimerId) {
+            // 前台窗口创建中的延迟复查：窗口应已可见
+            KillTimer(hwnd, kTargetRetryTimerId);
+            UpdateTarget(*s);
+            DrawBarAndPresent(*s);
+            // 前台窗口仍在创建中（不可见）：继续复查，最多 kMaxTargetRetry 次
+            const HWND fg = GetForegroundWindow();
+            if (fg && IsWindow(fg) && !IsWindowVisible(fg) &&
+                ++s->targetRetryCount < kMaxTargetRetry) {
+                SetTimer(hwnd, kTargetRetryTimerId, 150, nullptr);
             }
         }
         return 0;
@@ -2180,6 +2304,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_DESTROY:
         KillTimer(hwnd, kTabRefreshTimerId);
+        KillTimer(hwnd, kTargetRetryTimerId);
         UninstallVolumeHook();
         if (s) {
             if (s->volumePanelHwnd) {
