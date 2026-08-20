@@ -1,7 +1,7 @@
 # chrome-tab-sync — DesktopTopBar Chrome 标签同步扩展
 
 把 Chrome 当前聚焦窗口的**真实标签页**实时同步到 DesktopTopBar 桌面顶栏，
-顶栏可直接操作这些标签：点击切换、悬停 × / 中键关闭、右侧 + / 右键新建。
+顶栏可直接操作这些标签：点击切换、中键关闭、右键新建。
 
 ## 安装（一次即可）
 
@@ -18,9 +18,7 @@
 | --- | --- |
 | 聚焦任意 Chrome/Edge 窗口 | 顶栏标签变为该窗口内的真实标签页（标题实时同步） |
 | 左键点击标签 | 切换到该标签页（并聚焦对应 Chrome 窗口） |
-| 悬停标签右侧的 × | 关闭该标签页 |
 | 鼠标中键点击标签 | 关闭该标签页 |
-| 标签区末尾的 ＋ | 新建标签页 |
 | 右键标签 | 新建标签页 |
 | 关闭 Chrome / 卸载扩展 | 顶栏自动回退为原来的「窗口枚举」模式 |
 
@@ -37,7 +35,7 @@ DesktopTopBar 内置 WS 服务端（顶栏进程内，仅绑定本机回环地�
    │  事件推送：hello / windowFocused / tabCreated|Updated|Removed|Moved|Activated
    │  命令下发：activateTab / closeTab / newTab
    ▼
-顶栏标签区渲染（Chrome 风格，含激活高亮 / 固定标签圆点 / 关闭× / ＋按钮）
+顶栏标签区渲染（Chrome 风格，含激活高亮 / 固定标签圆点）
 ```
 
 - 扩展只向顶栏推送**当前聚焦 Chrome 窗口**的标签（`tabs` + `alarms` 权限，

@@ -7,8 +7,8 @@
 //   3. 从音量键右侧到右侧三键之间显示 Chrome 风格标签：
 //      - 普通应用：标签为聚焦窗口所属应用打开的全部窗口，名字为对应窗口名
 //      - Chrome/Edge（安装了 chrome-tab-sync 扩展并连接后）：标签为浏览器内
-//        当前聚焦窗口的真实标签页（标题同步、点击切换、中键/悬停×关闭、
-//        右侧 + 新建标签页）。未连接扩展时回退为窗口枚举。
+//        当前聚焦窗口的真实标签页（标题同步、点击切换、中键关闭、
+//        右键新建标签页）。未连接扩展时回退为窗口枚举。
 //   4. 顶栏右侧提供 Chrome 浏览器风格的 最小化 / 最大化 / 关闭 三个按钮，
 //      用于控制当前聚焦窗口
 //   5. 高度等于 Chrome 浏览器标签栏的高度（约 40px，随 DPI 缩放）
@@ -97,6 +97,10 @@ constexpr int kButtonGap = 4;
 constexpr float kTabTopInset = 5.0f;        // 活动标签顶部留白，底部贴住标签栏
 constexpr float kTabDividerInset = 8.0f;    // 未激活标签之间竖线的上下留白
 
+// 统一标签宽度（96 DPI 基准，随 DPI 缩放）：空间充裕时所有标签等宽，
+// 不随标题长度变化；标签多到放不下时沿用自动缩小逻辑
+constexpr float kUniformTabWidth = 240.0f;   // 1.5 × 160 基准宽度
+
 // 左上角音量按钮与展开面板
 constexpr int kVolumeButtonW = 46;      // 音量按钮宽度（与窗口控制按钮一致，便于点击）
 constexpr int kVolumePanelW = 260;      // 展开的音量面板宽度
@@ -148,7 +152,6 @@ enum ButtonHit {
     kHitMaximize = 1,
     kHitClose = 2,
     kHitTab = 6,        // Chrome 风格标签区域
-    kHitNewTab = 7,     // Chrome 模式：标签区右侧的新建标签按钮
 };
 
 struct TabInfo {
@@ -192,9 +195,6 @@ struct AppState {
 
     // Chrome 标签同步状态（UI 线程维护，数据来自 chrome-tab-sync 扩展）
     wsproto::ChromeSyncModel chromeSync;
-    // Chrome 模式悬停状态：标签上的关闭按钮 / 新建标签按钮
-    int hoverTabClose = -1;
-    bool hoverNewTab = false;
 
     // 右键“新建窗口”后的待插入状态：新窗口出现时插入到该标签右侧
     HWND insertAfterTab = nullptr;
@@ -401,8 +401,6 @@ void ChromeSyncSendCloseTab(int tabId);
 void ChromeSyncSendNewTab();
 void ChromeSyncStart(HWND hwnd);
 void ChromeSyncStop();
-RectF TabCloseRect(const RectF& r, float k);
-RectF NewTabRect(AppState& s);
 
 // 音量面板几何 / 操作的前置声明（定义在下方，供命中测试与消息处理使用）
 int BarHeight(AppState& s);
@@ -644,15 +642,6 @@ ButtonHit HitTestButton(AppState& s, int x, int y) {
         return kHitVolume;
     }
 
-    // Chrome 同步模式：新建标签按钮（位于标签区末尾，优先于标签命中）
-    if (ChromeSyncMode(s)) {
-        RectF nt = NewTabRect(s);
-        if (x >= static_cast<int>(nt.X) && x < static_cast<int>(nt.X + nt.Width) &&
-            y < BarAreaHeight(s)) {
-            return kHitNewTab;
-        }
-    }
-
     // Chrome 风格标签区域
     if (HitTestTab(s, x, y) >= 0) {
         return kHitTab;
@@ -804,32 +793,6 @@ bool IsChromeTarget(HWND hwnd) {
 // 当前是否处于 Chrome 同步模式：扩展已连接 且 目标是 Chromium 窗口
 bool ChromeSyncMode(AppState& s) {
     return s.chromeSync.connected && IsChromeTarget(s.targetHwnd);
-}
-
-// 标签上的关闭按钮矩形（Chrome 模式，悬停/激活标签右侧的 ×）
-RectF TabCloseRect(const RectF& r, float k) {
-    const float w = 20.0f * k;
-    return RectF(r.X + r.Width - w - 6.0f * k, (r.Height - w) * 0.5f, w, w);
-}
-
-// 新建标签按钮矩形（Chrome 模式：标签区末尾，无标签时位于标签区左端）
-RectF NewTabRect(AppState& s) {
-    const float k = s.scale;
-    const float w = 34.0f * k;
-    RectF volR;
-    VolumeButtonRect(s, volR);
-    RectF minR, maxR, closeR;
-    ComputeButtonRects(s, minR, maxR, closeR);
-    const float left = volR.X + volR.Width + 6.0f * k;
-    const float right = minR.X - 6.0f * k;
-    float x = left;
-    if (!s.tabs.empty()) {
-        x = s.tabs.back().rect.X + s.tabs.back().rect.Width + 4.0f * k;
-    }
-    if (x + w > right) {
-        x = right - w;
-    }
-    return RectF(x, 0.0f, w, static_cast<float>(BarAreaHeight(s)));
 }
 
 // 向扩展发送一条 JSON 命令（UTF-8 文本帧）；未连接时返回 false
@@ -1265,9 +1228,15 @@ BOOL CALLBACK EnumAppWindowsProc(HWND hwnd, LPARAM lParam) {
 }
 
 // 根据当前宽度计算每个标签的矩形（从音量键右侧到右侧三键左侧）。
-// measureG 可传入正在绘制的 Graphics，避免对同一 Bitmap 重复创建 Graphics。
+// 所有标签始终等宽，不随标题长度变化：
+//   - 空间充裕（统一宽度放得下所有标签）时，全部使用统一宽度；
+//   - 标签多到放不下时，每个标签同时缩小相同程度，
+//     总长度恰好铺满标签区（每格 = 可用宽度 / 标签数），
+//     即整体缩小时正好是容纳所有标签的最大宽度。
+// measureG 保留仅为兼容调用方（已不再需要测量标题）。
 void LayoutTabs(AppState& s, std::vector<TabInfo>& tabs,
                 Graphics* measureG = nullptr) {
+    (void)measureG;
     if (tabs.empty()) {
         return;
     }
@@ -1285,68 +1254,16 @@ void LayoutTabs(AppState& s, std::vector<TabInfo>& tabs,
         return;
     }
 
-    const float minW = 60.0f * k;
-    const float maxW = 220.0f * k;
-    const float pad = 20.0f * k;
-
-    std::vector<float> desired;
-    desired.reserve(tabs.size());
-    FontFamily family(L"Segoe UI");
-    Font font(&family, 12.0f * k, FontStyleRegular, UnitPixel);
-    StringFormat sf;
-    sf.SetFormatFlags(StringFormatFlagsNoWrap);
-
-    std::unique_ptr<Graphics> localG;
-    Graphics* mg = measureG;
-    if (!mg && s.bitmap) {
-        localG.reset(new Graphics(s.bitmap));
-        mg = localG.get();
-    }
-
-    for (const auto& tab : tabs) {
-        float textW = 0.0f;
-        if (mg) {
-            RectF layoutRect(0, 0, 10000.0f, 100.0f);
-            RectF bound;
-            mg->MeasureString(tab.title.c_str(), -1, &font, layoutRect, &sf, &bound);
-            textW = bound.Width;
-        } else {
-            textW = static_cast<float>(tab.title.size()) * 7.0f * k;
-        }
-        desired.push_back(std::clamp(textW + pad, minW, maxW));
-    }
-
-    float totalDesired = 0.0f;
-    for (float w : desired) {
-        totalDesired += w;
-    }
-    float scaleFactor = totalDesired > 0.0f ? available / totalDesired : 0.0f;
-    if (scaleFactor > 1.0f) {
-        scaleFactor = 1.0f;
-    }
-
+    // 空间充裕取统一宽度；不足则等分铺满（每个标签缩小相同程度）
+    const float w = (std::min)(kUniformTabWidth * k,
+                               available / static_cast<float>(tabs.size()));
     float x = left;
-    for (size_t i = 0; i < tabs.size(); ++i) {
-        float w = desired[i] * scaleFactor;
-        if (w < minW) {
-            w = minW;
-        }
-        tabs[i].rect.X = x;
-        tabs[i].rect.Y = 0.0f;
-        tabs[i].rect.Width = w;
-        tabs[i].rect.Height = static_cast<float>(BarAreaHeight(s));
+    for (auto& tab : tabs) {
+        tab.rect.X = x;
+        tab.rect.Y = 0.0f;
+        tab.rect.Width = w;
+        tab.rect.Height = static_cast<float>(BarAreaHeight(s));
         x += w;
-    }
-
-    // 标签过多时强制均分，保证不侵入右侧三键区域
-    if (x > right + 0.5f) {
-        const float step = (right - left) / static_cast<float>(tabs.size());
-        x = left;
-        for (auto& tab : tabs) {
-            tab.rect.X = x;
-            tab.rect.Width = step;
-            x += step;
-        }
     }
 }
 
@@ -1519,9 +1436,6 @@ bool RefreshTabs(AppState& s) {
         s.tabs.swap(next);
         if (s.hoverTab >= static_cast<int>(s.tabs.size())) {
             s.hoverTab = -1;
-        }
-        if (s.hoverTabClose >= static_cast<int>(s.tabs.size())) {
-            s.hoverTabClose = -1;
         }
     }
 
@@ -2512,12 +2426,7 @@ void DrawBar(AppState& s) {
         if (r.Width <= 0.0f || r.Height <= 0.0f) {
             continue;
         }
-        const bool active = tabActive(tab);
-        const bool hover = (s.hoverButton == kHitTab &&
-                            s.hoverTab == static_cast<int>(i));
 
-        // Chrome 同步模式：激活/悬停标签右侧预留关闭按钮空间
-        const bool reserveClose = chromeMode && (active || hover);
         float textLeft = r.X + 8.0f * k;
         if (chromeMode && tab.chromePinned) {
             // 固定标签：左侧画小圆点，标题相应右移
@@ -2529,10 +2438,7 @@ void DrawBar(AppState& s) {
             textLeft += 10.0f * k;
         }
         // 所有标签标题使用相同的高度和垂直居中，避免已打开/未打开标题高度不一致
-        float textRight = r.X + r.Width - 8.0f * k;
-        if (reserveClose) {
-            textRight -= 22.0f * k;
-        }
+        const float textRight = r.X + r.Width - 8.0f * k;
         RectF textR = RectF(textLeft, r.Y,
                             (std::max)(textRight - textLeft, 1.0f),
                             r.Height);
@@ -2549,53 +2455,6 @@ void DrawBar(AppState& s) {
         g.SetClip(textR);
         g.DrawString(tab.title.c_str(), -1, &tabFont, textR, &tabSf, &textBrush);
         g.Restore(state);
-    }
-
-    // ---- Chrome 同步模式：标签关闭按钮（激活/悬停标签右侧的 ×）----
-    if (chromeMode) {
-        for (size_t i = 0; i < s.tabs.size(); ++i) {
-            const TabInfo& tab = s.tabs[i];
-            const RectF& r = tab.rect;
-            if (r.Width <= 0.0f || r.Height <= 0.0f) {
-                continue;
-            }
-            const bool active = tabActive(tab);
-            const bool hover = (s.hoverButton == kHitTab &&
-                                s.hoverTab == static_cast<int>(i));
-            if (!active && !hover) {
-                continue;
-            }
-            const RectF cr = TabCloseRect(r, k);
-            const bool closeHover =
-                (s.hoverTabClose == static_cast<int>(i));
-            SolidBrush closeBg(closeHover ? Color(110, 255, 255, 255)
-                                          : Color(55, 255, 255, 255));
-            g.FillEllipse(&closeBg, cr);
-            Pen closePen(closeHover ? Color(255, 255, 255, 255)
-                                    : Color(210, 255, 255, 255),
-                         1.3f * k);
-            closePen.SetStartCap(LineCapRound);
-            closePen.SetEndCap(LineCapRound);
-            const float d = 4.0f * k;
-            const float cx = cr.X + cr.Width * 0.5f;
-            const float cy = cr.Y + cr.Height * 0.5f;
-            g.DrawLine(&closePen, cx - d, cy - d, cx + d, cy + d);
-            g.DrawLine(&closePen, cx + d, cy - d, cx - d, cy + d);
-        }
-
-        // ---- 新建标签按钮（+）----
-        const RectF nt = NewTabRect(s);
-        DrawButtonHover(g, nt, kHitNewTab, s.hoverButton);
-        Pen plusPen(s.hoverButton == kHitNewTab ? Color(255, 255, 255, 255)
-                                                : Color(200, 255, 255, 255),
-                    1.5f * k);
-        plusPen.SetStartCap(LineCapRound);
-        plusPen.SetEndCap(LineCapRound);
-        const float cx = nt.X + nt.Width * 0.5f;
-        const float cy = nt.Y + nt.Height * 0.5f;
-        const float d = 4.5f * k;
-        g.DrawLine(&plusPen, cx - d, cy, cx + d, cy);
-        g.DrawLine(&plusPen, cx, cy - d, cx, cy + d);
     }
 
     // ---- 右侧三个 Chrome 风格按钮 ----
@@ -2780,30 +2639,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const ButtonHit hit = HitTestButton(*s, pt.x, pt.y);
         const int newHoverTab = (hit == kHitTab) ? tabIndex : -1;
 
-        // Chrome 同步模式：悬停标签右侧关闭按钮 / 新建标签按钮
-        int newHoverTabClose = -1;
-        bool newHoverNewTab = false;
-        if (ChromeSyncMode(*s)) {
-            if (newHoverTab >= 0 &&
-                static_cast<size_t>(newHoverTab) < s->tabs.size()) {
-                const RectF cr = TabCloseRect(s->tabs[newHoverTab].rect, s->scale);
-                if (pt.x >= static_cast<int>(cr.X) &&
-                    pt.x < static_cast<int>(cr.X + cr.Width) &&
-                    pt.y >= static_cast<int>(cr.Y) &&
-                    pt.y < static_cast<int>(cr.Y + cr.Height)) {
-                    newHoverTabClose = newHoverTab;
-                }
-            }
-            newHoverNewTab = (hit == kHitNewTab);
-        }
-
-        if (hit != s->hoverButton || newHoverTab != s->hoverTab ||
-            newHoverTabClose != s->hoverTabClose ||
-            newHoverNewTab != s->hoverNewTab) {
+        if (hit != s->hoverButton || newHoverTab != s->hoverTab) {
             s->hoverButton = hit;
             s->hoverTab = newHoverTab;
-            s->hoverTabClose = newHoverTabClose;
-            s->hoverNewTab = newHoverNewTab;
             DrawBarAndPresent(*s);
         }
         return 0;
@@ -2813,12 +2651,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (s) {
             s->trackingMouse = false;
             if (!s->volumeDragging &&
-                (s->hoverButton != kHitNone || s->hoverTab != -1 ||
-                 s->hoverTabClose != -1 || s->hoverNewTab)) {
+                (s->hoverButton != kHitNone || s->hoverTab != -1)) {
                 s->hoverButton = kHitNone;
                 s->hoverTab = -1;
-                s->hoverTabClose = -1;
-                s->hoverNewTab = false;
                 DrawBarAndPresent(*s);
             }
         }
@@ -2841,12 +2676,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (tabIndex >= 0 && tabIndex < static_cast<int>(s->tabs.size())) {
                 const TabInfo& tab = s->tabs[tabIndex];
                 if (chromeMode && tab.isChrome) {
-                    // Chrome 同步模式：悬停关闭按钮时点击 = 关闭标签
-                    if (s->hoverTabClose == tabIndex) {
-                        ChromeSyncSendCloseTab(tab.chromeTabId);
-                    } else {
-                        ChromeSyncSendActivateTab(tab.chromeTabId);
-                    }
+                    // Chrome 同步模式：点击标签 = 切换（关闭用中键）
+                    ChromeSyncSendActivateTab(tab.chromeTabId);
                     break;
                 }
                 HWND tabHwnd = tab.hwnd;
@@ -2857,12 +2688,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ApplyTargetInfo(*s, tabHwnd);
                 s->targetSticky = false;
                 DrawBarAndPresent(*s);
-            }
-            break;
-        case kHitNewTab:
-            // Chrome 同步模式：新建标签页
-            if (chromeMode) {
-                ChromeSyncSendNewTab();
             }
             break;
         case kHitMinimize:
@@ -2962,8 +2787,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (!connected) {
                 s->chromeSync.tabs.clear();
                 s->chromeSync.windowId = 0;
-                s->hoverTabClose = -1;
-                s->hoverNewTab = false;
             }
             if (RefreshTabs(*s)) {
                 DrawBarAndPresent(*s);

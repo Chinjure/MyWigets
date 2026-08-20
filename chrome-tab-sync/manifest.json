@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "DesktopTopBar 标签同步",
   "version": "1.0.0",
-  "description": "把 Chrome 当前窗口的标签页实时同步到 DesktopTopBar 桌面顶栏：顶栏点击切换标签、中键/悬停关闭、右侧 + 新建标签",
+  "description": "把 Chrome 当前窗口的标签页实时同步到 DesktopTopBar 桌面顶栏：顶栏点击切换标签、中键关闭、右键新建标签",
   "permissions": ["tabs", "alarms"],
   "background": {
     "service_worker": "background.js"
