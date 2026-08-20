@@ -1,18 +1,10 @@
-param(
-    [ValidateSet('Release', 'Debug')]
-    [string]$Configuration = 'Release',
-
-    [ValidateSet('x64', 'x86')]
-    [string]$Architecture = 'x64'
-)
-
+# build_test_proto.ps1 - 编译并运行 topbar_ws_proto 协议层单元测试（控制台）
 $ErrorActionPreference = 'Stop'
 
 $root = $PSScriptRoot
 if (-not $root) {
     $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
-
 Set-Location $root
 
 function Find-VsDevCmd {
@@ -33,30 +25,21 @@ function Find-VsDevCmd {
 
 $vsDevCmd = Find-VsDevCmd
 if (-not $vsDevCmd -and -not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
-    throw 'MSVC not found. Run this script from "x64 Native Tools Command Prompt" or install the VS C++ workload.'
+    throw 'MSVC not found.'
 }
 
-$src = Join-Path $root 'src\topbar_main.cpp'
-$outDir = Join-Path $root 'bin'
-$null = New-Item -ItemType Directory -Force -Path $outDir
-$exe = Join-Path $outDir "DesktopTopBar-$Architecture.exe"
+$src = Join-Path $root 'test_proto.cpp'
+$exe = Join-Path $root 'test_proto.exe'
 
-$defs = '/DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX'
-if ($Configuration -eq 'Release') {
-    $optim = '/O2 /MT'
-} else {
-    $optim = '/Od /MTd /Zi'
-}
+$clLine = "cl /nologo /std:c++17 /EHsc /O2 /W4 /permissive- /utf-8 /DUNICODE /D_UNICODE /I`"$root\src`" /Fe:`"$exe`" `"$src`" /link"
 
-$clLine = "cl /nologo /std:c++17 /EHsc $optim /W4 /permissive- /utf-8 $defs /Fe:`"$exe`" `"$src`" /link /SUBSYSTEM:WINDOWS gdiplus.lib user32.lib gdi32.lib advapi32.lib ws2_32.lib"
-
-$bat = Join-Path $env:TEMP 'desktoptopbar_build.bat'
+$bat = Join-Path $env:TEMP 'desktoptopbar_test_build.bat'
 $lines = @('@echo off', 'setlocal')
 if ($vsDevCmd) {
-    $lines += "call `"$vsDevCmd`" -no_logo -arch=$Architecture"
+    $lines += "call `"$vsDevCmd`" -no_logo -arch=x64"
     $lines += 'if errorlevel 1 exit /b 1'
 }
-$lines += "cd /d `"$outDir`""
+$lines += "cd /d `"$root`""
 $lines += $clLine
 $lines += 'if errorlevel 1 exit /b 1'
 $lines += 'endlocal'
@@ -64,7 +47,6 @@ Set-Content -Path $bat -Value $lines -Encoding Ascii
 
 & cmd.exe /d /c $bat
 $code = $LASTEXITCODE
-
 Remove-Item -Path $bat -Force -ErrorAction SilentlyContinue
 
 if ($code -ne 0) {
@@ -72,4 +54,6 @@ if ($code -ne 0) {
 }
 
 Write-Host ""
-Write-Host "Build OK: $exe" -ForegroundColor Green
+Write-Host "Running: $exe" -ForegroundColor Green
+& $exe
+exit $LASTEXITCODE

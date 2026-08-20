@@ -34,10 +34,12 @@ foreach(target IN ITEMS DesktopClock DesktopCalendar DesktopTopBar)
     )
 endforeach()
 
-# DesktopTopBar 使用 Core Audio（按进程调音量），需要 COM 库
+# DesktopTopBar 使用 Core Audio（按进程调音量），需要 COM 库；
+# ws2_32：Chrome 标签同步的 WebSocket 服务端
 target_link_libraries(DesktopTopBar PRIVATE
     ole32
     oleaut32
+    ws2_32
 )
 
 target_compile_definitions(MyWigets PRIVATE

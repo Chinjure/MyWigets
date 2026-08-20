@@ -5,7 +5,10 @@
 //   2. 通过 Progman 属主 + HWND_BOTTOM 挂在桌面层，与其它三个组件一样
 //      只展现在桌面上：不覆盖任何普通窗口，也不出现在任务栏/Alt-Tab 中
 //   3. 从音量键右侧到右侧三键之间显示 Chrome 风格标签：
-//      标签为聚焦窗口所属应用打开的全部窗口，名字为对应窗口名
+//      - 普通应用：标签为聚焦窗口所属应用打开的全部窗口，名字为对应窗口名
+//      - Chrome/Edge（安装了 chrome-tab-sync 扩展并连接后）：标签为浏览器内
+//        当前聚焦窗口的真实标签页（标题同步、点击切换、中键/悬停×关闭、
+//        右侧 + 新建标签页）。未连接扩展时回退为窗口枚举。
 //   4. 顶栏右侧提供 Chrome 浏览器风格的 最小化 / 最大化 / 关闭 三个按钮，
 //      用于控制当前聚焦窗口
 //   5. 高度等于 Chrome 浏览器标签栏的高度（约 40px，随 DPI 缩放）
@@ -20,6 +23,11 @@
 #define _WIN32_WINNT 0x0601
 #endif
 
+// WinSock2 必须先于 windows.h 引入；本文件用 WIN32_LEAN_AND_MEAN 排除
+// windows.h 内的旧 winsock.h，因此这里（windows.h 之后）引入是安全的
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
@@ -33,14 +41,22 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <tlhelp32.h>   // 进程快照：解析应用子进程的音频会话
 #include <unordered_map>
 #include <vector>
+
+// Chrome 标签同步：纯逻辑层（JSON / SHA-1 / Base64 / WS 帧 / 同步模型）
+#include "topbar_ws_proto.h"
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "user32.lib")
@@ -50,6 +66,7 @@
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "Mmdevapi.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 using namespace Gdiplus;
 using Microsoft::WRL::ComPtr;
@@ -87,16 +104,40 @@ constexpr int kVolumePanelH = 60;       // 展开的音量面板高度
 constexpr int kVolumePanelMargin = 2;   // 按键/面板贴合左上角的小边距
 constexpr int kMuteButtonW = 30;        // 面板内静音按钮宽度
 constexpr UINT kVolumeApplyDelayMs = 40;
-constexpr UINT_PTR kTabRefreshTimerId = 1;  // 定时刷新同应用窗口标签
+// 挂起态短轮询：右键新建窗口待插入 / 抢前台重试期间每 200ms 刷新一次，
+// 状态结束即停（不常驻）
+constexpr UINT_PTR kTabRefreshTimerId = 1;
+constexpr UINT kPendingPollMs = 200;
 // 前台窗口创建瞬间尚未可见时的延迟复查（一次性定时器）
 constexpr UINT_PTR kTargetRetryTimerId = 2;
 // 前台窗口创建中不可见时最多复查次数（每次间隔 150ms，
 // 资源管理器等窗口从激活到可见可能需要数百毫秒）
 constexpr int kMaxTargetRetry = 5;
-// 右键新建窗口后抢前台的失败重试次数（随标签刷新定时器触发，约每 1s 一次）
+// 事件驱动刷新的抖动合并定时器（一次性）：高频窗口事件合并为一次刷新
+constexpr UINT_PTR kTabRefreshDebounceTimerId = 3;
+constexpr UINT kTabRefreshDebounceMs = 100;
+// 低频兜底自检（一次性，每次刷新后重置）：事件驱动正常时基本不触发，
+// 防止窗口事件丢失导致标签过期；无目标时停用（零轮询）
+constexpr UINT_PTR kSlowRefreshTimerId = 4;
+constexpr UINT kSlowRefreshMs = 5000;
+// 右键新建窗口后抢前台的失败重试次数（随挂起态短轮询触发，约每 200ms 一次）
 constexpr int kMaxPendingFocusAttempts = 5;
 
 constexpr int kMenuExit = 1001;
+
+// ---- Chrome 标签同步（WebSocket 服务端）----
+// 本地回环端口：chrome-tab-sync 扩展连接此端口推送/接收标签数据
+constexpr int kChromeSyncPort = 9786;
+// 收到扩展消息后通知 UI 线程（lParam = new wchar_t[] JSON，UI 线程负责释放）
+constexpr UINT kChromeSyncMsg = WM_APP + 10;
+// 扩展连接/断开状态通知（wParam = 1 连接 / 0 断开）
+constexpr UINT kChromeSyncStateMsg = WM_APP + 11;
+// 客户端 socket 接收超时：空闲时发 ping 探活，连续超时则断开
+constexpr int kChromeSyncRecvTimeoutMs = 25000;
+constexpr int kChromeSyncMaxIdleTimeouts = 2;
+// 握手阶段读取超时（5s）与请求头上限（8KB）
+constexpr int kChromeSyncHandshakeTimeoutMs = 5000;
+constexpr size_t kChromeSyncMaxHeaderBytes = 8192;
 
 enum ButtonHit {
     kHitNone = -1,
@@ -107,6 +148,7 @@ enum ButtonHit {
     kHitMaximize = 1,
     kHitClose = 2,
     kHitTab = 6,        // Chrome 风格标签区域
+    kHitNewTab = 7,     // Chrome 模式：标签区右侧的新建标签按钮
 };
 
 struct TabInfo {
@@ -114,6 +156,12 @@ struct TabInfo {
     DWORD pid = 0;
     std::wstring title;
     RectF rect;  // 顶栏客户区坐标
+
+    // Chrome 同步模式（isChrome 为 true 时 hwnd/pid 无效，使用以下字段）
+    bool isChrome = false;
+    int chromeTabId = 0;
+    bool chromeActive = false;
+    bool chromePinned = false;
 };
 
 struct AppState {
@@ -142,9 +190,16 @@ struct AppState {
     // Chrome 风格标签：聚焦窗口所属应用打开的全部顶层窗口
     std::vector<TabInfo> tabs;
 
+    // Chrome 标签同步状态（UI 线程维护，数据来自 chrome-tab-sync 扩展）
+    wsproto::ChromeSyncModel chromeSync;
+    // Chrome 模式悬停状态：标签上的关闭按钮 / 新建标签按钮
+    int hoverTabClose = -1;
+    bool hoverNewTab = false;
+
     // 右键“新建窗口”后的待插入状态：新窗口出现时插入到该标签右侧
     HWND insertAfterTab = nullptr;
     bool insertPending = false;
+    ULONGLONG insertPendingSince = 0;  // 挂起起始时间：超时未出现则放弃
 
     // 右键新建窗口的聚焦重试：新窗口出现后反复尝试抢前台，
     // 直到窗口真正成为前台、用户已切到其他应用或达到重试上限
@@ -336,6 +391,18 @@ void ResolveVolumeSession(AppState& s);  // 前置声明（定义在前台窗口
 bool ProcessTreeContains(DWORD rootPid, DWORD sessionPid);  // 前置声明（定义在下方）
 bool RefreshTabs(AppState& s);             // 前置声明（定义在下方）
 int HitTestTab(AppState& s, int x, int y); // 前置声明（定义在下方）
+
+// Chrome 标签同步相关前置声明（定义在下方）
+bool IsChromeTarget(HWND hwnd);
+bool ChromeSyncMode(AppState& s);
+bool ChromeSyncSendJson(const std::string& utf8Json);
+void ChromeSyncSendActivateTab(int tabId);
+void ChromeSyncSendCloseTab(int tabId);
+void ChromeSyncSendNewTab();
+void ChromeSyncStart(HWND hwnd);
+void ChromeSyncStop();
+RectF TabCloseRect(const RectF& r, float k);
+RectF NewTabRect(AppState& s);
 
 // 音量面板几何 / 操作的前置声明（定义在下方，供命中测试与消息处理使用）
 int BarHeight(AppState& s);
@@ -558,6 +625,9 @@ void OpenNewAppWindow(AppState& s, HWND tabHwnd) {
     if (reinterpret_cast<INT_PTR>(result) > 32) {
         s.insertAfterTab = tabHwnd;
         s.insertPending = true;
+        s.insertPendingSince = GetTickCount64();
+        // 立即启动挂起态短轮询：新窗口可能出现得较慢，不依赖事件
+        SetTimer(s.hwnd, kTabRefreshTimerId, kPendingPollMs, nullptr);
     }
 }
 
@@ -572,6 +642,15 @@ ButtonHit HitTestButton(AppState& s, int x, int y) {
     if (x >= static_cast<int>(volR.X) && x < static_cast<int>(volR.X + volR.Width) &&
         y < BarAreaHeight(s)) {
         return kHitVolume;
+    }
+
+    // Chrome 同步模式：新建标签按钮（位于标签区末尾，优先于标签命中）
+    if (ChromeSyncMode(s)) {
+        RectF nt = NewTabRect(s);
+        if (x >= static_cast<int>(nt.X) && x < static_cast<int>(nt.X + nt.Width) &&
+            y < BarAreaHeight(s)) {
+            return kHitNewTab;
+        }
     }
 
     // Chrome 风格标签区域
@@ -678,6 +757,391 @@ bool ProcessTreeContains(DWORD rootPid, DWORD sessionPid) {
         cur = parent;
     }
     return false;
+}
+
+// ---- Chrome 标签同步：WebSocket 服务端 ----
+//
+// 顶栏内置一个 127.0.0.1:kChromeSyncPort 的 WebSocket 服务端。
+// chrome-tab-sync 扩展（MV3）连接后推送当前聚焦 Chrome 窗口的标签列表与
+// 增量事件；顶栏向扩展发送 激活/关闭/新建标签 命令。
+// 网络工作在线程（g_chromeServer.thread），消息经 PostMessage 回到 UI 线程；
+// 命令发送由 sendMutex 串行化。
+
+std::wstring GetProcessName(DWORD pid);  // 定义在下方（同应用窗口枚举节）
+
+struct ChromeSyncServer {
+    HWND notifyHwnd = nullptr;
+    SOCKET listenSock = INVALID_SOCKET;
+    SOCKET clientSock = INVALID_SOCKET;  // 由 sendMutex 保护
+    std::mutex sendMutex;
+    std::thread thread;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> connected{false};
+    std::string recvBuf;        // 客户端数据缓冲（握手残留 + 帧流）
+    std::string pendingText;    // 分片文本消息累积
+    int idleTimeouts = 0;       // 连续接收超时计数（心跳探活）
+};
+
+ChromeSyncServer g_chromeServer;
+
+// 判断目标窗口是否属于 Chrome/Edge（Chromium）进程
+bool IsChromeTarget(HWND hwnd) {
+    if (!hwnd) {
+        return false;
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0) {
+        return false;
+    }
+    std::wstring name = GetProcessName(pid);
+    for (auto& ch : name) {
+        ch = static_cast<wchar_t>(towlower(ch));
+    }
+    return name == L"chrome.exe" || name == L"msedge.exe";
+}
+
+// 当前是否处于 Chrome 同步模式：扩展已连接 且 目标是 Chromium 窗口
+bool ChromeSyncMode(AppState& s) {
+    return s.chromeSync.connected && IsChromeTarget(s.targetHwnd);
+}
+
+// 标签上的关闭按钮矩形（Chrome 模式，悬停/激活标签右侧的 ×）
+RectF TabCloseRect(const RectF& r, float k) {
+    const float w = 20.0f * k;
+    return RectF(r.X + r.Width - w - 6.0f * k, (r.Height - w) * 0.5f, w, w);
+}
+
+// 新建标签按钮矩形（Chrome 模式：标签区末尾，无标签时位于标签区左端）
+RectF NewTabRect(AppState& s) {
+    const float k = s.scale;
+    const float w = 34.0f * k;
+    RectF volR;
+    VolumeButtonRect(s, volR);
+    RectF minR, maxR, closeR;
+    ComputeButtonRects(s, minR, maxR, closeR);
+    const float left = volR.X + volR.Width + 6.0f * k;
+    const float right = minR.X - 6.0f * k;
+    float x = left;
+    if (!s.tabs.empty()) {
+        x = s.tabs.back().rect.X + s.tabs.back().rect.Width + 4.0f * k;
+    }
+    if (x + w > right) {
+        x = right - w;
+    }
+    return RectF(x, 0.0f, w, static_cast<float>(BarAreaHeight(s)));
+}
+
+// 向扩展发送一条 JSON 命令（UTF-8 文本帧）；未连接时返回 false
+bool ChromeSyncSendJson(const std::string& utf8Json) {
+    if (!g_chromeServer.connected.load()) {
+        return false;
+    }
+    const std::string frame =
+        wsproto::WsEncodeFrame(0x1, utf8Json, true);
+    std::lock_guard<std::mutex> lock(g_chromeServer.sendMutex);
+    if (g_chromeServer.clientSock == INVALID_SOCKET) {
+        return false;
+    }
+    const int sent = send(g_chromeServer.clientSock, frame.data(),
+                          static_cast<int>(frame.size()), 0);
+    return sent == static_cast<int>(frame.size());
+}
+
+void ChromeSyncSendActivateTab(int tabId) {
+    ChromeSyncSendJson(wsproto::ChromeSyncBuildCommand(L"activateTab", tabId));
+}
+
+void ChromeSyncSendCloseTab(int tabId) {
+    ChromeSyncSendJson(wsproto::ChromeSyncBuildCommand(L"closeTab", tabId));
+}
+
+void ChromeSyncSendNewTab() {
+    ChromeSyncSendJson(wsproto::ChromeSyncBuildCommand(L"newTab"));
+}
+
+// 关闭当前客户端连接（可跨线程调用；sendMutex 串行化与 send 的竞争）
+void ChromeSyncCloseClient() {
+    std::lock_guard<std::mutex> lock(g_chromeServer.sendMutex);
+    if (g_chromeServer.clientSock != INVALID_SOCKET) {
+        shutdown(g_chromeServer.clientSock, SD_BOTH);
+        closesocket(g_chromeServer.clientSock);
+        g_chromeServer.clientSock = INVALID_SOCKET;
+    }
+    g_chromeServer.recvBuf.clear();
+    g_chromeServer.pendingText.clear();
+    if (g_chromeServer.connected.exchange(false)) {
+        PostMessageW(g_chromeServer.notifyHwnd, kChromeSyncStateMsg, 0, 0);
+    }
+}
+
+// 发送一个原始 WS 帧（服务端线程内部使用，不经过 sendMutex）
+bool ChromeSyncSendFrameRaw(int opcode, const std::string& payload) {
+    if (g_chromeServer.clientSock == INVALID_SOCKET) {
+        return false;
+    }
+    const std::string frame = wsproto::WsEncodeFrame(opcode, payload, true);
+    const int sent = send(g_chromeServer.clientSock, frame.data(),
+                          static_cast<int>(frame.size()), 0);
+    return sent == static_cast<int>(frame.size());
+}
+
+// 大小写不敏感地在一段文本中查找子串
+std::string::size_type ChromeSyncFindCI(const std::string& hay,
+                                        const char* needle) {
+    std::string low = hay;
+    std::transform(low.begin(), low.end(), low.begin(),
+                   [](unsigned char c) { return static_cast<char>(tolower(c)); });
+    const std::string nl = needle;
+    std::string lowN = nl;
+    std::transform(lowN.begin(), lowN.end(), lowN.begin(),
+                   [](unsigned char c) { return static_cast<char>(tolower(c)); });
+    return low.find(lowN);
+}
+
+// WebSocket 握手：读取请求头，校验并回复 101
+int ChromeSyncHandshake() {
+    SOCKET c = g_chromeServer.clientSock;
+    if (c == INVALID_SOCKET) {
+        return -1;
+    }
+    // 握手阶段较短超时
+    DWORD timeout = kChromeSyncHandshakeTimeoutMs;
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+
+    std::string req;
+    char tmp[2048];
+    while (req.find("\r\n\r\n") == std::string::npos &&
+           req.size() < kChromeSyncMaxHeaderBytes) {
+        const int r = recv(c, tmp, sizeof(tmp), 0);
+        if (r <= 0) {
+            return -1;
+        }
+        req.append(tmp, static_cast<size_t>(r));
+    }
+    const size_t headerEnd = req.find("\r\n\r\n");
+    if (headerEnd == std::string::npos) {
+        return -1;
+    }
+
+    // 提取 Sec-WebSocket-Key（Chrome 发送的头部大小写固定，仍做容错查找）
+    std::string key;
+    size_t pos = ChromeSyncFindCI(req, "Sec-WebSocket-Key:");
+    if (pos == std::string::npos) {
+        return -1;
+    }
+    pos += 19;
+    const size_t lineEnd = req.find("\r\n", pos);
+    if (lineEnd == std::string::npos) {
+        return -1;
+    }
+    key = req.substr(pos, lineEnd - pos);
+    // 去首尾空白
+    size_t b = key.find_first_not_of(" \t");
+    size_t e = key.find_last_not_of(" \t");
+    if (b == std::string::npos || e == std::string::npos || e < b) {
+        return -1;
+    }
+    key = key.substr(b, e - b + 1);
+
+    const std::string accept = wsproto::ComputeWsAccept(key);
+    const std::string resp =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: " +
+        accept + "\r\n\r\n";
+
+    size_t sent = 0;
+    while (sent < resp.size()) {
+        const int r = send(c, resp.data() + sent,
+                           static_cast<int>(resp.size() - sent), 0);
+        if (r <= 0) {
+            return -1;
+        }
+        sent += static_cast<size_t>(r);
+    }
+
+    // 握手请求里可能已夹带首帧（极少见），保留到帧缓冲
+    if (headerEnd + 4 < req.size()) {
+        g_chromeServer.recvBuf = req.substr(headerEnd + 4);
+    }
+
+    // 恢复常规接收超时（探活用）
+    timeout = kChromeSyncRecvTimeoutMs;
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    return 0;
+}
+
+// 把一条完整文本消息交给 UI 线程（堆上复制，UI 线程释放）
+void ChromeSyncDeliverText(const std::string& utf8) {
+    const std::wstring wide = wsproto::Utf8ToWide(utf8);
+    if (wide.empty()) {
+        return;
+    }
+    auto* copy = new wchar_t[wide.size() + 1];
+    wcscpy_s(copy, wide.size() + 1, wide.c_str());
+    PostMessageW(g_chromeServer.notifyHwnd, kChromeSyncMsg, 0,
+                 reinterpret_cast<LPARAM>(copy));
+}
+
+// 解析帧缓冲中的全部完整帧；返回 false 表示协议错误需断开
+bool ChromeSyncProcessFrames() {
+    while (!g_chromeServer.stop.load()) {
+        size_t consumed = 0;
+        wsproto::WsFrame frame;
+        std::string err;
+        const int rc = wsproto::WsDecodeFrame(g_chromeServer.recvBuf, consumed,
+                                              frame, err);
+        if (rc == 0) {
+            return true;  // 数据不足，等更多数据
+        }
+        if (rc < 0) {
+            return false;
+        }
+        g_chromeServer.recvBuf.erase(0, consumed);
+
+        switch (frame.opcode) {
+        case 0x1:  // 文本
+            if (frame.fin) {
+                ChromeSyncDeliverText(frame.payload);
+            } else {
+                g_chromeServer.pendingText += frame.payload;
+            }
+            break;
+        case 0x0:  // 延续帧
+            g_chromeServer.pendingText += frame.payload;
+            if (frame.fin) {
+                ChromeSyncDeliverText(g_chromeServer.pendingText);
+                g_chromeServer.pendingText.clear();
+            }
+            break;
+        case 0x8:  // 关闭
+            ChromeSyncSendFrameRaw(0x8, frame.payload);
+            ChromeSyncCloseClient();
+            return true;
+        case 0x9:  // ping -> pong
+            ChromeSyncSendFrameRaw(0xA, frame.payload);
+            break;
+        case 0xA:  // pong：忽略
+            break;
+        default:   // 二进制等：忽略
+            break;
+        }
+    }
+    return true;
+}
+
+void ChromeSyncServerThread() {
+    while (!g_chromeServer.stop.load()) {
+        if (g_chromeServer.clientSock == INVALID_SOCKET) {
+            // 等待新连接（可被 stop / closesocket 打断）
+            fd_set rf;
+            FD_ZERO(&rf);
+            FD_SET(g_chromeServer.listenSock, &rf);
+            timeval tv{0, 500000};
+            if (select(0, &rf, nullptr, nullptr, &tv) <= 0) {
+                continue;
+            }
+            SOCKET c = accept(g_chromeServer.listenSock, nullptr, nullptr);
+            if (c == INVALID_SOCKET) {
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_chromeServer.sendMutex);
+                if (g_chromeServer.stop.load()) {
+                    closesocket(c);
+                    break;
+                }
+                g_chromeServer.clientSock = c;
+            }
+            if (ChromeSyncHandshake() != 0) {
+                ChromeSyncCloseClient();
+                continue;
+            }
+            g_chromeServer.idleTimeouts = 0;
+            g_chromeServer.connected.store(true);
+            PostMessageW(g_chromeServer.notifyHwnd, kChromeSyncStateMsg, 1, 0);
+            continue;
+        }
+
+        // 客户端循环
+        char tmp[8192];
+        const int r = recv(g_chromeServer.clientSock, tmp, sizeof(tmp), 0);
+        if (r > 0) {
+            g_chromeServer.recvBuf.append(tmp, static_cast<size_t>(r));
+            g_chromeServer.idleTimeouts = 0;
+            if (!ChromeSyncProcessFrames()) {
+                ChromeSyncCloseClient();
+            }
+            continue;
+        }
+        if (r == 0) {
+            ChromeSyncCloseClient();  // 对端关闭
+            continue;
+        }
+        const int err = WSAGetLastError();
+        if (err == WSAETIMEDOUT) {
+            // 空闲探活：发 ping；连续多次无响应则断开
+            ChromeSyncSendFrameRaw(0x9, "");
+            if (++g_chromeServer.idleTimeouts > kChromeSyncMaxIdleTimeouts) {
+                ChromeSyncCloseClient();
+            }
+            continue;
+        }
+        if (err == WSAEWOULDBLOCK) {
+            continue;
+        }
+        ChromeSyncCloseClient();
+    }
+}
+
+// 启动服务端（幂等）：绑定 127.0.0.1:kChromeSyncPort 并启动监听线程。
+// 端口被占用等失败情形只禁用该功能，不影响顶栏其余部分。
+void ChromeSyncStart(HWND hwnd) {
+    if (g_chromeServer.thread.joinable()) {
+        return;
+    }
+    g_chromeServer.notifyHwnd = hwnd;
+
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) {
+        return;
+    }
+    BOOL reuse = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // 仅本机
+    addr.sin_port = htons(static_cast<u_short>(kChromeSyncPort));
+    if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        closesocket(s);
+        return;
+    }
+    if (listen(s, 4) != 0) {
+        closesocket(s);
+        return;
+    }
+    g_chromeServer.listenSock = s;
+    g_chromeServer.stop.store(false);
+    g_chromeServer.thread = std::thread(ChromeSyncServerThread);
+}
+
+// 停止服务端并回收线程（WM_DESTROY 时调用；幂等）
+void ChromeSyncStop() {
+    g_chromeServer.stop.store(true);
+    if (g_chromeServer.listenSock != INVALID_SOCKET) {
+        closesocket(g_chromeServer.listenSock);
+        g_chromeServer.listenSock = INVALID_SOCKET;
+    }
+    ChromeSyncCloseClient();
+    if (g_chromeServer.thread.joinable()) {
+        g_chromeServer.thread.join();
+    }
 }
 
 // ---- Chrome 风格标签：同应用窗口枚举 / 布局 ----
@@ -889,20 +1353,43 @@ void LayoutTabs(AppState& s, std::vector<TabInfo>& tabs,
 // 重新枚举当前目标应用的全部顶层窗口并刷新标签列表。
 // 返回 true 表示列表内容有变化（供定时器决定是否需要重绘）。
 bool RefreshTabs(AppState& s) {
+    const bool chromeMode = ChromeSyncMode(s);
     std::vector<TabInfo> next;
     if (s.hasTarget && s.targetHwnd && IsWindow(s.targetHwnd)) {
-        EnumTabsContext ctx;
-        ctx.self = s.hwnd;
-        ctx.target = s.targetHwnd;
-        ctx.selfPid = GetCurrentProcessId();
-        ctx.tabs = &next;
-        EnumWindows(EnumAppWindowsProc, reinterpret_cast<LPARAM>(&ctx));
+        if (chromeMode) {
+            // Chrome 同步模式：标签直接来自扩展推送的浏览器标签页，
+            // 顺序即浏览器内顺序（扩展按 index 排序维护）
+            next.reserve(s.chromeSync.tabs.size());
+            for (const auto& ct : s.chromeSync.tabs) {
+                TabInfo ti;
+                ti.isChrome = true;
+                ti.chromeTabId = ct.id;
+                ti.chromeActive = ct.active;
+                ti.chromePinned = ct.pinned;
+                ti.title = ct.title;
+                if (ti.title.empty()) {
+                    ti.title = ct.url;
+                }
+                if (ti.title.empty()) {
+                    ti.title = L"新标签页";
+                }
+                next.push_back(std::move(ti));
+            }
+        } else {
+            EnumTabsContext ctx;
+            ctx.self = s.hwnd;
+            ctx.target = s.targetHwnd;
+            ctx.selfPid = GetCurrentProcessId();
+            ctx.tabs = &next;
+            EnumWindows(EnumAppWindowsProc, reinterpret_cast<LPARAM>(&ctx));
+        }
     }
 
     // 保持已有标签顺序：切换聚焦/置顶不会让窗口跳到第一位，新窗口追加到末尾。
     // EnumWindows 返回的是 Z 序，直接用会让聚焦窗口总排在第一。
+    // （Chrome 同步模式的顺序由扩展维护，跳过重排）
     bool hasCommonWindow = false;
-    if (!s.tabs.empty() && !next.empty()) {
+    if (!chromeMode && !s.tabs.empty() && !next.empty()) {
         for (const auto& old : s.tabs) {
             for (const auto& n : next) {
                 if (old.hwnd == n.hwnd) {
@@ -918,9 +1405,12 @@ bool RefreshTabs(AppState& s) {
     if (!hasCommonWindow && !next.empty()) {
         // 首次遇到该应用（或刚从别的应用切换过来）时按 Z 序倒序排列，
         // 近似“打开顺序”，避免聚焦窗口固定第一。
-        std::reverse(next.begin(), next.end());
+        // （Chrome 同步模式同样跳过：扩展已按浏览器顺序给出）
+        if (!chromeMode) {
+            std::reverse(next.begin(), next.end());
+        }
     }
-    if (!s.tabs.empty() && !next.empty()) {
+    if (!chromeMode && !s.tabs.empty() && !next.empty()) {
         std::vector<TabInfo> ordered;
         ordered.reserve(next.size());
         std::vector<bool> used(next.size(), false);
@@ -1011,8 +1501,14 @@ bool RefreshTabs(AppState& s) {
     bool changed = s.tabs.size() != next.size();
     if (!changed) {
         for (size_t i = 0; i < next.size(); ++i) {
-            if (s.tabs[i].hwnd != next[i].hwnd ||
-                s.tabs[i].title != next[i].title) {
+            const TabInfo& a = s.tabs[i];
+            const TabInfo& b = next[i];
+            if (a.isChrome != b.isChrome || a.hwnd != b.hwnd ||
+                a.title != b.title ||
+                (a.isChrome &&
+                 (a.chromeTabId != b.chromeTabId ||
+                  a.chromeActive != b.chromeActive ||
+                  a.chromePinned != b.chromePinned))) {
                 changed = true;
                 break;
             }
@@ -1024,6 +1520,32 @@ bool RefreshTabs(AppState& s) {
         if (s.hoverTab >= static_cast<int>(s.tabs.size())) {
             s.hoverTab = -1;
         }
+        if (s.hoverTabClose >= static_cast<int>(s.tabs.size())) {
+            s.hoverTabClose = -1;
+        }
+    }
+
+    // 定时器状态维护：
+    // - 挂起态（右键新建窗口待插入 / 抢前台重试）保持 200ms 短轮询，结束即停
+    // - 有目标时保持 5s 低频兜底自检（一次性，每次刷新重置，
+    //   事件驱动正常时基本不触发，仅防窗口事件丢失）；无目标时零轮询
+    if (s.insertPending) {
+        // 新窗口长时间未出现（启动失败等）：超时放弃，避免短轮询常驻
+        if (s.insertPendingSince &&
+            GetTickCount64() - s.insertPendingSince > 10000) {
+            s.insertAfterTab = nullptr;
+            s.insertPending = false;
+        }
+    }
+    if (s.insertPending || s.pendingFocusHwnd) {
+        SetTimer(s.hwnd, kTabRefreshTimerId, kPendingPollMs, nullptr);
+    } else {
+        KillTimer(s.hwnd, kTabRefreshTimerId);
+    }
+    if (s.hasTarget && s.targetHwnd && IsWindow(s.targetHwnd)) {
+        SetTimer(s.hwnd, kSlowRefreshTimerId, kSlowRefreshMs, nullptr);
+    } else {
+        KillTimer(s.hwnd, kSlowRefreshTimerId);
     }
     return changed;
 }
@@ -1219,9 +1741,11 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 
-// ---- WinEvent 钩子：替代前台窗口 / 最大化状态的轮询 ----
-// 前台切换、最小化/最大化/还原均由系统事件驱动，不再用定时器轮询。
-HWINEVENTHOOK g_winEventHook[3] = {nullptr, nullptr, nullptr};
+// ---- WinEvent 钩子：替代前台窗口 / 最大化状态 / 标签列表的轮询 ----
+// 前台切换、最小化/最大化/还原、目标应用窗口增删/显隐/标题变化
+// 均由系统事件驱动，不再用常驻定时器轮询。
+HWINEVENTHOOK g_winEventHook[5] = {nullptr, nullptr, nullptr,
+                                   nullptr, nullptr};
 
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
                            LONG idObject, LONG idChild, DWORD, DWORD) {
@@ -1262,6 +1786,33 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
             DrawBarAndPresent(*s);
         }
         break;
+    case EVENT_OBJECT_CREATE:
+    case EVENT_OBJECT_DESTROY:
+    case EVENT_OBJECT_SHOW:
+    case EVENT_OBJECT_HIDE:
+    case EVENT_OBJECT_NAMECHANGE:
+        // 目标应用顶层窗口增删/显隐/标题变化：事件驱动刷新标签。
+        // 只处理目标应用的顶层窗口，降低高频对象事件的噪音；
+        // 经 100ms 抖动合并，避免连续事件反复刷新。
+        if (!s->hasTarget || !s->targetHwnd || !IsWindow(s->targetHwnd)) {
+            break;
+        }
+        // 只看顶层窗口（排除子控件）；销毁事件中句柄可能已部分失效，放宽
+        if (event != EVENT_OBJECT_DESTROY && hwnd &&
+            GetAncestor(hwnd, GA_ROOT) != hwnd) {
+            break;
+        }
+        if (hwnd) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            // 查不到进程（窗口正在销毁）时保守刷新
+            if (pid && !IsSameApplication(hwnd, s->targetHwnd)) {
+                break;
+            }
+        }
+        SetTimer(bar, kTabRefreshDebounceTimerId, kTabRefreshDebounceMs,
+                 nullptr);
+        break;
     default:
         break;
     }
@@ -1289,6 +1840,14 @@ void InstallVolumeHook(HWND hwnd) {
         // 还原
         g_winEventHook[2] = SetWinEventHook(
             EVENT_SYSTEM_RESTORE, EVENT_SYSTEM_RESTORE,
+            nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+        // 目标应用窗口创建 / 销毁 / 显示 / 隐藏：事件驱动刷新标签
+        g_winEventHook[3] = SetWinEventHook(
+            EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE,
+            nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+        // 目标应用窗口标题变化
+        g_winEventHook[4] = SetWinEventHook(
+            EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE,
             nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
     }
 }
@@ -1863,10 +2422,16 @@ void DrawBar(AppState& s) {
     FontFamily tabFamily(L"Segoe UI");
     Gdiplus::Font tabFont(&tabFamily, 12.0f * k, FontStyleRegular, UnitPixel);
 
+    // 标签是否处于激活状态（Chrome 同步模式看浏览器内激活态）
+    const auto tabActive = [&s](const TabInfo& t) {
+        return t.isChrome ? t.chromeActive : (t.hwnd == s.targetHwnd);
+    };
+    const bool chromeMode = ChromeSyncMode(s);
+
     // 未激活标签之间的竖线：高度略小于标签栏高度，上下留白相等
     for (size_t i = 0; i + 1 < s.tabs.size(); ++i) {
-        const bool leftActive = (s.tabs[i].hwnd == s.targetHwnd);
-        const bool rightActive = (s.tabs[i + 1].hwnd == s.targetHwnd);
+        const bool leftActive = tabActive(s.tabs[i]);
+        const bool rightActive = tabActive(s.tabs[i + 1]);
         if (leftActive || rightActive) {
             continue;
         }
@@ -1887,7 +2452,7 @@ void DrawBar(AppState& s) {
             continue;
         }
 
-        const bool active = (tab.hwnd == s.targetHwnd);
+        const bool active = tabActive(tab);
         const bool hover = (s.hoverButton == kHitTab &&
                             s.hoverTab == static_cast<int>(i));
 
@@ -1947,9 +2512,29 @@ void DrawBar(AppState& s) {
         if (r.Width <= 0.0f || r.Height <= 0.0f) {
             continue;
         }
+        const bool active = tabActive(tab);
+        const bool hover = (s.hoverButton == kHitTab &&
+                            s.hoverTab == static_cast<int>(i));
+
+        // Chrome 同步模式：激活/悬停标签右侧预留关闭按钮空间
+        const bool reserveClose = chromeMode && (active || hover);
+        float textLeft = r.X + 8.0f * k;
+        if (chromeMode && tab.chromePinned) {
+            // 固定标签：左侧画小圆点，标题相应右移
+            const float dotR = 2.6f * k;
+            SolidBrush dotBrush(Color(220, 255, 255, 255));
+            g.FillEllipse(&dotBrush, textLeft + 2.0f * k,
+                          r.Y + r.Height * 0.5f - dotR, dotR * 2.0f,
+                          dotR * 2.0f);
+            textLeft += 10.0f * k;
+        }
         // 所有标签标题使用相同的高度和垂直居中，避免已打开/未打开标题高度不一致
-        RectF textR = RectF(r.X + 8.0f * k, r.Y,
-                            (std::max)(r.Width - 16.0f * k, 1.0f),
+        float textRight = r.X + r.Width - 8.0f * k;
+        if (reserveClose) {
+            textRight -= 22.0f * k;
+        }
+        RectF textR = RectF(textLeft, r.Y,
+                            (std::max)(textRight - textLeft, 1.0f),
                             r.Height);
         StringFormat tabSf;
         tabSf.SetFormatFlags(StringFormatFlagsNoWrap);  // 只显示一行，超出宽度直接截断
@@ -1964,6 +2549,53 @@ void DrawBar(AppState& s) {
         g.SetClip(textR);
         g.DrawString(tab.title.c_str(), -1, &tabFont, textR, &tabSf, &textBrush);
         g.Restore(state);
+    }
+
+    // ---- Chrome 同步模式：标签关闭按钮（激活/悬停标签右侧的 ×）----
+    if (chromeMode) {
+        for (size_t i = 0; i < s.tabs.size(); ++i) {
+            const TabInfo& tab = s.tabs[i];
+            const RectF& r = tab.rect;
+            if (r.Width <= 0.0f || r.Height <= 0.0f) {
+                continue;
+            }
+            const bool active = tabActive(tab);
+            const bool hover = (s.hoverButton == kHitTab &&
+                                s.hoverTab == static_cast<int>(i));
+            if (!active && !hover) {
+                continue;
+            }
+            const RectF cr = TabCloseRect(r, k);
+            const bool closeHover =
+                (s.hoverTabClose == static_cast<int>(i));
+            SolidBrush closeBg(closeHover ? Color(110, 255, 255, 255)
+                                          : Color(55, 255, 255, 255));
+            g.FillEllipse(&closeBg, cr);
+            Pen closePen(closeHover ? Color(255, 255, 255, 255)
+                                    : Color(210, 255, 255, 255),
+                         1.3f * k);
+            closePen.SetStartCap(LineCapRound);
+            closePen.SetEndCap(LineCapRound);
+            const float d = 4.0f * k;
+            const float cx = cr.X + cr.Width * 0.5f;
+            const float cy = cr.Y + cr.Height * 0.5f;
+            g.DrawLine(&closePen, cx - d, cy - d, cx + d, cy + d);
+            g.DrawLine(&closePen, cx + d, cy - d, cx - d, cy + d);
+        }
+
+        // ---- 新建标签按钮（+）----
+        const RectF nt = NewTabRect(s);
+        DrawButtonHover(g, nt, kHitNewTab, s.hoverButton);
+        Pen plusPen(s.hoverButton == kHitNewTab ? Color(255, 255, 255, 255)
+                                                : Color(200, 255, 255, 255),
+                    1.5f * k);
+        plusPen.SetStartCap(LineCapRound);
+        plusPen.SetEndCap(LineCapRound);
+        const float cx = nt.X + nt.Width * 0.5f;
+        const float cy = nt.Y + nt.Height * 0.5f;
+        const float d = 4.5f * k;
+        g.DrawLine(&plusPen, cx - d, cy, cx + d, cy);
+        g.DrawLine(&plusPen, cx, cy - d, cx, cy + d);
     }
 
     // ---- 右侧三个 Chrome 风格按钮 ----
@@ -2101,7 +2733,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         s->dpi = GetWindowDpi(hwnd);
         s->scale = static_cast<float>(s->dpi) / 96.0f;
         InstallVolumeHook(hwnd); // 常驻全局钩子：显式点击/Alt+Tab 检测 + 面板外点击收起
-        SetTimer(hwnd, kTabRefreshTimerId, 1000, nullptr); // 标签列表定期刷新
+        // 标签刷新不设常驻定时器：WinEvent 事件驱动（见 WinEventProc），
+        // 仅挂起态（新建窗口/抢前台）启用 200ms 短轮询、静止时 5s 低频兜底
+        ChromeSyncStart(hwnd);   // Chrome 标签同步服务端（扩展连接用）
         return 0;
     }
 
@@ -2145,9 +2779,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int tabIndex = HitTestTab(*s, pt.x, pt.y);
         const ButtonHit hit = HitTestButton(*s, pt.x, pt.y);
         const int newHoverTab = (hit == kHitTab) ? tabIndex : -1;
-        if (hit != s->hoverButton || newHoverTab != s->hoverTab) {
+
+        // Chrome 同步模式：悬停标签右侧关闭按钮 / 新建标签按钮
+        int newHoverTabClose = -1;
+        bool newHoverNewTab = false;
+        if (ChromeSyncMode(*s)) {
+            if (newHoverTab >= 0 &&
+                static_cast<size_t>(newHoverTab) < s->tabs.size()) {
+                const RectF cr = TabCloseRect(s->tabs[newHoverTab].rect, s->scale);
+                if (pt.x >= static_cast<int>(cr.X) &&
+                    pt.x < static_cast<int>(cr.X + cr.Width) &&
+                    pt.y >= static_cast<int>(cr.Y) &&
+                    pt.y < static_cast<int>(cr.Y + cr.Height)) {
+                    newHoverTabClose = newHoverTab;
+                }
+            }
+            newHoverNewTab = (hit == kHitNewTab);
+        }
+
+        if (hit != s->hoverButton || newHoverTab != s->hoverTab ||
+            newHoverTabClose != s->hoverTabClose ||
+            newHoverNewTab != s->hoverNewTab) {
             s->hoverButton = hit;
             s->hoverTab = newHoverTab;
+            s->hoverTabClose = newHoverTabClose;
+            s->hoverNewTab = newHoverNewTab;
             DrawBarAndPresent(*s);
         }
         return 0;
@@ -2157,9 +2813,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (s) {
             s->trackingMouse = false;
             if (!s->volumeDragging &&
-                (s->hoverButton != kHitNone || s->hoverTab != -1)) {
+                (s->hoverButton != kHitNone || s->hoverTab != -1 ||
+                 s->hoverTabClose != -1 || s->hoverNewTab)) {
                 s->hoverButton = kHitNone;
                 s->hoverTab = -1;
+                s->hoverTabClose = -1;
+                s->hoverNewTab = false;
                 DrawBarAndPresent(*s);
             }
         }
@@ -2172,6 +2831,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const int tabIndex = HitTestTab(*s, pt.x, pt.y);
         const ButtonHit hit = HitTestButton(*s, pt.x, pt.y);
+        const bool chromeMode = ChromeSyncMode(*s);
 
         switch (hit) {
         case kHitVolume:
@@ -2179,7 +2839,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         case kHitTab:
             if (tabIndex >= 0 && tabIndex < static_cast<int>(s->tabs.size())) {
-                HWND tabHwnd = s->tabs[tabIndex].hwnd;
+                const TabInfo& tab = s->tabs[tabIndex];
+                if (chromeMode && tab.isChrome) {
+                    // Chrome 同步模式：悬停关闭按钮时点击 = 关闭标签
+                    if (s->hoverTabClose == tabIndex) {
+                        ChromeSyncSendCloseTab(tab.chromeTabId);
+                    } else {
+                        ChromeSyncSendActivateTab(tab.chromeTabId);
+                    }
+                    break;
+                }
+                HWND tabHwnd = tab.hwnd;
                 if (IsIconic(tabHwnd)) {
                     ShowWindow(tabHwnd, SW_RESTORE);
                 }
@@ -2187,6 +2857,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ApplyTargetInfo(*s, tabHwnd);
                 s->targetSticky = false;
                 DrawBarAndPresent(*s);
+            }
+            break;
+        case kHitNewTab:
+            // Chrome 同步模式：新建标签页
+            if (chromeMode) {
+                ChromeSyncSendNewTab();
             }
             break;
         case kHitMinimize:
@@ -2215,29 +2891,83 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_MBUTTONDOWN: {
-        // 中键点击标签：关闭对应窗口
+        // 中键点击标签：普通应用关闭对应窗口；Chrome 同步模式关闭对应标签
         if (!s) {
             return 0;
         }
         POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const int tabIndex = HitTestTab(*s, pt.x, pt.y);
         if (tabIndex >= 0 && tabIndex < static_cast<int>(s->tabs.size())) {
-            PostMessageW(s->tabs[tabIndex].hwnd, WM_CLOSE, 0, 0);
+            const TabInfo& tab = s->tabs[tabIndex];
+            if (ChromeSyncMode(*s) && tab.isChrome) {
+                ChromeSyncSendCloseTab(tab.chromeTabId);
+            } else {
+                PostMessageW(tab.hwnd, WM_CLOSE, 0, 0);
+            }
         }
         return 0;
     }
 
     case WM_RBUTTONUP: {
-        // 右键标签：在该标签右侧打开应用新窗口；右键空白处仍显示退出菜单
+        // 右键标签：普通应用在该标签右侧打开应用新窗口；
+        // Chrome 同步模式 = 新建标签页；右键空白处仍显示退出菜单
         if (!s) {
             return 0;
         }
         POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const int tabIndex = HitTestTab(*s, pt.x, pt.y);
         if (tabIndex >= 0 && tabIndex < static_cast<int>(s->tabs.size())) {
-            OpenNewAppWindow(*s, s->tabs[tabIndex].hwnd);
+            const TabInfo& tab = s->tabs[tabIndex];
+            if (ChromeSyncMode(*s) && tab.isChrome) {
+                ChromeSyncSendNewTab();
+            } else {
+                OpenNewAppWindow(*s, tab.hwnd);
+            }
         } else {
             ShowExitMenu(hwnd);
+        }
+        return 0;
+    }
+
+    case kChromeSyncMsg: {
+        // 扩展推送的标签数据（JSON，lParam = new wchar_t[]，这里负责释放）
+        if (!s) {
+            if (lParam) {
+                delete[] reinterpret_cast<wchar_t*>(lParam);
+            }
+            return 0;
+        }
+        const wchar_t* json = reinterpret_cast<const wchar_t*>(lParam);
+        if (json) {
+            const wsproto::JsonValue jsonValue = wsproto::JsonParse(json);
+            if (wsproto::ChromeSyncApplyMessage(s->chromeSync, jsonValue)) {
+                if (RefreshTabs(*s)) {
+                    DrawBarAndPresent(*s);
+                }
+            }
+        }
+        delete[] reinterpret_cast<wchar_t*>(lParam);
+        return 0;
+    }
+
+    case kChromeSyncStateMsg: {
+        // 扩展连接 / 断开：连接后立即以现有数据刷新（首帧 hello 稍后到达），
+        // 断开则清空同步数据并回退为窗口枚举
+        if (!s) {
+            return 0;
+        }
+        const bool connected = wParam != 0;
+        if (s->chromeSync.connected != connected) {
+            s->chromeSync.connected = connected;
+            if (!connected) {
+                s->chromeSync.tabs.clear();
+                s->chromeSync.windowId = 0;
+                s->hoverTabClose = -1;
+                s->hoverNewTab = false;
+            }
+            if (RefreshTabs(*s)) {
+                DrawBarAndPresent(*s);
+            }
         }
         return 0;
     }
@@ -2262,6 +2992,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         if (wParam == kTabRefreshTimerId) {
+            // 挂起态短轮询：新建窗口待插入 / 抢前台重试
             if (RefreshTabs(*s)) {
                 DrawBarAndPresent(*s);
             }
@@ -2275,6 +3006,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (fg && IsWindow(fg) && !IsWindowVisible(fg) &&
                 ++s->targetRetryCount < kMaxTargetRetry) {
                 SetTimer(hwnd, kTargetRetryTimerId, 150, nullptr);
+            }
+        } else if (wParam == kTabRefreshDebounceTimerId) {
+            // 事件驱动的标签刷新（抖动合并后）
+            KillTimer(hwnd, kTabRefreshDebounceTimerId);
+            if (RefreshTabs(*s)) {
+                DrawBarAndPresent(*s);
+            }
+        } else if (wParam == kSlowRefreshTimerId) {
+            // 低频兜底自检：事件驱动正常时被刷新重置，很少触发
+            KillTimer(hwnd, kSlowRefreshTimerId);
+            if (RefreshTabs(*s)) {
+                DrawBarAndPresent(*s);
             }
         }
         return 0;
@@ -2305,6 +3048,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         KillTimer(hwnd, kTabRefreshTimerId);
         KillTimer(hwnd, kTargetRetryTimerId);
+        KillTimer(hwnd, kTabRefreshDebounceTimerId);
+        KillTimer(hwnd, kSlowRefreshTimerId);
+        ChromeSyncStop();  // 先停网络线程（会向本窗口发状态消息，需在窗口销毁前）
         UninstallVolumeHook();
         if (s) {
             if (s->volumePanelHwnd) {
@@ -2378,6 +3124,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         return 1;
     }
 
+    // Chrome 标签同步服务端需要 WinSock；失败只禁用该功能
+    WSADATA wsaData{};
+    const bool wsaOk = WSAStartup(MAKEWORD(2, 2), &wsaData) == 0;
+
     AppState state;
     HWND hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -2424,6 +3174,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     GdiplusShutdown(gdiplusToken);
     if (SUCCEEDED(comInit)) {
         CoUninitialize();
+    }
+    if (wsaOk) {
+        WSACleanup();
     }
     CloseHandle(mutex);
     return static_cast<int>(msg.wParam);
