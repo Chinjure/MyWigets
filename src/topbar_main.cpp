@@ -10,7 +10,8 @@
 //        当前聚焦窗口的真实标签页（标题同步、点击切换、中键关闭、
 //        右键新建标签页）。未连接扩展时回退为窗口枚举。
 //   4. 顶栏右侧提供 Chrome 浏览器风格的 最小化 / 最大化 / 关闭 三个按钮，
-//      用于控制当前聚焦窗口
+//      用于控制当前聚焦窗口；双击顶栏空白处最大化/还原当前聚焦窗口；
+//      按住顶栏空白处拖动可移动当前聚焦窗口（等同标题栏拖动）
 //   5. 高度等于 Chrome 浏览器标签栏的高度（约 40px，随 DPI 缩放）
 
 #ifndef UNICODE
@@ -189,6 +190,13 @@ struct AppState {
     int hoverButton = kHitNone;          // 当前悬停的按钮
     int hoverTab = -1;                   // 当前悬停的 Chrome 标签索引
     bool trackingMouse = false;
+
+    // 按住空白处拖动（等同标题栏拖动，移动当前目标窗口）
+    bool dragWindow = false;             // 正在拖动（按下空白处）
+    bool dragMoving = false;             // 已超过阈值，真正移动窗口
+    HWND dragHwnd = nullptr;             // 被拖动的窗口
+    POINT dragStartPt{};                 // 按下点（屏幕坐标）
+    POINT dragOffset{};                  // 光标相对窗口左上角的偏移
 
     // Chrome 风格标签：聚焦窗口所属应用打开的全部顶层窗口
     std::vector<TabInfo> tabs;
@@ -2626,6 +2634,56 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (!s) {
             return 0;
         }
+
+        // 拖动中：移动目标窗口（等同标题栏拖动）
+        if (s->dragWindow && s->dragHwnd && IsWindow(s->dragHwnd)) {
+            POINT cur{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ClientToScreen(hwnd, &cur);
+            const int dx = cur.x - s->dragStartPt.x;
+            const int dy = cur.y - s->dragStartPt.y;
+            if (!s->dragMoving) {
+                // 移动阈值：超过才真正开始拖动，避免误触
+                const int threshold = (std::max)(4, MulDiv(4, s->dpi, 96));
+                const int adx = dx < 0 ? -dx : dx;
+                const int ady = dy < 0 ? -dy : dy;
+                if (adx < threshold && ady < threshold) {
+                    return 0;
+                }
+                s->dragMoving = true;
+                RECT rc{};
+                GetWindowRect(s->dragHwnd, &rc);
+                if (IsZoomed(s->dragHwnd)) {
+                    // 最大化窗口拖动：先还原，抓点按比例换算（同 Windows 标题栏）
+                    ShowWindow(s->dragHwnd, SW_RESTORE);
+                    RECT rc2{};
+                    GetWindowRect(s->dragHwnd, &rc2);
+                    const float rx =
+                        rc.right > rc.left
+                            ? static_cast<float>(s->dragStartPt.x - rc.left) /
+                                  static_cast<float>(rc.right - rc.left)
+                            : 0.5f;
+                    const float ry =
+                        rc.bottom > rc.top
+                            ? static_cast<float>(s->dragStartPt.y - rc.top) /
+                                  static_cast<float>(rc.bottom - rc.top)
+                            : 0.5f;
+                    s->dragOffset.x = static_cast<LONG>(
+                        rx * static_cast<float>(rc2.right - rc2.left));
+                    s->dragOffset.y = static_cast<LONG>(
+                        ry * static_cast<float>(rc2.bottom - rc2.top));
+                    s->targetMaximized = false;
+                    DrawBarAndPresent(*s);  // 更新右侧最大化按钮字形
+                } else {
+                    s->dragOffset.x = s->dragStartPt.x - rc.left;
+                    s->dragOffset.y = s->dragStartPt.y - rc.top;
+                }
+            }
+            SetWindowPos(s->dragHwnd, nullptr, cur.x - s->dragOffset.x,
+                         cur.y - s->dragOffset.y, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
+
         if (!s->trackingMouse) {
             TRACKMOUSEEVENT tme{};
             tme.cbSize = sizeof(tme);
@@ -2647,6 +2705,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
+    case WM_CAPTURECHANGED:
+        // 捕获被系统或其他窗口夺走时结束拖动，避免状态残留
+        if (s && s->dragWindow) {
+            s->dragWindow = false;
+            s->dragMoving = false;
+            s->dragHwnd = nullptr;
+        }
+        return 0;
+
     case WM_MOUSELEAVE:
         if (s) {
             s->trackingMouse = false;
@@ -2667,6 +2734,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int tabIndex = HitTestTab(*s, pt.x, pt.y);
         const ButtonHit hit = HitTestButton(*s, pt.x, pt.y);
         const bool chromeMode = ChromeSyncMode(*s);
+
+        // 按住空白处：进入标题栏式拖动（移动阈值内只等待，不移动）
+        if (hit == kHitNone && s->hasTarget && s->targetHwnd &&
+            IsWindow(s->targetHwnd) && !IsIconic(s->targetHwnd)) {
+            s->dragWindow = true;
+            s->dragMoving = false;
+            s->dragHwnd = s->targetHwnd;
+            s->dragStartPt = pt;
+            ClientToScreen(hwnd, &s->dragStartPt);
+            SetCapture(hwnd);
+        }
 
         switch (hit) {
         case kHitVolume:
@@ -2703,6 +2781,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
+    case WM_LBUTTONDBLCLK: {
+        // 双击顶栏空白处：最大化/还原当前目标窗口（与标题栏双击行为一致）。
+        // 双击落在按钮/标签上时不触发（第二次按下已由各自逻辑处理）。
+        if (!s) {
+            return 0;
+        }
+        POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const ButtonHit hit = HitTestButton(*s, pt.x, pt.y);
+        if (hit == kHitNone && s->hasTarget && s->targetHwnd &&
+            IsWindow(s->targetHwnd)) {
+            HitButton(s->hwnd, s->targetHwnd, kHitMaximize);
+            // 刷新最大化状态（右侧按钮字形与后续布局）
+            s->targetMaximized = IsZoomed(s->targetHwnd) != FALSE;
+            DrawBarAndPresent(*s);
+        }
+        return 0;
+    }
+
     case WM_LBUTTONUP: {
         if (!s) {
             return 0;
@@ -2711,6 +2807,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             s->volumeDragging = false;
             ReleaseCapture();
             DrawBarAndPresent(*s);
+        }
+        if (s->dragWindow) {
+            s->dragWindow = false;
+            s->dragMoving = false;
+            s->dragHwnd = nullptr;
+            ReleaseCapture();
         }
         return 0;
     }
@@ -2933,7 +3035,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;  // CS_DBLCLKS：双击空白处最大化
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
