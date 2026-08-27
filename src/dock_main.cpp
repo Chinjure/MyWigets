@@ -3130,6 +3130,16 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
         AppendMenuW(menu, MF_STRING, showId, L"打开文件位置");
     }
 
+    // 统一追加空白处右键的全局菜单项：无论点在哪个图标上，都能看到
+    // 自动收起开关和退出入口。
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu,
+                MF_STRING | (s.autoCollapse ? MF_CHECKED : MF_UNCHECKED),
+                kMenuToggleAutoCollapse,
+                L"自动收起（光标离开收到底部，触碰下缘展开）");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kMenuExit, L"退出桌面 Dock");
+
     POINT pt{};
     GetCursorPos(&pt);
     SetForegroundWindow(s.hwnd);
@@ -3142,6 +3152,21 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
     s.menuOpen = false;
     PostMessageW(s.hwnd, WM_NULL, 0, 0);
     DestroyMenu(menu);
+
+    // 全局菜单项（与空白处右键一致）
+    if (cmd == kMenuToggleAutoCollapse) {
+        s.autoCollapse = !s.autoCollapse;
+        if (!s.autoCollapse) s.hideRequested = false;  // 关闭即展开
+        SaveConfig(s);
+        Logf(s.autoCollapse ? L"自动收起：开启" : L"自动收起：关闭");
+        return;
+    }
+    if (cmd == kMenuExit) {
+        Logf(L"用户请求退出");
+        DestroyWindow(s.hwnd);
+        return;
+    }
+
     if (cmd < kMenuBaseId || cmd - kMenuBaseId >= s.menuCount) return;
     const MenuEntry& e = s.menu[cmd - kMenuBaseId];
     switch (e.action) {
@@ -3362,6 +3387,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             const int idx = HitIndexAt(*s, static_cast<float>(pt.x),
                                            static_cast<float>(pt.y));
             if (idx >= 0) {
+                // 图标右键：保留图标自身的操作，同时追加全局菜单项
+                // （自动收起开关 / 退出），保证任意位置都能看到空白处内容。
                 ShowItemContextMenu(*s, static_cast<size_t>(idx));
             } else {
                 ShowBlankContextMenu(*s);
