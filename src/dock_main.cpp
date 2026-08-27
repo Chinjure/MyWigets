@@ -338,12 +338,15 @@ std::wstring ExeDisplayName(const std::wstring& fullPathLower) {
 }
 
 // ============================== 日志 ==============================
+// main 分支禁止日志：kLogEnabled=false 时 LogInit 不建目录不开文件、
+// Logf 直接返回（release 行为，零 I/O）。debug 分支保持 true（完整日志）。
+constexpr bool kLogEnabled = false;
 
 FILE* g_logFile = nullptr;
 SRWLOCK g_logLock = SRWLOCK_INIT;  // 后台关闭线程与主线程可能同时写日志
 
 void Logf(const wchar_t* fmt, ...) {
-    if (!g_logFile) return;
+    if (!kLogEnabled || !g_logFile) return;
     AcquireSRWLockExclusive(&g_logLock);
     SYSTEMTIME st{};
     GetLocalTime(&st);
@@ -359,6 +362,7 @@ void Logf(const wchar_t* fmt, ...) {
 }
 
 void LogInit() {
+    if (!kLogEnabled) return;  // main 分支：不创建 logs 目录、不写日志
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     const std::wstring binDir = PathDir(exe);          // ...\bin
@@ -385,11 +389,10 @@ void LogInit() {
 }
 
 void LogClose() {
-    if (g_logFile) {
-        Logf(L"---- DesktopDock 退出 ----");
-        fclose(g_logFile);
-        g_logFile = nullptr;
-    }
+    if (!kLogEnabled || !g_logFile) return;
+    Logf(L"---- DesktopDock 退出 ----");
+    fclose(g_logFile);
+    g_logFile = nullptr;
 }
 
 // ============================== 第三方判定 ==============================
