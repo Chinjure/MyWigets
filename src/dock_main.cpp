@@ -120,6 +120,13 @@ constexpr UINT_PTR kTooltipTimerId = 4;        // 悬停提示一次性定时器
 constexpr UINT kMsgRefresh = WM_APP + 1;   // 窗口集合/托盘状态可能变化，合并刷新
 constexpr UINT kMsgHeal = WM_APP + 2;      // 套件组件被最小化，立即恢复
 constexpr UINT kMsgTriggerDone = WM_APP + 3;  // 托盘触发完成（worker → 主窗口收尾）
+constexpr UINT kMsgHookClick = WM_APP + 4; // 低层鼠标钩子采集的点击 → 主窗口线程执行
+
+// 低层鼠标钩子采集的点击类型（wParam）
+constexpr WPARAM kHookClickDockLeft = 1;      // Dock 图标左键（切换/打开）
+constexpr WPARAM kHookClickDockMiddle = 2;    // Dock 图标中键（关闭应用）
+constexpr WPARAM kHookClickStart = 3;         // 左下角开始按钮
+constexpr WPARAM kHookClickShowDesktop = 4;   // 右下角显示桌面
 
 // 启动台拖入固定（WM_COPYDATA 自定协议）：“DOCK” 魔数，lpData = UTF-16 路径
 constexpr DWORD kDesktopDockPinMagic =
@@ -915,6 +922,34 @@ Bitmap* CropToIconContent(Bitmap* bmp) {
     return cropped;
 }
 
+// 图标源位图预缩上限：每帧 DrawImage 的成本 ≈ 源像素数 × 目标像素数。
+// jumbo 源是 256×256，而渲染目标是 ≤ kMaxScale·kIconSize·dpi ≈ 73px——
+// 每帧从 256px 缩放纯属浪费（实测 18 个图标占 ~17ms/帧，拖垮整帧节奏，
+// 而 Dock 的 WH_MOUSE_LL 钩子跑在自身 UI 线程，线程被渲染占满会阻塞
+// 全局鼠标事件 → 光标一到 Dock 就掉帧）。加载时一次性用最高质量
+// Bicubic 预缩到渲染上限，之后每帧绘制成本下降 ~4 倍且视觉无损。
+constexpr int kIconCacheMaxSourcePx = 160;
+
+Bitmap* PreScaleIconSource(Bitmap* bmp) {
+    if (!bmp) return nullptr;
+    const int W = bmp->GetWidth();
+    const int H = bmp->GetHeight();
+    if (W <= kIconCacheMaxSourcePx && H <= kIconCacheMaxSourcePx) {
+        return bmp;  // 无需预缩（多为已裁剪的小图标）
+    }
+    const float maxDim = static_cast<float>(std::max(W, H));
+    const int sw = static_cast<int>(std::lround(W * (kIconCacheMaxSourcePx / maxDim)));
+    const int sh = static_cast<int>(std::lround(H * (kIconCacheMaxSourcePx / maxDim)));
+    if (sw <= 0 || sh <= 0) return bmp;
+    Bitmap* scaled = new Bitmap(sw, sh, PixelFormat32bppPARGB);
+    if (!scaled) return bmp;
+    Graphics g(scaled);
+    g.SetSmoothingMode(SmoothingModeHighQuality);
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    g.DrawImage(bmp, Gdiplus::Rect(0, 0, sw, sh), 0, 0, W, H, UnitPixel);
+    return scaled;
+}
+
 Bitmap* GetOrLoadIcon(AppState& s, const std::wstring& lowerKey) {
     auto it = s.iconCache.find(lowerKey);
     if (it != s.iconCache.end()) return it->second;  // 失败也缓存避免反复重试
@@ -924,6 +959,11 @@ Bitmap* GetOrLoadIcon(AppState& s, const std::wstring& lowerKey) {
         if (cropped != bmp) {
             delete bmp;
             bmp = cropped;
+        }
+        Bitmap* pre = PreScaleIconSource(bmp);
+        if (pre != bmp) {
+            delete bmp;
+            bmp = pre;
         }
     } else {
         Logf(L"图标提取失败：%ls", lowerKey.c_str());
@@ -1189,16 +1229,18 @@ int QueryPrimaryDpi() {
 }
 
 void ForceForegroundWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return;
     HWND fg = GetForegroundWindow();
     if (fg == hwnd) return;
     const DWORD fgThread = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
     const DWORD myThread = GetCurrentThreadId();
-    if (fgThread && fgThread != myThread) {
-        AttachThreadInput(fgThread, myThread, TRUE);
-    }
+    const bool attached = fgThread && fgThread != myThread &&
+                          AttachThreadInput(fgThread, myThread, TRUE) != FALSE;
     BringWindowToTop(hwnd);
     SetForegroundWindow(hwnd);
-    if (fgThread && fgThread != myThread) {
+    if (attached) {
+        // 只分离真正附加成功的线程；即使上述调用异常，也确保不把
+        // 输入队列遗留成“附加”状态（会导致资源管理器等失鼠标响应）。
         AttachThreadInput(fgThread, myThread, FALSE);
     }
 }
@@ -1324,6 +1366,7 @@ constexpr int kShowDesktopWLogical = 12;  // 隐形按钮宽（逻辑像素，�
 constexpr int kShowDesktopHLogical = 48;  // 隐形按钮高（逻辑像素，与 Windows 按钮一致）
 
 HHOOK g_showDesktopHook = nullptr;
+bool g_hookLeftDownOnDock = false;         // 低层钩子吞掉过 Dock 左键按下：抬起也须吞掉
 std::vector<HWND> g_showDesktopMinimized;  // 本次显示桌面最小化的窗口（再点恢复）
 bool g_showDesktopActive = false;          // 显示桌面状态（true=再点恢复）
 
@@ -1449,7 +1492,8 @@ void ToggleShowDesktop() {
     Logf(L"显示桌面：最小化 %zu 个窗口", g_showDesktopMinimized.size());
 }
 
-// 下方交互动作会由低层鼠标钩子直接调用（透明底部空隙可能收不到窗口消息）
+// 交互动作定义在下方；低层鼠标钩子只采集点击并投递给 WndProc 统一执行
+// （透明底部空隙/贴底边缘可能收不到窗口消息，钩子负责命中采集）
 int HitIndexAt(AppState& s, float x, float y);
 void ToggleFocusOrLaunch(AppState& s, size_t idx);
 void SetFrameCadence(AppState& s, bool fast);
@@ -1504,35 +1548,47 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
                 // 透明底部空隙可能收不到窗口 WM_MOUSEMOVE，因此在钩子层
                 // 直接保证快帧，悬停/放大动画才能及时更新。
                 SetFrameCadence(g_state, true);
-            } else if (g_state.wasOnDock) {
-                RECT wr{};
-                if (GetWindowRect(g_state.hwnd, &wr)) {
-                    const bool topExit = ms->pt.y < wr.top;
-                    const bool leftExit = ms->pt.x < wr.left;
-                    const bool rightExit = ms->pt.x >= wr.right;
-                    if (topExit || leftExit || rightExit) {
-                        g_state.hideRequested = true;
-                        g_state.wasOnDock = false;  // 收起已触发；重进再置位
-                        // 空闲已停帧：收起动画从这里拿到第一帧
-                        SetFrameCadence(g_state, true);
+            } else {
+                // 光标物理位置已离开 Dock：立即清除窗口侧的“在窗内”状态。
+                // WM_MOUSELEAVE 在分层窗口/快速移动/输入队列附加场景可能丢失，
+                // 若残留 true 会导致人已离开 Dock 仍因横向移动触发悬停放大。
+                g_state.mouseInside = false;
+                if (g_state.wasOnDock) {
+                    RECT wr{};
+                    if (GetWindowRect(g_state.hwnd, &wr)) {
+                        const bool topExit = ms->pt.y < wr.top;
+                        const bool leftExit = ms->pt.x < wr.left;
+                        const bool rightExit = ms->pt.x >= wr.right;
+                        if (topExit || leftExit || rightExit) {
+                            g_state.hideRequested = true;
+                            g_state.wasOnDock = false;  // 收起已触发；重进再置位
+                            // 空闲已停帧：收起动画从这里拿到第一帧
+                            SetFrameCadence(g_state, true);
+                        }
                     }
                 }
             }
         } else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP) {
-            if (InCornerZone(ms->pt, true)) {
+            if (wParam == WM_LBUTTONDOWN && InCornerZone(ms->pt, true)) {
                 // 左下角：仿 Windows 开始按钮 —— 触发 Win 键（打开开始菜单）
-                if (wParam == WM_LBUTTONDOWN) TriggerWinKey();
+                PostMessageW(g_state.hwnd, kMsgHookClick, kHookClickStart, 0);
+                g_hookLeftDownOnDock = true;
                 return 1;  // 吞掉：点击不穿透到下方窗口
             }
-            if (InCornerZone(ms->pt, false)) {
+            if (wParam == WM_LBUTTONDOWN && InCornerZone(ms->pt, false)) {
                 // 右下角：显示桌面（再点恢复）
-                if (wParam == WM_LBUTTONDOWN) ToggleShowDesktop();
+                PostMessageW(g_state.hwnd, kMsgHookClick,
+                             kHookClickShowDesktop, 0);
+                g_hookLeftDownOnDock = true;
                 return 1;  // 吞掉：点击不穿透到下方窗口
             }
 
-            // 低层钩子直接处理图标点击：透明底部空隙/贴底边缘可能收不到
-            // 窗口鼠标消息，这里按物理坐标命中图标并执行与窗口单击一致的动作，
-            // 保证即使指针紧贴屏幕下边缘也能点击到图标（任务栏式行为）。
+            // 低层钩子只负责“采集”图标点击事件（含透明底部空隙/贴底边缘），
+            // 把动作投递到主窗口线程后立即返回。绝不在钩子回调里执行
+            // ShowWindow/SetForegroundWindow/AttachThreadInput/ToggleShowDesktop
+            // 等窗口/输入管理 —— 这些操作在 WH_MOUSE_LL 回调里执行会导致
+            // 输入队列被附加、Windows 资源管理器（桌面 shell）失去鼠标响应，
+            // 必须回到 UI 线程再做。
             if (wParam == WM_LBUTTONDOWN && PointInDockOrStrip(ms->pt)) {
                 RECT wr{};
                 if (GetWindowRect(g_state.hwnd, &wr)) {
@@ -1544,14 +1600,32 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
                     }
                     const int idx = HitIndexAt(g_state, mx, my);
                     if (idx >= 0) {
-                        ToggleFocusOrLaunch(g_state,
-                                            static_cast<size_t>(idx));
+                        PostMessageW(
+                            g_state.hwnd, kMsgHookClick, kHookClickDockLeft,
+                            MAKELPARAM(static_cast<short>(mx),
+                                       static_cast<short>(my)));
+                        g_hookLeftDownOnDock = true;
                         return 1;
                     }
                 }
             }
+
+            // 未在上面 return 的按下 = 不是 Dock/角部消费的按下：
+            // 清除可能残留的旧“钩子吞掉按下”状态，避免误吞后续普通抬起。
+            if (wParam == WM_LBUTTONDOWN) {
+                g_hookLeftDownOnDock = false;
+            }
+
+            // 如果按下是被上面吞掉的（Dock/角部），对应的抬起也要吞掉，
+            // 否则系统会把一个没有按下的“孤儿抬键”派给资源管理器等窗口，
+            // 造成鼠标按钮状态错乱、点击失效。
+            if (wParam == WM_LBUTTONUP && g_hookLeftDownOnDock) {
+                g_hookLeftDownOnDock = false;
+                return 1;
+            }
         } else if (wParam == WM_MBUTTONUP && PointInDockOrStrip(ms->pt)) {
             // 与窗口内中键一致：底部空隙/贴边也能中键关闭，并立即隐藏圆点。
+            // 同样只采集，投递到 UI 线程后执行（避免钩子内做窗口管理）。
             RECT wr{};
             if (GetWindowRect(g_state.hwnd, &wr)) {
                 float mx = static_cast<float>(ms->pt.x - wr.left);
@@ -1561,7 +1635,10 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
                 }
                 const int idx = HitIndexAt(g_state, mx, my);
                 if (idx >= 0) {
-                    RequestCloseByIndex(g_state, static_cast<size_t>(idx));
+                    PostMessageW(
+                        g_state.hwnd, kMsgHookClick, kHookClickDockMiddle,
+                        MAKELPARAM(static_cast<short>(mx),
+                                   static_cast<short>(my)));
                     return 1;
                 }
             }
@@ -1582,6 +1659,7 @@ void InstallShowDesktopHook() {
 }
 
 void UninstallShowDesktopHook() {
+    g_hookLeftDownOnDock = false;  // 卸载即清空配对状态，避免重装后残留
     if (g_showDesktopHook) {
         UnhookWindowsHookEx(g_showDesktopHook);
         g_showDesktopHook = nullptr;
@@ -2198,12 +2276,19 @@ bool UpdateLayoutOneFrame(AppState& s) {
     }
     const float sigma = kMagnifySigma * k;
 
+    // 悬停以低层钩子/每帧自愈的物理真值 mouseOverDock 为准。mouseInside 只是
+    // 窗口 WM_MOUSEMOVE 的旁证，在分层窗口快速移动/输入队列附加异常时会残留
+    // true，仅当低层钩子安装失败时才回退使用它（否则人已离开 Dock 仍横向
+    // 移动会误触发悬停动画）。
+    const bool pointerActive = s.mouseOverDock ||
+                               (s.mouseInside && g_showDesktopHook == nullptr);
+
     // ---- 目标缩放（悬停生效，悬停真值由 LL 钩子按光标物理位置维护，
     //     窗口事件在边缘/静止场景不可靠）----
     float activeAny = false;
     for (size_t i = 0; i < n; ++i) {
         float target = 1.0f;
-        if ((s.mouseOverDock || s.mouseInside) && s.prevCenters.size() == n) {
+        if (pointerActive && s.prevCenters.size() == n) {
             const float d = s.mouseX - s.prevCenters[i];
             const float f = std::exp(-(d * d) / (2.f * sigma * sigma));
             target = 1.0f + (kMaxScale - 1.0f) * f;
@@ -2277,7 +2362,7 @@ bool UpdateLayoutOneFrame(AppState& s) {
     // WM_MOUSEMOVE：透明下边缘/空隙可能不派发窗口鼠标消息，否则贴近
     // 屏幕下边缘时悬停会闪烁。
     LONG newHover = -1;
-    if (s.mouseOverDock || s.mouseInside) {
+    if (pointerActive) {
         for (size_t i = 0; i < n; ++i) {
             const RectF& r = s.geoms[i].hit;
             if (s.mouseX >= r.X && s.mouseX < r.X + r.Width &&
@@ -2377,7 +2462,9 @@ void DrawSeparator(Graphics& g, AppState& s, float iconBottom, float k) {
 
 void DrawFrame(Graphics& g, AppState& s) {
     g.SetSmoothingMode(SmoothingModeAntiAlias);
-    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    // 图标源已预缩至 ≤160px（见 PreScaleIconSource），目标 ≤73px：
+    // Bilinear 已足够（Bicubic 慢 ~6 倍，视觉差异在此比例可忽略）。
+    g.SetInterpolationMode(InterpolationModeHighQualityBilinear);
     g.Clear(Color(0, 0, 0, 0));
 
     const float k = s.scale;
@@ -2445,19 +2532,36 @@ void DrawFrame(Graphics& g, AppState& s) {
     if (s.uiFont && s.hoverIndex < n &&
         GetTickCount64() - s.hoverSince > kTooltipDelayMs) {
         const DockItem& it = s.items[s.hoverIndex];
+        // 度量缓存：MeasureString 是 GDI+ 高成本操作。以完整显示名为键，
+        // 截断结果只在名称或最大宽度（窗口宽随悬停展宽变化）改变时重测。
+        static std::wstring cachedKey;
+        static std::wstring cachedText;
+        static RectF cachedMeasured;
+        static float cachedMaxTextW = -1.f;
         std::wstring text = it.displayName;
         const float maxTextW = body.Width * 0.4f;
-        for (;;) {
-            RectF measured{};
-            g.MeasureString(text.c_str(), static_cast<INT>(text.size()),
-                            s.uiFont, PointF(0.f, 0.f), &measured);
-            if (measured.Width <= maxTextW || text.size() <= 2) break;
-            text.resize(text.size() - 1);
-            if (text.size() > 1) text[text.size() - 1] = L'…';
+        if (text != cachedKey ||
+            std::fabs(maxTextW - cachedMaxTextW) > 1.0f) {
+            // 文本截断（超出 maxTextW 时逐字缩短）
+            std::wstring t = text;
+            for (;;) {
+                RectF m{};
+                g.MeasureString(t.c_str(), static_cast<INT>(t.size()),
+                                s.uiFont, PointF(0.f, 0.f), &m);
+                if (m.Width <= maxTextW || t.size() <= 2) break;
+                t.resize(t.size() - 1);
+                if (t.size() > 1) t[t.size() - 1] = L'…';
+            }
+            RectF m{};
+            g.MeasureString(t.c_str(), static_cast<INT>(t.size()), s.uiFont,
+                            PointF(0.f, 0.f), &m);
+            cachedKey = text;
+            cachedText = std::move(t);
+            cachedMeasured = m;
+            cachedMaxTextW = maxTextW;
         }
-        RectF measured{};
-        g.MeasureString(text.c_str(), static_cast<INT>(text.size()), s.uiFont,
-                        PointF(0.f, 0.f), &measured);
+        text = cachedText;
+        const RectF& measured = cachedMeasured;
         const float tw = measured.Width + 24.f * k;
         const float th = 27.f * k;
         const float tipCenterX = s.geoms[s.hoverIndex].cx;
@@ -3657,6 +3761,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ShowItemContextMenu(*s, static_cast<size_t>(idx));
             } else {
                 ShowBlankContextMenu(*s);
+            }
+            return 0;
+        }
+
+        // WH_MOUSE_LL 钩子只采集点击，真正的窗口/输入管理动作在 UI 线程执行。
+        // 这样避免 AttachThreadInput / SetForegroundWindow / ShowWindow 等调用
+        // 发生在低层鼠标钩子回调里，杜绝资源管理器（explorer shell）失去
+        // 鼠标响应、只能 Ctrl+Alt+Del 恢复的卡死。
+        case kMsgHookClick: {
+            if (wParam == kHookClickDockLeft ||
+                wParam == kHookClickDockMiddle) {
+                POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+                const int idx = HitIndexAt(*s, static_cast<float>(pt.x),
+                                           static_cast<float>(pt.y));
+                if (idx >= 0) {
+                    if (wParam == kHookClickDockLeft) {
+                        ToggleFocusOrLaunch(*s, static_cast<size_t>(idx));
+                    } else {
+                        RequestCloseByIndex(*s, static_cast<size_t>(idx));
+                    }
+                }
+            } else if (wParam == kHookClickStart) {
+                TriggerWinKey();
+            } else if (wParam == kHookClickShowDesktop) {
+                ToggleShowDesktop();
             }
             return 0;
         }
