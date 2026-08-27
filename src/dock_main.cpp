@@ -1351,12 +1351,19 @@ void ToggleShowDesktop() {
     Logf(L"显示桌面：最小化 %zu 个窗口", g_showDesktopMinimized.size());
 }
 
+// 下方交互动作会由低层鼠标钩子直接调用（透明底部空隙可能收不到窗口消息）
+int HitIndexAt(AppState& s, float x, float y);
+void ToggleFocusOrLaunch(AppState& s, size_t idx);
+void SetFrameCadence(AppState& s, bool fast);
+
 // 展开触发条：与 Dock 栏同宽（含当前呈现宽度）、高 2px（随 DPI）的
 // 屏幕下边缘区域；光标触碰即从收起状态升起
 bool InDockStrip(POINT pt) {
     const int h = MulDiv(kDockStripHeightLogical, g_state.dpi, 96);
-    const int sh = GetSystemMetrics(SM_CYSCREEN);
-    if (pt.y < sh - h || pt.y >= sh) return false;
+    const int bottom = PrimaryWorkArea().bottom;
+    // 含 bottom 这一行：物理屏幕最底像素/贴边时系统可能报 sh-1 或 sh，
+    // 一律算 Dock 有效区，避免最低一列丢失悬停/点击。
+    if (pt.y < bottom - h || pt.y > bottom) return false;
     return pt.x >= g_state.winX && pt.x < g_state.winX + g_state.winW;
 }
 
@@ -1365,8 +1372,12 @@ bool InDockStrip(POINT pt) {
 // 其下——光标在这些区域（含渲染区下方边缘）都属于“在 Dock 上”
 bool PointInDockOrStrip(POINT pt) {
     RECT wr{};
+    const int bottom = PrimaryWorkArea().bottom;
+    // 水平在 Dock 窗口范围内时，从窗口顶部一直到屏幕下边缘都算有效交互区，
+    // 包含窗口底部的透明边距以及 Dock 与屏幕下边缘之间的空隙。
+    // 同样用 <= bottom，把最底边一行也纳入。
     if (GetWindowRect(g_state.hwnd, &wr) && pt.x >= wr.left &&
-        pt.x < wr.right && pt.y >= wr.top && pt.y < wr.bottom) {
+        pt.x < wr.right && pt.y >= wr.top && pt.y <= bottom) {
         return true;
     }
     return InDockStrip(pt);
@@ -1385,16 +1396,12 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
             if (onDock) {
                 g_state.wasOnDock = true;
                 if (g_state.hideRequested) {
-                    // 触碰触发条 / 回到 Dock：请求展开并恢复快帧
+                    // 触碰触发条 / 回到 Dock：请求展开
                     g_state.hideRequested = false;
-                    if (g_state.frameIntervalMs !=
-                        static_cast<int>(kFrameIntervalMs)) {
-                        g_state.frameIntervalMs =
-                            static_cast<int>(kFrameIntervalMs);
-                        SetTimer(g_state.hwnd, kFrameTimerId,
-                                 kFrameIntervalMs, nullptr);
-                    }
                 }
+                // 透明底部空隙可能收不到窗口 WM_MOUSEMOVE，因此在钩子层
+                // 直接保证快帧，悬停/放大动画才能及时更新。
+                SetFrameCadence(g_state, true);
             } else if (g_state.wasOnDock) {
                 RECT wr{};
                 if (GetWindowRect(g_state.hwnd, &wr)) {
@@ -1417,6 +1424,27 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
                 // 右下角：显示桌面（再点恢复）
                 if (wParam == WM_LBUTTONDOWN) ToggleShowDesktop();
                 return 1;  // 吞掉：点击不穿透到下方窗口
+            }
+
+            // 低层钩子直接处理图标点击：透明底部空隙/贴底边缘可能收不到
+            // 窗口鼠标消息，这里按物理坐标命中图标并执行与窗口单击一致的动作，
+            // 保证即使指针紧贴屏幕下边缘也能点击到图标（任务栏式行为）。
+            if (wParam == WM_LBUTTONDOWN && PointInDockOrStrip(ms->pt)) {
+                RECT wr{};
+                if (GetWindowRect(g_state.hwnd, &wr)) {
+                    float mx = static_cast<float>(ms->pt.x - wr.left);
+                    float my = static_cast<float>(ms->pt.y - wr.top);
+                    // 空隙处于窗口矩形下方时，按最近有效边缘处理
+                    if (my >= static_cast<float>(g_state.winH)) {
+                        my = static_cast<float>(g_state.winH) - 1.f;
+                    }
+                    const int idx = HitIndexAt(g_state, mx, my);
+                    if (idx >= 0) {
+                        ToggleFocusOrLaunch(g_state,
+                                            static_cast<size_t>(idx));
+                        return 1;
+                    }
+                }
             }
         }
     }
@@ -1606,49 +1634,6 @@ bool RefreshItems(AppState& s) {
         c.item.windows.push_back(kv.second);
     }
 
-    // ---- 来源 2.5：未解析固定项与窗口组模糊合并 ----
-    // Office 广告式 lnk / 商店应用 lnk 可能解析不出目标 exe（key 就是 lnk 本身）。
-    // 若某窗口组的 文件描述 或 exe 基名 与固定项显示名一致，
-    // 则把窗口组升级为固定项（保留 lnk 启动路径），消除重复条目。
-    auto PinNameMatchesWindow = [](const std::wstring& pinNameLower,
-                                   const std::wstring& winKey) {
-        const std::wstring base =
-            StripExtension(ToLower(PathBasename(winKey)));
-        if (!pinNameLower.empty() && base == pinNameLower) return true;
-        const std::wstring desc = ToLower(ExeDisplayName(winKey));
-        return !desc.empty() && !pinNameLower.empty() &&
-               desc.find(pinNameLower) != std::wstring::npos;
-    };
-    for (size_t i = 0; i < cands.size(); ++i) {
-        Cand& p = cands[i];
-        if (!p.item.pinned || p.item.hasWindow) continue;
-        // 仅处理 key 解析失败（等于 lnk 自身）的固定项
-        const std::wstring pinLower = ToLower(p.item.key);
-        if (pinLower.rfind(L".lnk") != pinLower.size() - 4) continue;
-        const std::wstring nameLower = ToLower(p.item.displayName);
-        if (nameLower.empty()) continue;
-        for (size_t j = 0; j < cands.size(); ++j) {
-            if (j == i) continue;
-            Cand& w = cands[j];
-            if (!w.item.hasWindow) continue;
-            if (!PinNameMatchesWindow(nameLower, w.item.key)) continue;
-            w.item.pinned = true;
-            w.item.launchPath = p.item.launchPath;
-            w.item.displayName = p.item.displayName;
-            // 每对 (固定项, 运行组) 只记录一次，避免每轮询刷日志
-            static std::unordered_set<std::wstring> mergedLogged;
-            if (mergedLogged.insert(p.item.displayName + L"→" +
-                                    w.item.key).second) {
-                Logf(L"固定项按名称并入运行组：%ls → %ls",
-                     p.item.displayName.c_str(), w.item.key.c_str());
-            }
-            // 从候选中剔除 lnk 本体条目
-            cands.erase(cands.begin() + static_cast<long>(i));
-            --i;
-            break;
-        }
-    }
-
     // ---- 来源 3：托盘驻留第三方 —— 特别需求核心 ----
     // 进程级全量枚举（每个进程 OpenProcess + 查询镜像路径）较耗电，
     // “是否存活”容忍 3s 缓存延迟（应用启动/退出后托盘条目 ≤3s 校正）
@@ -1673,6 +1658,49 @@ bool RefreshItems(AppState& s) {
         if (s.hiddenKeys.count(key)) continue;  // 用户手动隐藏的后台项
         Cand& c = getCand(key);
         c.item.trayMarked = true;
+    }
+
+    // ---- 来源 2.5：固定项与运行组/托盘组按名称模糊合并 ----
+    // 有的应用“启动器 exe”和“实际主程序 exe”不是同一个文件
+    // （例如钉钉：钉钉.lnk → dingtalklauncher.exe，而运行/托盘是
+    // dingtalk.exe），会导致 Dock 出现同名重复图标。这里不再只处理
+    // 解析失败的 lnk，只要固定项和某个运行/托盘组显示名一致，就把
+    // 运行/托盘组升级为固定项（保留 lnk 启动路径），消除重复。
+    auto PinNameMatchesWindow = [](const std::wstring& pinNameLower,
+                                   const std::wstring& winKey) {
+        const std::wstring base =
+            StripExtension(ToLower(PathBasename(winKey)));
+        if (!pinNameLower.empty() && base == pinNameLower) return true;
+        const std::wstring desc = ToLower(ExeDisplayName(winKey));
+        return !desc.empty() && !pinNameLower.empty() &&
+               desc.find(pinNameLower) != std::wstring::npos;
+    };
+    for (size_t i = 0; i < cands.size(); ++i) {
+        Cand& p = cands[i];
+        if (!p.item.pinned || p.item.hasWindow || p.item.trayMarked) continue;
+        const std::wstring nameLower = ToLower(p.item.displayName);
+        if (nameLower.empty()) continue;
+        for (size_t j = 0; j < cands.size(); ++j) {
+            if (j == i) continue;
+            Cand& w = cands[j];
+            if (!w.item.hasWindow && !w.item.trayMarked) continue;
+            if (w.item.key == p.item.key) continue;
+            if (!PinNameMatchesWindow(nameLower, w.item.key)) continue;
+            w.item.pinned = true;
+            w.item.launchPath = p.item.launchPath;
+            w.item.displayName = p.item.displayName;
+            // 每对 (固定项, 运行组) 只记录一次，避免每轮询刷日志
+            static std::unordered_set<std::wstring> mergedLogged;
+            if (mergedLogged.insert(p.item.displayName + L"→" +
+                                    w.item.key).second) {
+                Logf(L"固定项按名称并入运行组：%ls → %ls",
+                     p.item.displayName.c_str(), w.item.key.c_str());
+            }
+            // 从候选中剔除启动器固定项本体，避免同名重复图标
+            cands.erase(cands.begin() + static_cast<long>(i));
+            --i;
+            break;
+        }
     }
 
     // ---- 过滤 + 排序：固定区在前（pins 序），其余按稳定序号 ----
@@ -2000,6 +2028,7 @@ bool UpdateLayoutOneFrame(AppState& s) {
     }
 
     // ---- 实时游标：窗口每帧随展宽位移，事件坐标会过期，直接换算 ----
+    float hitBottomY = static_cast<float>(s.winH);  // 命中区下沿（窗口客户坐标）
     {
         POINT cp{};
         GetCursorPos(&cp);
@@ -2007,6 +2036,18 @@ bool UpdateLayoutOneFrame(AppState& s) {
         if (GetWindowRect(s.hwnd, &wr)) {
             s.mouseX = static_cast<float>(cp.x - wr.left);
             s.mouseY = static_cast<float>(cp.y - wr.top);
+            // 每帧用物理光标位置自愈 mouseOverDock：不依赖 LL 钩子是否
+            // 正好送达最底一行，贴底/空隙悬停更稳定。
+            s.mouseOverDock = PointInDockOrStrip(cp);
+            if (s.mouseOverDock) {
+                s.wasOnDock = true;
+                if (s.hideRequested) s.hideRequested = false;
+            }
+            // 命中区覆盖到“屏幕底边”（含 Dock 与屏幕下边缘之间的整段空隙），
+            // 不再把空隙坐标向上钳制到窗口内，最低一行也能直接命中。
+            // +1 让“屏幕底边这一行”（y==bottom）也落入命中区间。
+            const int bottom = PrimaryWorkArea().bottom;
+            hitBottomY = static_cast<float>(bottom - wr.top + 1);
         }
     }
     const float sigma = kMagnifySigma * k;
@@ -2070,7 +2111,10 @@ bool UpdateLayoutOneFrame(AppState& s) {
                     // 缺了会把每槽 6px 全部累积成右端空隙
         const float left = x;
         GeomSlot& gm = s.geoms[i];
-        gm.hit = RectF(left, body.Y + 2.f, w + half * 2.f, body.Height - 4.f);
+        // 命中区从玻璃主体顶部一直延伸到屏幕底边（含透明下边缘/贴底空隙），
+        // 这样光标贴近屏幕下边缘（含空隙内最低一行）仍能稳定命中并悬停到对应图标。
+        gm.hit = RectF(left, body.Y + 2.f, w + half * 2.f,
+                       hitBottomY - (body.Y + 2.f));
         gm.icon = RectF(left, iconBottom - w, w, w);
         gm.cx = left + w * 0.5f;
         s.prevCenters[i] = gm.cx;
@@ -2083,8 +2127,11 @@ bool UpdateLayoutOneFrame(AppState& s) {
     }
 
     // ---- 悬停命中（含悬停时间戳维护）----
+    // 使用鼠标物理位置（LL 钩子维护的 mouseOverDock）而不是仅依赖窗口
+    // WM_MOUSEMOVE：透明下边缘/空隙可能不派发窗口鼠标消息，否则贴近
+    // 屏幕下边缘时悬停会闪烁。
     LONG newHover = -1;
-    if (s.mouseInside) {
+    if (s.mouseOverDock || s.mouseInside) {
         for (size_t i = 0; i < n; ++i) {
             const RectF& r = s.geoms[i].hit;
             if (s.mouseX >= r.X && s.mouseX < r.X + r.Width &&
