@@ -211,6 +211,7 @@ struct AppState {
 
     std::vector<std::wstring> pins;
     std::unordered_set<std::wstring> hiddenKeys;
+    std::unordered_set<std::wstring> closingKeys;  // 中键关闭中：立即隐藏运行圆点
     int bottomGapBase = kBottomGapBase;
     RECT savedWorkArea{};  // 任务栏存在时的工作区（恢复任务栏时还原）
 
@@ -1355,6 +1356,7 @@ void ToggleShowDesktop() {
 int HitIndexAt(AppState& s, float x, float y);
 void ToggleFocusOrLaunch(AppState& s, size_t idx);
 void SetFrameCadence(AppState& s, bool fast);
+void RequestCloseByIndex(AppState& s, size_t idx);  // 中键关闭 + 立即隐藏圆点
 
 // 展开触发条：与 Dock 栏同宽（含当前呈现宽度）、高 2px（随 DPI）的
 // 屏幕下边缘区域；光标触碰即从收起状态升起
@@ -1444,6 +1446,21 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
                                             static_cast<size_t>(idx));
                         return 1;
                     }
+                }
+            }
+        } else if (wParam == WM_MBUTTONUP && PointInDockOrStrip(ms->pt)) {
+            // 与窗口内中键一致：底部空隙/贴边也能中键关闭，并立即隐藏圆点。
+            RECT wr{};
+            if (GetWindowRect(g_state.hwnd, &wr)) {
+                float mx = static_cast<float>(ms->pt.x - wr.left);
+                float my = static_cast<float>(ms->pt.y - wr.top);
+                if (my >= static_cast<float>(g_state.winH)) {
+                    my = static_cast<float>(g_state.winH) - 1.f;
+                }
+                const int idx = HitIndexAt(g_state, mx, my);
+                if (idx >= 0) {
+                    RequestCloseByIndex(g_state, static_cast<size_t>(idx));
+                    return 1;
                 }
             }
         }
@@ -1735,6 +1752,24 @@ bool RefreshItems(AppState& s) {
         if (animIt != prevAnim.end()) item.scaleAnim = animIt->second;
         if (item.pinned) ++s.pinCount;
         s.items.push_back(std::move(item));
+    }
+
+    // ---- 中键关闭抑制状态清理 ----
+    // 一旦应用确实不再有窗口/托盘驻留（或条目已消失），解除抑制；
+    // 若仍存活（关闭中/优雅退出尚未完成），继续保持圆点隐藏。
+    for (auto it = s.closingKeys.begin(); it != s.closingKeys.end();) {
+        bool stillRunning = false;
+        for (const auto& item : s.items) {
+            if (item.key == *it && (item.hasWindow || item.trayMarked)) {
+                stillRunning = true;
+                break;
+            }
+        }
+        if (!stillRunning) {
+            it = s.closingKeys.erase(it);
+        } else {
+            ++it;
+        }
     }
 
     // ---- 变更检测与日志（仅状态切换的那一次 poll 会触发）----
@@ -2278,7 +2313,9 @@ void DrawFrame(Graphics& g, AppState& s) {
             g.FillPath(&br, &pp);
         }
         // 第 3 层：运行圆点（深色玻璃上用白色，macOS 深色 Dock 同款）
-        if (it.hasWindow || it.trayMarked) {
+        // 中键关闭已发出后立即抑制圆点，不等待实际退出/下一次刷新。
+        if ((it.hasWindow || it.trayMarked) &&
+            s.closingKeys.find(it.key) == s.closingKeys.end()) {
             const float r = 2.6f * k;
             SolidBrush dot(Color(225, 244, 246, 250));
             g.FillEllipse(&dot, gm.cx - r, dotCy - r + dy * 0.2f, r * 2.f,
@@ -2557,6 +2594,17 @@ void CloseAppByKey(const std::wstring& key, const std::wstring& displayName) {
             Logf(L"关闭 %ls：超时已强制结束", displayName.c_str());
         })
         .detach();
+}
+
+// 中键关闭入口：先标记“关闭中”并立即重绘（运行圆点立刻消失），
+// 再执行实际关闭；窗口内与低层钩子共用同一路径，行为一致。
+void RequestCloseByIndex(AppState& s, size_t idx) {
+    if (idx >= s.items.size()) return;
+    DockItem& item = s.items[idx];
+    s.closingKeys.insert(item.key);
+    s.needsRedraw = true;
+    DrawAndPresent(s);
+    CloseAppByKey(item.key, item.displayName);
 }
 
 // ============ 托盘图标触发（Win11 XAML 托盘）============
@@ -3236,8 +3284,7 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
             LaunchItem(s, e.itemIndex);
             break;
         case ItemAction::CloseAllWindows:
-            CloseAppByKey(s.items[e.itemIndex].key,
-                          s.items[e.itemIndex].displayName);
+            RequestCloseByIndex(s, e.itemIndex);
             break;
         case ItemAction::TogglePin:
             TogglePinByKey(s, s.items[e.itemIndex]);
@@ -3422,9 +3469,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             const int idx = HitIndexAt(*s, static_cast<float>(pt.x),
                                            static_cast<float>(pt.y));
             if (idx >= 0) {
-                // 中键关闭应用（窗口项优雅关闭；纯托盘项直接进程级关闭）
-                DockItem& item = s->items[static_cast<size_t>(idx)];
-                CloseAppByKey(item.key, item.displayName);
+                // 中键关闭应用：标记关闭中并立即重绘，运行圆点立刻消失。
+                RequestCloseByIndex(*s, static_cast<size_t>(idx));
             }
             return 0;
         }
