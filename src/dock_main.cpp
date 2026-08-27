@@ -1346,10 +1346,20 @@ void EnsureTaskbarHidden(AppState& s) {
             touched = true;
         }
     }
-    if (touched) {
-        // explorer 重启后工作区被其重置为任务栏占位值，需重新扩为全屏
-        // （同上：不带 SPIF_SENDCHANGE）
-        const RECT full = VirtualScreenRect();
+
+    // 关键：任务栏即使已经处于隐藏状态，工作区也可能被 explorer/开始菜单/
+    // 临时显示任务栏等操作重新改回“任务栏占位”值（例如底边从 1080 变成 1032）。
+    // 原实现只在“本次发现任务栏可见并隐藏”时扩充工作区，导致这种隐藏但工作区
+    // 未恢复的情况不会自愈，Dock 就会停在任务栏原位置上方。
+    const RECT full = VirtualScreenRect();
+    RECT wa{};
+    const bool gotWorkArea =
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0) != FALSE;
+    const bool workAreaStale =
+        !gotWorkArea || wa.left != full.left || wa.top != full.top ||
+        wa.right != full.right || wa.bottom != full.bottom;
+
+    if (touched || workAreaStale) {
         SystemParametersInfoW(SPI_SETWORKAREA, 0,
                               const_cast<RECT*>(&full), 0);
         RefreshPrimaryWorkArea();  // 工作区已改为全屏，同步缓存
@@ -3814,6 +3824,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (wParam == kHookClickShowDesktop) {
                 ToggleShowDesktop();
             }
+            // 与 Dock 交互后立即自愈工作区：开始菜单/显示桌面等操作可能让
+            // explorer 把工作区改回“任务栏占位”，导致 Dock 跳到任务栏上方。
+            EnsureTaskbarHidden(*s);
             return 0;
         }
 
@@ -4037,6 +4050,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     s.winW = initial.cx;
     s.lastIdleW = initial.cx;
     HideTaskbar();  // Dock 常驻期间隐藏 Windows 任务栏（此后定位使用全屏工作区）
+    EnsureTaskbarHidden(s);  // 启动即自愈：防止 explorer 异步把工作区改回任务栏占位
     RepositionDock(s, true);
     InstallShowDesktopHook();  // 右下角显示桌面隐形按钮（与 Windows 按钮同尺寸）
 
