@@ -3430,6 +3430,7 @@ std::wstring WindowTitleForMenu(HWND hwnd) {
 }
 
 void ShowItemContextMenu(AppState& s, size_t idx) {
+    if (s.menuOpen) return;  // 防止菜单未关闭时重复右键造成嵌套模态循环/卡死
     DockItem& item = s.items[idx];
     ResetMenuEntries(s);
     HMENU menu = CreatePopupMenu();
@@ -3503,7 +3504,7 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
 
     POINT pt{};
     GetCursorPos(&pt);
-    SetForegroundWindow(s.hwnd);
+    ForceForegroundWindow(s.hwnd);  // 不能只 SetForegroundWindow：NOACTIVATE 窗口易被前台锁拦截，菜单可能不来
     s.menuOpen = true;  // 菜单期间保持展开（避免光标移至菜单即被收起）
     const int cmd = TrackPopupMenu(menu,
                                    TPM_RETURNCMD | TPM_RIGHTBUTTON |
@@ -3574,6 +3575,7 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
 }
 
 void ShowBlankContextMenu(AppState& s) {
+    if (s.menuOpen) return;  // 防止菜单未关闭时重复右键造成嵌套模态循环/卡死
     ResetMenuEntries(s);
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu,
@@ -3585,7 +3587,7 @@ void ShowBlankContextMenu(AppState& s) {
 
     POINT pt{};
     GetCursorPos(&pt);
-    SetForegroundWindow(s.hwnd);
+    ForceForegroundWindow(s.hwnd);  // 同 ShowItemContextMenu：确保菜单能拿到前台
     s.menuOpen = true;  // 菜单期间保持展开
     const int cmd = TrackPopupMenu(menu,
                                    TPM_RETURNCMD | TPM_RIGHTBUTTON |
