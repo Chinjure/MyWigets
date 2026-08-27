@@ -970,6 +970,16 @@ bool IsShellSystemClass(HWND hwnd) {
            wcscmp(cls, L"XamlExplorerHostIslandWindow") == 0;
 }
 
+// 文件管理器窗口（explorer.exe 的 CabinetWClass / 旧版 ExploreWClass）：
+// 尽管其宿主进程是基础设施，文件管理窗口本身是用户意义上的应用，
+// Dock 的“来源 2”应以窗口为准放行（见 RefreshItems）
+bool IsFileExplorerWindow(HWND hwnd) {
+    wchar_t cls[64] = {};
+    if (GetClassNameW(hwnd, cls, 63) <= 0) return false;
+    return wcscmp(cls, L"CabinetWClass") == 0 ||
+           wcscmp(cls, L"ExploreWClass") == 0;
+}
+
 // UWP 框架窗口的真实身份是其中 CoreWindow 所属的包进程
 DWORD RealIdentityPidForFrame(HWND frame) {
     HWND core =
@@ -1146,6 +1156,163 @@ void EnsureTaskbarHidden(AppState& s) {
     }
 }
 
+// ============================== 显示桌面（右下角隐形按钮 + Win+D 自愈）==============================
+// Dock 常驻时任务栏隐藏，屏幕右下角让位给“显示桌面”语义：此处放一块与
+// Windows 显示桌面按钮尺寸完全一致（本机 150% DPI 实测 18×72，逻辑 12×48）
+// 的完全隐形点击区，点击 = Windows 的显示桌面（再点恢复）。
+//
+// 关于系统 Win+D 与“组件被最小化”：
+// 早期版本任务栏可见时，系统 Show Desktop 只最小化任务栏窗口，套件组件
+// （WS_EX_NOACTIVATE 工具窗）天然被排除；任务栏被 Dock 隐藏后，shell 的
+// Show Desktop 不再能按任务栏窗口组计算排除集，会把组件一并最小化。
+// 不拦截 Win+D（拦截会破坏 Win 修饰键状态并引发 Start 菜单/切换语义问题），
+// 而是让其正常发生并由 Dock 每帧自愈：组件窗口一旦被最小化立即 SW_RESTORE，
+// 对用户可见的闪烁 ≤1 帧；普通应用窗口维持系统 Show Desktop 的原生行为。
+// 右下角隐形按钮走自家 ToggleShowDesktop（显式排除套件组件，零窗口零像素）。
+
+constexpr int kShowDesktopWLogical = 12;  // Windows 显示桌面按钮宽（逻辑像素）
+constexpr int kShowDesktopHLogical = 48;  // Windows 显示桌面按钮高（逻辑像素）
+
+HHOOK g_showDesktopHook = nullptr;
+std::vector<HWND> g_showDesktopMinimized;  // 本次显示桌面最小化的窗口（再点恢复）
+bool g_showDesktopActive = false;          // 显示桌面状态（true=再点恢复）
+
+// 套件组件顶层窗口（自愈缓存：Win+D 被最小化时立即恢复）
+// 类名与各组件源码一致；MyWigetsTrayWindow 通常隐藏，不影响判断
+std::vector<HWND> g_suiteWindows;
+
+void RefreshSuiteWindowCache() {
+    g_suiteWindows.clear();
+    static const wchar_t* kSuiteCls[] = {
+        L"DesktopTopBarWindow", L"DesktopAnalogClockWindow",
+        L"DesktopCalendarWindow", L"DesktopLauncherWindow",
+        L"MyWigetsTrayWindow",
+    };
+    EnumWindows(
+        [](HWND hwnd, LPARAM) -> BOOL {
+            wchar_t cls[64] = {};
+            GetClassNameW(hwnd, cls, 63);
+            for (const wchar_t* c : kSuiteCls) {
+                if (wcscmp(cls, c) == 0) {
+                    g_suiteWindows.push_back(hwnd);
+                    break;
+                }
+            }
+            return TRUE;
+        },
+        0);
+}
+
+// 每帧调用：任何套件组件被最小化（系统 Win+D 的 Show Desktop 残留）
+// 立即恢复 —— 保证“Win+D 不影响组件隐藏”
+void HealMinimizedSuiteWindows() {
+    for (HWND w : g_suiteWindows) {
+        if (IsWindow(w) && IsIconic(w)) {
+            ShowWindow(w, SW_RESTORE);
+            Logf(L"显示桌面自愈：恢复被系统最小化的组件窗口 0x%X",
+                 static_cast<unsigned>(reinterpret_cast<UINT_PTR>(w)));
+        }
+    }
+}
+
+// 自家套件进程（exe 基名）：显示桌面时绝不最小化
+bool IsOwnSuitePid(DWORD pid) {
+    if (pid == 0 || pid == GetCurrentProcessId()) return true;
+    const std::wstring img = ImagePathOfPid(pid);
+    if (img.empty()) return false;
+    const std::wstring base = ToLower(PathBasename(img));
+    for (const wchar_t* name : kSelfExclusions) {
+        if (base == name) return true;  // 表内全部为小写
+    }
+    return false;
+}
+
+// 右下角点击区（主屏物理坐标；尺寸随 DPI 缩放，与 Windows 按钮一致）
+bool InShowDesktopZone(POINT pt) {
+    const int w = MulDiv(kShowDesktopWLogical, g_state.dpi, 96);
+    const int h = MulDiv(kShowDesktopHLogical, g_state.dpi, 96);
+    const int sw = GetSystemMetrics(SM_CXSCREEN);
+    const int sh = GetSystemMetrics(SM_CYSCREEN);
+    return pt.x >= sw - w && pt.x < sw && pt.y >= sh - h && pt.y < sh;
+}
+
+// 显示桌面：最小化除桌面/系统/套件组件外的全部可见顶层窗口；
+// 处于显示桌面状态时再次调用则恢复上次最小化的窗口（与 Windows 一致）
+void ToggleShowDesktop() {
+    if (g_showDesktopActive) {
+        const size_t n = g_showDesktopMinimized.size();
+        for (HWND w : g_showDesktopMinimized) {
+            if (IsWindow(w) && IsIconic(w)) ShowWindow(w, SW_RESTORE);
+        }
+        g_showDesktopMinimized.clear();
+        g_showDesktopActive = false;
+        Logf(L"显示桌面：恢复上次最小化的 %zu 个窗口", n);
+        return;
+    }
+
+    g_showDesktopMinimized.clear();
+    EnumWindows(
+        [](HWND hwnd, LPARAM) -> BOOL {
+            if (!IsWindowVisible(hwnd)) return TRUE;  // 隐藏窗不动
+            if (IsIconic(hwnd)) return TRUE;          // 已最小化不动
+            if (IsCloaked(hwnd)) return TRUE;         // UWP 幽灵窗不动
+            if (GetWindow(hwnd, GW_OWNER)) return TRUE;  // 跟随属主
+            if (IsShellSystemClass(hwnd)) return TRUE;   // 桌面/任务栏本体
+            wchar_t cls[64] = {};
+            GetClassNameW(hwnd, cls, 63);
+            if (wcsstr(cls, L"Ghost") || wcsstr(cls, L"Island")) {
+                return TRUE;
+            }
+            const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            // 工具窗（无任务栏按钮）与系统热键窗：不参与显示桌面
+            if ((ex & WS_EX_TOOLWINDOW) != 0 &&
+                (ex & WS_EX_APPWINDOW) == 0) {
+                return TRUE;
+            }
+            if (IsOwnSuitePid(PidOf(hwnd))) return TRUE;  // 自家组件永不隐藏
+            ShowWindow(hwnd, SW_MINIMIZE);
+            g_showDesktopMinimized.push_back(hwnd);
+            return TRUE;
+        },
+        0);
+
+    // 没有任何窗口需要最小化时（如已在桌面态）不进入“恢复”状态，
+    // 下次点击重新尝试最小化 —— 与 Windows 的显示桌面语义一致
+    g_showDesktopActive = !g_showDesktopMinimized.empty();
+    Logf(L"显示桌面：最小化 %zu 个窗口", g_showDesktopMinimized.size());
+}
+
+LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION) {
+        auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+        if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP) {
+            if (InShowDesktopZone(ms->pt)) {
+                if (wParam == WM_LBUTTONDOWN) ToggleShowDesktop();
+                return 1;  // 吞掉：点击不穿透到下方窗口
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+// 安装/卸载右下角显示桌面钩子（失败不致命：仅失去该入口）
+void InstallShowDesktopHook() {
+    if (!g_showDesktopHook) {
+        g_showDesktopHook = SetWindowsHookExW(
+            WH_MOUSE_LL, ShowDesktopHookProc, GetModuleHandleW(nullptr), 0);
+        if (!g_showDesktopHook) {
+            Logf(L"显示桌面钩子安装失败（err=%lu）", GetLastError());
+        }
+    }
+}
+
+void UninstallShowDesktopHook() {
+    if (g_showDesktopHook) {
+        UnhookWindowsHookEx(g_showDesktopHook);
+        g_showDesktopHook = nullptr;
+    }
+}
+
 // ============================== 刷新合并 ==============================
 
 DockItem MakeItemFromKey(const std::wstring& key) {
@@ -1224,7 +1391,10 @@ bool RefreshItems(AppState& s) {
     EnumWindows(EnumAppWindowProc, reinterpret_cast<LPARAM>(&wgctx));
     for (const auto& kv : wgctx.ordered) {
         const std::wstring& key = kv.first;
-        if (BasenameBlocked(key)) continue;
+        // 基础设施（explorer 等）整体排除；唯一例外：文件管理器窗口 ——
+        // explorer.exe 同时承载桌面/任务栏与“文件管理器”，后者是用户
+        // 意义上的应用，必须进 Dock（可聚焦/最小化/关闭）
+        if (BasenameBlocked(key) && !IsFileExplorerWindow(kv.second)) continue;
         Cand& c = getCand(key);
         c.item.hasWindow = true;
         c.item.windows.push_back(kv.second);
@@ -2612,7 +2782,9 @@ void FrameTick(AppState& s) {
         RefreshItems(s);
         EnsureWindowSize(s);
         EnsureTaskbarHidden(s);  // explorer 重启重建任务栏后再次隐藏
+        RefreshSuiteWindowCache();  // 组件可能重启/重建窗口，刷新自愈缓存
     }
+    HealMinimizedSuiteWindows();  // 每帧：Win+D 系统级最小化组件时立即恢复
 
     const bool animating = UpdateLayoutOneFrame(s);
     const std::string sig = MakeSignature(s);
@@ -2865,6 +3037,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     s.lastIdleW = initial.cx;
     HideTaskbar();  // Dock 常驻期间隐藏 Windows 任务栏（此后定位使用全屏工作区）
     RepositionDock(s, true);
+    InstallShowDesktopHook();  // 右下角显示桌面隐形按钮（与 Windows 按钮同尺寸）
 
     RefreshItems(s);
     s.lastSignature = MakeSignature(s);
@@ -2881,6 +3054,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     }
 
     KillTimer(s.hwnd, kFrameTimerId);
+    UninstallShowDesktopHook();
     delete s.uiFont;
     ClearIconCache(s);
     DestroyBacking(s);
