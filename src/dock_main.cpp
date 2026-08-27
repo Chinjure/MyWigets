@@ -1,7 +1,7 @@
 // DesktopDock - 类 macOS 26 Dock 栏（独立程序，与桌面套件其他组件风格一致）
 //
 // 功能：
-//   1. 屏幕底部居中的一条毛玻璃质感底栏（GDI+ 逐像素透明 + 圆角 + 柔影），
+//   1. 屏幕底部居中的一条毛玻璃质感底栏（GDI+ 逐像素透明 + 圆角），
 //      悬停时图标以 macOS 风格放大（高斯衰减影响邻近图标，弹性动画）
 //   2. 左侧为「固定」应用：支持拖入 .exe/.lnk 固定、右键取消固定，
 //      顺序持久化到注册表 HKCU\Software\DesktopSuite\Dock
@@ -15,7 +15,8 @@
 //      列表求交集：已登记托盘 ∩ 进程存活 − Windows 自带组件 − 本套件自身，
 //      即「现在正以托盘形式驻留的第三方程序」。这类程序即使没有任何可见窗口，
 //      也出现在 Dock 运行区并带运行圆点；纯后台静默项可右键隐藏。
-//   5. 点击行为：有窗口时 聚焦 ⇄ 最小化全部；仅托盘驻留时尝试唤起主窗口或启动；
+//   5. 点击行为：应用未在前台时 打开该应用的全部主窗口（最小化的一次性恢复），
+//      前台时 最小化全部；纯托盘驻留（隐藏 Qt 主窗等）仍走托盘图标触发或启动；
 //      启动时有 macOS 风格弹跳动画直到应用出现；中键关闭该应用全部窗口
 //
 // 日志写入 ..\logs\dock.log
@@ -2124,23 +2125,6 @@ void AddRoundRect(GraphicsPath& path, const RectF& r, float radius) {
     path.CloseFigure();
 }
 
-void DrawSoftShadow(Graphics& g, const RectF& body, float radius, float k) {
-    // 两层外扩描边模拟柔影：矩形整体外移下压，避开玻璃边框位置，
-    // 不与主体描边叠成多重边
-    for (int layer = 0; layer < 2; ++layer) {
-        const float spread = (3.f + layer * 3.f) * k;
-        const float offY = (3.f + layer * 3.f) * k;
-        const BYTE alpha = static_cast<BYTE>(30 - layer * 12);
-        RectF sr(body.X - spread, body.Y - spread + offY,
-                 body.Width + spread * 2.f, body.Height + spread * 2.f);
-        GraphicsPath p;
-        AddRoundRect(p, sr, radius + spread);
-        Pen pen(Color(alpha, 10, 11, 18), (layer + 2) * 3.f * k);
-        pen.SetLineJoin(LineJoinRound);
-        g.DrawPath(&pen, &p);
-    }
-}
-
 void DrawGlassBody(Graphics& g, const RectF& body, float radius, float k) {
     GraphicsPath p;
     AddRoundRect(p, body, radius);
@@ -2203,7 +2187,6 @@ void DrawFrame(Graphics& g, AppState& s) {
     const float iconBottom = body.Y + body.Height - kPadBottom * k;
     const float dotCy = iconBottom + kDotDrop * k;
 
-    DrawSoftShadow(g, body, radius, k);
     DrawGlassBody(g, body, radius, k);
     DrawSeparator(g, s, iconBottom, k);
 
@@ -2367,6 +2350,37 @@ HWND PickMainWindow(const std::vector<HWND>& windows) {
         }
     }
     return best;
+}
+
+// 判断是否是“应用本体”主窗口形态：非工具窗、非托盘消息窗、非幽灵窗，
+// 且正常几何 ≥ 400×300。最小化窗口必须用 GetWindowPlacement 的
+// rcNormalPosition，因为最小化后 GetWindowRect 只剩 160×26 的任务栏图标矩形，
+// 直接按 GetWindowRect 会把多个最小化主窗全部误判成辅助小窗。
+bool IsMainShapeWindow(HWND hwnd) {
+    if (!IsWindow(hwnd) || IsCloaked(hwnd)) return false;
+    if (GetWindow(hwnd, GW_OWNER) != nullptr) return false;  // 阴影/水印等属主窗
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, 63);
+    if (wcsstr(cls, L"TrayIconMessage") != nullptr) return false;
+    const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if ((ex & WS_EX_TOOLWINDOW) != 0 && (ex & WS_EX_APPWINDOW) == 0) {
+        return false;
+    }
+    long w = 0;
+    long h = 0;
+    if (IsIconic(hwnd)) {
+        WINDOWPLACEMENT wp{};
+        wp.length = sizeof(wp);
+        if (!GetWindowPlacement(hwnd, &wp)) return false;
+        w = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
+        h = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+    } else {
+        RECT rc{};
+        if (!GetWindowRect(hwnd, &rc)) return false;
+        w = rc.right - rc.left;
+        h = rc.bottom - rc.top;
+    }
+    return w > 0 && h > 0 && w * h >= kMainWindowMinArea;
 }
 
 void LaunchItem(AppState& s, size_t idx) {
@@ -2677,7 +2691,10 @@ void TrayIconTriggerAsync(AppState& s, const std::wstring& nameHint,
     }).detach();
 }
 
-// 仅托盘驻留时的点击：尽力唤出主窗口，找不到再启动
+// Dock 已收集窗口里没有可打开的“主窗口形态”时（全隐藏/纯托盘/仅剩辅助小窗），
+// 在这里通过进程线程枚举补找隐藏窗口并打开全部；仍区分托盘图标驻留：
+// 纯托盘场景（微信等 Qt 自绘主窗完全隐藏）不能外部 ShowWindow —— 那会得到
+// “看得见点不动”的影子窗口，必须继续走托盘图标触发，由应用自己恢复。
 void WakeTrayOnlyApp(AppState& s, size_t idx) {
     DockItem& item = s.items[idx];
 
@@ -2685,7 +2702,7 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
     std::vector<DWORD> pids = FindPidsByKey(item.key);
 
     // 收集该应用全部“有界面”窗口。钉钉等进程动辄几十个隐藏窗口
-    // （消息窗/阴影窗/工具窗），必须按“像不像主窗口”打分挑选，
+    // （消息窗/阴影窗/工具窗），必须按“像不像主窗口”过滤，
     // 不能取枚举到的第一个 —— 那往往是 0×0 的消息窗，唤起了也没效果。
     struct Candidate {
         HWND hwnd = nullptr;
@@ -2744,112 +2761,136 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
         CloseHandle(tsnap);
     }
 
-    // 打分挑选主窗口。不能“可见优先”：微信等应用有可见的托盘消息窗
-    // （Qt51514WxTrayIconMessageWindowClass 1280×781 —— 已按类名排除，
-    // 否则它比真正的主窗口还大、分数更高，唤醒的就是这个隐形窗）。
-    // 评分权重：
-    //   非工具窗 1000  +  有标题 100  +  可见 10  +  面积分 min(面积/1万, 100)
-    // 主窗口特征 = 大 + 有标题 + 非工具窗，面积与标题主导，可见性只是小分。
-    auto ScoreOf = [](const Candidate& c) -> long {
-        long sc = 0;
-        if (!c.tool) sc += 1000;
-        if (c.hasTitle) sc += 100;
-        if (c.visible) sc += 10;
-        sc += std::min(c.area / 10000L, 100L);
-        return sc;
+    auto IsQtClass = [](HWND hwnd) -> bool {
+        wchar_t cls[64] = {};
+        GetClassNameW(hwnd, cls, 63);
+        return wcsstr(cls, L"Qt5") != nullptr ||
+               wcsstr(cls, L"Qt6") != nullptr;
     };
-    HWND best = nullptr;
-    long bestScore = -1;
+
+    // 先筛出“主窗口形态”的窗口：这就是要打开的全部窗口集合。
+    std::vector<HWND> mains;
     for (const Candidate& c : cands) {
-        const long sc = ScoreOf(c);
-        if (sc > bestScore) {
-            bestScore = sc;
-            best = c.hwnd;
-        }
+        if (c.tool) continue;
+        if (IsMainShapeWindow(c.hwnd)) mains.push_back(c.hwnd);
     }
 
-    if (best) {
-        wchar_t bestCls[64] = {};
-        GetClassNameW(best, bestCls, 63);
-        const bool qtClass = wcsstr(bestCls, L"Qt5") != nullptr ||
-                             wcsstr(bestCls, L"Qt6") != nullptr;
-
-        if (IsIconic(best)) {
-            // 任务栏语义：最小化窗口在任务栏有条目 —— 走标准恢复（等同点击
-            // 任务栏按钮：WM_SYSCOMMAND/SC_RESTORE 进入应用自身消息队列，
-            // 由应用自己处理恢复，Qt 自绘窗口同样安全），即时、无任务栏闪现。
-            DWORD_PTR dummy = 0;
-            SendMessageTimeoutW(best, WM_SYSCOMMAND, SC_RESTORE, 0,
-                                SMTO_ABORTIFHUNG | SMTO_BLOCK, 500,
-                                &dummy);
-            BringWindowToTop(best);
-            ForceForegroundWindow(best);
-            Logf(L"恢复任务栏窗口：%ls", item.displayName.c_str());
-            return;
+    // 没有任何主窗口形态（纯后台/消息窗/极小辅助窗）：回退旧版评分唤起，
+    // 避免遗漏个别特殊情况。
+    if (mains.empty()) {
+        auto ScoreOf = [](const Candidate& c) -> long {
+            long sc = 0;
+            if (!c.tool) sc += 1000;
+            if (c.hasTitle) sc += 100;
+            if (c.visible) sc += 10;
+            sc += std::min(c.area / 10000L, 100L);
+            return sc;
+        };
+        HWND best = nullptr;
+        long bestScore = -1;
+        for (const Candidate& c : cands) {
+            const long sc = ScoreOf(c);
+            if (sc > bestScore) {
+                bestScore = sc;
+                best = c.hwnd;
+            }
         }
-
-        if (!IsWindowVisible(best)) {
-            // 完全隐藏 → 无任务栏条目（托盘驻留），Dock 不关心是否托盘应用，
-            // 只按窗口状态分派：
-            //  Qt 自绘窗口（微信等）外部 ShowWindow 会得到“看得见点不动”的
-            //  影子窗口 → 异步托盘图标触发（UI 不冻结）；
-            //  其他应用 → 直接显示（毫秒级）。
-            if (qtClass && item.trayMarked && !pids.empty() &&
-                !g_skipTrayTriggerOnce) {
-                TrayIconTriggerAsync(s, item.displayName, pids, idx);
+        if (best) {
+            const bool qt = IsQtClass(best);
+            if (IsIconic(best)) {
+                DWORD_PTR dummy = 0;
+                SendMessageTimeoutW(best, WM_SYSCOMMAND, SC_RESTORE, 0,
+                                    SMTO_ABORTIFHUNG | SMTO_BLOCK, 500,
+                                    &dummy);
+                BringWindowToTop(best);
+                ForceForegroundWindow(best);
+                Logf(L"恢复任务栏窗口：%ls", item.displayName.c_str());
                 return;
             }
-            ShowWindow(best, SW_SHOW);
-            BringWindowToTop(best);
-            SetForegroundWindow(best);
-            ForceForegroundWindow(best);
-            Logf(L"唤起托盘应用主窗口：%ls", item.displayName.c_str());
+            if (!IsWindowVisible(best)) {
+                if (qt && item.trayMarked && !pids.empty() &&
+                    !g_skipTrayTriggerOnce) {
+                    TrayIconTriggerAsync(s, item.displayName, pids, idx);
+                    return;
+                }
+                ShowWindow(best, SW_SHOW);
+                BringWindowToTop(best);
+                SetForegroundWindow(best);
+                ForceForegroundWindow(best);
+                Logf(L"唤起托盘应用主窗口：%ls", item.displayName.c_str());
+                return;
+            }
+        }
+        if (!pids.empty()) {
+            Logf(L"托盘应用无可唤起窗口（纯后台驻留）：%ls",
+                 item.displayName.c_str());
             return;
         }
-        // 候选窗口都已可见：唤起无意义 —— 应用主界面不在这里
-    }
-
-    // 到这里说明：非托盘项没有可唤起的隐藏窗口；或托盘项已尝试过
-    // 托盘图标触发但失败。找不到任何可显示的窗口：进程已在运行
-    // （纯后台/消息窗进程）时重新启动多半无效，只记录；未运行则正常启动。
-    if (!pids.empty()) {
-        Logf(L"托盘应用无可唤起窗口（纯后台驻留）：%ls",
-             item.displayName.c_str());
+        LaunchItem(s, idx);
         return;
     }
-    LaunchItem(s, idx);  // 找不到可唤起的窗口：按启动处理
+
+    // 托盘图标驻留 + Qt 隐藏主窗：必须走应用自己的托盘图标处理器。
+    // 外部 ShowWindow 对这类窗口会得到影子窗口（无法交互），
+    // 由 TrayIconTriggerAsync 临时显示任务栏并触发 UIA Invoke。
+    bool hasHiddenQtMain = false;
+    for (HWND w : mains) {
+        if (!IsWindowVisible(w) && !IsIconic(w) && IsQtClass(w)) {
+            hasHiddenQtMain = true;
+            break;
+        }
+    }
+    if (item.trayMarked && hasHiddenQtMain && !pids.empty() &&
+        !g_skipTrayTriggerOnce) {
+        TrayIconTriggerAsync(s, item.displayName, pids, idx);
+        return;
+    }
+
+    // 打开全部主窗口：最小化的走 SC_RESTORE（任务栏语义，Qt 也安全），
+    // 完全隐藏的非 Qt 窗口直接显示。
+    int restored = 0;
+    for (HWND w : mains) {
+        if (!IsWindow(w) || IsCloaked(w)) continue;
+        if (IsIconic(w)) {
+            DWORD_PTR dummy = 0;
+            SendMessageTimeoutW(w, WM_SYSCOMMAND, SC_RESTORE, 0,
+                                SMTO_ABORTIFHUNG | SMTO_BLOCK, 500,
+                                &dummy);
+            ++restored;
+        } else if (!IsWindowVisible(w)) {
+            ShowWindow(w, SW_SHOW);
+            ++restored;
+        }
+        BringWindowToTop(w);
+    }
+
+    // 选一个主窗口抢前台（不抢的话用户可能以为没反应）；
+    // 其余窗口已经在 Z 序顶部，用户可见。
+    HWND target = PickMainWindow(mains);
+    if (!target) {
+        for (HWND w : mains) {
+            if (IsWindow(w) && IsWindowVisible(w) && !IsIconic(w)) {
+                target = w;
+                break;
+            }
+        }
+    }
+    if (!target && !mains.empty()) target = mains.front();
+    if (target) {
+        ForceForegroundWindow(target);
+        Logf(L"打开全部窗口：%ls（共 %zu 个，恢复 %d 个）",
+             item.displayName.c_str(), mains.size(), restored);
+    } else {
+        Logf(L"打开全部窗口：%ls（共 %zu 个，无法聚焦）",
+             item.displayName.c_str(), mains.size());
+    }
 }
 
 void ToggleFocusOrLaunch(AppState& s, size_t idx) {
     if (idx >= s.items.size()) return;
     DockItem& item = s.items[idx];
 
-    // 没有“主窗口形态”的可见窗口（全隐藏/最小化/已销毁/仅剩小窗）时按
-    // 托盘驻留处理，走 WakeTrayOnlyApp 的评分选窗。不能对隐藏或过小的
-    // 窗口做“聚焦”——微信等应用最小化/隐藏后 dock 收集到的窗口往往不是
-    // 正常可交互的主窗口（如 295×387 的功能小窗），ShowWindow 强唤起的
-    // Qt 无边框窗口会出现无法关闭/交互的问题，必须走托盘图标触发。
-    bool anyVisible = false;
-    for (HWND w : item.windows) {
-        if (!IsWindow(w) || !IsWindowVisible(w) || IsIconic(w) ||
-            IsCloaked(w)) {
-            continue;  // 最小化（IsIconic）也算不可交互
-        }
-        RECT rc{};
-        if (GetWindowRect(w, &rc)) {
-            const long area = static_cast<long>(rc.right - rc.left) *
-                              static_cast<long>(rc.bottom - rc.top);
-            if (area >= kMainWindowMinArea) {  // 主窗口下限
-                anyVisible = true;
-                break;
-            }
-        }
-    }
-    if (item.windows.empty() || !anyVisible) {
-        WakeTrayOnlyApp(s, idx);
-        return;
-    }
-
+    // 应用已在前台：点击 = 最小化该应用全部可见窗口（保留原有切换语义）。
     if (AppOwnsForeground(item)) {
         for (HWND w : item.windows) {
             if (IsWindow(w) && IsWindowVisible(w) && !IsIconic(w)) {
@@ -2857,24 +2898,75 @@ void ToggleFocusOrLaunch(AppState& s, size_t idx) {
             }
         }
         Logf(L"最小化：%ls", item.displayName.c_str());
-    } else {
-        // 多窗口应用（网易云等）：主窗口优先，避免聚焦到歌词/迷你/弹窗
-        HWND target = PickMainWindow(item.windows);
+        s.needsRedraw = true;
+        return;
+    }
+
+    // 优先使用 Dock 已收集的顶层窗口（item.windows 已包含 UWP 的
+    // ApplicationFrameWindow 等真实应用窗口，不能只靠按 exe 枚举线程窗口）。
+    // 这里一次性恢复全部“主窗口形态”的窗口，而不是只唤起一个。
+    std::vector<HWND> mains;
+    for (HWND w : item.windows) {
+        if (IsWindow(w) && IsMainShapeWindow(w)) mains.push_back(w);
+    }
+
+    // 如果收集到的是隐藏的 Qt 主窗（通常是刚隐藏、Dock 还没刷新的托盘应用），
+    // 不能外部 ShowWindow——会得到“看得见点不动”的影子窗口。交给
+    // WakeTrayOnlyApp 走托盘图标触发。
+    if (item.trayMarked) {
+        for (HWND w : mains) {
+            if (!IsWindowVisible(w) && !IsIconic(w)) {
+                wchar_t cls[64] = {};
+                GetClassNameW(w, cls, 63);
+                if (wcsstr(cls, L"Qt5") != nullptr ||
+                    wcsstr(cls, L"Qt6") != nullptr) {
+                    WakeTrayOnlyApp(s, idx);
+                    s.needsRedraw = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    if (!mains.empty()) {
+        int restored = 0;
+        for (HWND w : mains) {
+            if (!IsWindow(w) || IsCloaked(w)) continue;
+            if (IsIconic(w)) {
+                DWORD_PTR dummy = 0;
+                SendMessageTimeoutW(w, WM_SYSCOMMAND, SC_RESTORE, 0,
+                                    SMTO_ABORTIFHUNG | SMTO_BLOCK, 500,
+                                    &dummy);
+                ++restored;
+            } else if (!IsWindowVisible(w)) {
+                ShowWindow(w, SW_SHOW);
+                ++restored;
+            }
+            BringWindowToTop(w);
+        }
+
+        HWND target = PickMainWindow(mains);
         if (!target) {
-            // 兜底：无主窗口形态时取任一可见窗口（贴近旧行为）
-            for (HWND w : item.windows) {
-                if (IsWindow(w) && IsWindowVisible(w) && !IsIconic(w) &&
-                    !IsCloaked(w)) {
+            for (HWND w : mains) {
+                if (IsWindow(w) && IsWindowVisible(w) && !IsIconic(w)) {
                     target = w;
                     break;
                 }
             }
         }
+        if (!target && !mains.empty()) target = mains.front();
         if (target) {
             ForceForegroundWindow(target);
-            Logf(L"聚焦：%ls", item.displayName.c_str());
         }
+        Logf(L"打开全部窗口：%ls（共 %zu 个，恢复 %d 个）",
+             item.displayName.c_str(), mains.size(), restored);
+        s.needsRedraw = true;
+        return;
     }
+
+    // item.windows 里没有可打开的主窗口形态（全隐藏/纯托盘/仅剩辅助小窗）：
+    // 交给 WakeTrayOnlyApp 做隐藏窗口评分/托盘图标触发/启动。
+    WakeTrayOnlyApp(s, idx);
     s.needsRedraw = true;
 }
 
@@ -2987,7 +3079,7 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
         const int actId =
             PushMenuEntry(s, ItemAction::ToggleFocus, idx, nullptr);
         AppendMenuW(menu, MF_STRING, actId,
-                    focused ? L"最小化所有窗口" : L"聚焦此应用");
+                    focused ? L"最小化所有窗口" : L"打开全部窗口");
         if (item.windows.size() > 1) {
             HMENU wins = CreatePopupMenu();
             for (HWND w : item.windows) {
