@@ -143,6 +143,28 @@ const wchar_t* const kInfraBasenames[] = {
     L"widgetservice.exe", L"msiexec.exe", L"applicationframehost.exe",
 };
 
+// ---- “UI 宿主辅助进程”映射 ----
+// 部分应用的可见主窗口由辅助进程承载（现代 Steam 客户端主窗口由
+// steamwebhelper.exe(CEF) 承载、steam.exe 只做托盘/后台驻留）。Windows
+// 任务栏按 AppUserModelID 把两者归并为一个按钮；Dock 若按进程 exe 路径
+// 分组会把同一应用拆成“Steam 托盘”+“Steam Client WebHelper 窗口”两条，
+// 且托盘那条无窗口可唤起。此处把辅助进程的窗口沿父进程链归并到宿主
+// 应用 exe（helperBase → appBase，均小写）：窗口分组与关闭/唤起统一生效。
+struct UiHostMapping {
+    const wchar_t* helperBase;  // 承载 UI 的辅助进程基名（小写）
+    const wchar_t* appBase;     // 宿主应用进程基名（小写）
+};
+constexpr UiHostMapping kUiHostMappings[] = {
+    {L"steamwebhelper.exe", L"steam.exe"},
+};
+
+const UiHostMapping* FindUiHostMapping(const std::wstring& baseLower) {
+    for (const auto& m : kUiHostMappings) {
+        if (baseLower == m.helperBase) return &m;
+    }
+    return nullptr;
+}
+
 enum class ItemAction {
     None,
     ToggleFocus,
@@ -1035,7 +1057,49 @@ struct WindowGroupContext {
     // 单轮次内 pid→镜像路径缓存：多窗口应用（网易云等 5+ 顶层窗）
     // 同一 pid 反复查询会重复 OpenProcess，缓存后按进程只查一次
     std::unordered_map<DWORD, std::wstring> pathCache;
+    // 单轮次内 pid→父pid 快照缓存：UI 宿主辅助进程归并（见 UiHostExeForPid）
+    std::unordered_map<DWORD, DWORD> parentCache;
+    // 单轮次内 pid→宿主应用路径：辅助进程多窗口时只解析一次父链
+    std::unordered_map<DWORD, std::wstring> hostCache;
 };
+
+// 为“UI 宿主辅助进程”（如 steamwebhelper.exe）解析宿主应用 exe 路径
+// （归一化小写）：沿父进程链（≤8 层）找 basename == appBase 的祖先进程。
+// parentCache：pid→父pid 快照缓存（一次 EnumWindows 仅建一次，多窗口共享）。
+// 解析失败返回空串 —— 调用方回退为原进程身份，行为无回归。
+std::wstring UiHostExeForPid(WindowGroupContext* ctx, DWORD helperPid,
+                             const UiHostMapping& m) {
+    auto cached = ctx->hostCache.find(helperPid);
+    if (cached != ctx->hostCache.end()) return cached->second;
+    if (ctx->parentCache.empty()) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) return L"";
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                ctx->parentCache[pe.th32ProcessID] = pe.th32ParentProcessID;
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+    const std::wstring appBase(m.appBase);
+    DWORD cur = helperPid;
+    std::wstring host;
+    for (int depth = 0; depth < 8; ++depth) {
+        auto it = ctx->parentCache.find(cur);
+        if (it == ctx->parentCache.end() || it->second == 0) break;
+        cur = it->second;
+        const std::wstring img = ImagePathOfPid(cur);
+        if (img.empty()) continue;
+        if (ToLower(PathBasename(img)) == appBase) {
+            host = img;
+            break;
+        }
+    }
+    ctx->hostCache[helperPid] = host;  // 空值也缓存：同轮不再重复解析
+    return host;
+}
 
 BOOL CALLBACK EnumAppWindowProc(HWND hwnd, LPARAM lParam) {
     auto* ctx = reinterpret_cast<WindowGroupContext*>(lParam);
@@ -1072,6 +1136,26 @@ BOOL CALLBACK EnumAppWindowProc(HWND hwnd, LPARAM lParam) {
         if (realPid != 0) {
             const std::wstring real = ImagePathOfPid(realPid);
             if (!real.empty()) identity = real;
+        }
+    }
+
+    // “UI 宿主辅助进程”归并：Steam 等应用的可见主窗口由辅助进程
+    // （steamwebhelper.exe / CEF）承载，宿主进程（steam.exe）只做托盘
+    // 驻留。按 exe 分组会出现“Steam【托盘】+ Steam WebHelper【窗口】”
+    // 两条且托盘条无窗口可唤起；沿父进程链归并到宿主应用 exe，
+    // 让该窗口进入宿主应用条目（与任务栏按 AppUserModelID 归并一致）。
+    const UiHostMapping* hostMap =
+        FindUiHostMapping(ToLower(PathBasename(identity)));
+    if (hostMap) {
+        const std::wstring host = UiHostExeForPid(ctx, pid, *hostMap);
+        if (!host.empty()) {
+            // 只记录一次（避免每轮询刷屏；与“固定项并入运行组”同模式）
+            static std::unordered_set<std::wstring> mergedLogged;
+            if (mergedLogged.insert(identity).second) {
+                Logf(L"窗口归并到宿主应用：%ls → %ls",
+                     PathBasename(identity).c_str(), host.c_str());
+            }
+            identity = host;
         }
     }
     ctx->ordered.emplace_back(identity, hwnd);
@@ -2516,29 +2600,66 @@ void LaunchItem(AppState& s, size_t idx) {
     SetFrameCadence(s, true);  // 空闲已停帧：启动弹跳动画需要帧驱动
 }
 
-// 按 exe 镜像路径（归一化小写 key）匹配该应用的全部存活 pid
+// 按 exe 镜像路径（归一化小写 key）匹配该应用的全部存活 pid。
+// key 若为“UI 宿主应用”（如 steam.exe），其辅助进程（steamwebhelper.exe）
+// 的 pid 一并返回 —— 关闭/终止必须覆盖承载真实主窗口的辅助进程，
+// 否则杀掉宿主后辅助进程残留、窗口仍挂在屏幕上。
 std::vector<DWORD> FindPidsByKey(const std::wstring& key) {
     std::vector<DWORD> pids;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return pids;
+
+    // 一次快照同时收集 pid→镜像路径 与 pid→父pid（宿主归并沿链用）
+    struct ProcInfo {
+        std::wstring img;
+        DWORD parent = 0;
+    };
+    std::unordered_map<DWORD, ProcInfo> procs;
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
     if (Process32FirstW(snap, &pe)) {
         do {
+            ProcInfo info;
+            info.parent = pe.th32ParentProcessID;
             HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
                                       FALSE, pe.th32ProcessID);
-            if (!proc) continue;
-            wchar_t img[MAX_PATH] = {};
-            DWORD sz = MAX_PATH;
-            const BOOL ok =
-                QueryFullProcessImageNameW(proc, 0, img, &sz) && sz > 0;
-            CloseHandle(proc);
-            if (ok && NormalizePath(img) == key) {
-                pids.push_back(pe.th32ProcessID);
+            if (proc) {
+                wchar_t img[MAX_PATH] = {};
+                DWORD sz = MAX_PATH;
+                if (QueryFullProcessImageNameW(proc, 0, img, &sz) && sz > 0) {
+                    info.img = NormalizePath(img);
+                }
+                CloseHandle(proc);
             }
+            if (!info.img.empty()) procs[pe.th32ProcessID] = std::move(info);
         } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
+
+    const std::wstring keyBase = ToLower(PathBasename(key));
+    for (const auto& kv : procs) {
+        const DWORD pid = kv.first;
+        const ProcInfo& info = kv.second;
+        if (info.img == key) {
+            pids.push_back(pid);
+            continue;
+        }
+        // 辅助进程：基名命中映射 helper 且父链可达宿主 key 才算同应用
+        const UiHostMapping* hostMap =
+            FindUiHostMapping(ToLower(PathBasename(info.img)));
+        if (!hostMap || keyBase != hostMap->appBase) continue;
+        DWORD cur = pid;
+        for (int depth = 0; depth < 8; ++depth) {
+            auto it = procs.find(cur);
+            if (it == procs.end() || it->second.parent == 0) break;
+            cur = it->second.parent;
+            auto pit = procs.find(cur);
+            if (pit != procs.end() && pit->second.img == key) {
+                pids.push_back(pid);
+                break;
+            }
+        }
+    }
     return pids;
 }
 
