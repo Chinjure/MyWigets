@@ -52,6 +52,7 @@
 #include <cwctype>
 #include <share.h>   // _SH_DENYNO：日志允许外部同时读取
 #include <string>
+#include <thread>    // 关闭应用的后台等待线程（UI 不阻塞）
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -99,13 +100,22 @@ constexpr float kMagWidthBudget = 170.0f;
 
 // ---- 节奏 ----
 constexpr UINT_PTR kFrameTimerId = 1;
-constexpr UINT kFrameIntervalMs = 15;          // 动画帧周期
-constexpr int kPollEveryFrames = 46;           // ≈ 0.7s 全量刷新一次状态
+constexpr UINT kFrameIntervalMs = 15;          // 动画帧周期（悬停/动画期间）
+constexpr UINT_PTR kRefreshTimerId = 2;        // 事件合并一次性定时器
+constexpr UINT_PTR kSafetyTimerId = 3;         // 事件失效保底（1 次/分钟）
+constexpr ULONGLONG kRefreshMinGapMs = 1000;   // 刷新最小间隔（合并窗口事件风暴）
+constexpr ULONGLONG kSafetyPollMs = 60000;     // 事件失效保底轮询（功耗≈0）
+constexpr ULONGLONG kRunningPathsCacheMs = 3000;  // 运行路径/托盘注册表缓存（进程级枚举较贵）
 constexpr ULONGLONG kTooltipDelayMs = 480;     // 悬停出提示延迟
 constexpr ULONGLONG kLaunchBounceMs = 3600;    // 启动弹跳超时
-constexpr ULONGLONG kTrayTriggerWindowMs = 3500;  // 托盘图标触发：任务栏临时可见窗口
+constexpr ULONGLONG kTrayTriggerWindowMs = 2200;  // 托盘图标触发：任务栏临时可见窗口
 constexpr int kMenuBaseId = 4000;
 constexpr int kMenuExit = 1001;
+
+// 事件驱动消息（WinEvent 回调/注册表监听线程 → 主窗口）
+constexpr UINT kMsgRefresh = WM_APP + 1;   // 窗口集合/托盘状态可能变化，合并刷新
+constexpr UINT kMsgHeal = WM_APP + 2;      // 套件组件被最小化，立即恢复
+constexpr UINT kMsgTriggerDone = WM_APP + 3;  // 托盘触发完成（worker → 主窗口收尾）
 
 // 自家套件组件（顶栏/挂件等同样注册了托盘图标）永不进入 Dock。
 // 注意 DesktopLauncher（启动台）不在此列：它是用户可固定的正常应用
@@ -204,6 +214,12 @@ struct AppState {
 
     std::vector<PendingLaunch> pendingLaunches;
     int frameCounter = 0;
+    int frameIntervalMs = kFrameIntervalMs;            // 当前定时器周期（0=停止）
+    ULONGLONG lastPollTick = 0;                        // 上次全量轮询时刻
+    bool refreshArmed = false;                         // 事件合并定时器已挂起
+    UINT taskbarCreatedMsg = 0;                        // TaskbarCreated 广播（explorer 重启）
+    std::unordered_set<std::wstring> runningExeCache;  // 进程路径集合缓存（省全进程枚举）
+    ULONGLONG runningExeCacheAt = 0;
     bool needsRedraw = true;
     Font* uiFont = nullptr;
 
@@ -287,9 +303,11 @@ std::wstring ExeDisplayName(const std::wstring& fullPathLower) {
 // ============================== 日志 ==============================
 
 FILE* g_logFile = nullptr;
+SRWLOCK g_logLock = SRWLOCK_INIT;  // 后台关闭线程与主线程可能同时写日志
 
 void Logf(const wchar_t* fmt, ...) {
     if (!g_logFile) return;
+    AcquireSRWLockExclusive(&g_logLock);
     SYSTEMTIME st{};
     GetLocalTime(&st);
     fwprintf(g_logFile, L"[%02u:%02u:%02u.%03u] ",
@@ -300,6 +318,7 @@ void Logf(const wchar_t* fmt, ...) {
     va_end(args);
     fputwc(L'\n', g_logFile);
     fflush(g_logFile);
+    ReleaseSRWLockExclusive(&g_logLock);
 }
 
 void LogInit() {
@@ -993,6 +1012,9 @@ DWORD RealIdentityPidForFrame(HWND frame) {
 struct WindowGroupContext {
     DWORD selfPid = 0;
     std::vector<std::pair<std::wstring, HWND>> ordered;  // Z 序
+    // 单轮次内 pid→镜像路径缓存：多窗口应用（网易云等 5+ 顶层窗）
+    // 同一 pid 反复查询会重复 OpenProcess，缓存后按进程只查一次
+    std::unordered_map<DWORD, std::wstring> pathCache;
 };
 
 BOOL CALLBACK EnumAppWindowProc(HWND hwnd, LPARAM lParam) {
@@ -1016,7 +1038,14 @@ BOOL CALLBACK EnumAppWindowProc(HWND hwnd, LPARAM lParam) {
     // 主窗口：正常时隐藏，但被错误唤起后会带真窗口尺寸，绝不能算“有窗口”
     if (wcsstr(cls, L"TrayIconMessage") != nullptr) return TRUE;
 
-    std::wstring identity = ImagePathOfPid(pid);
+    std::wstring identity;
+    auto it = ctx->pathCache.find(pid);
+    if (it != ctx->pathCache.end()) {
+        identity = it->second;
+    } else {
+        identity = ImagePathOfPid(pid);
+        ctx->pathCache[pid] = identity;
+    }
     if (identity.empty()) return TRUE;
     if (wcscmp(cls, L"ApplicationFrameWindow") == 0) {
         const DWORD realPid = RealIdentityPidForFrame(hwnd);
@@ -1181,23 +1210,27 @@ bool g_showDesktopActive = false;          // 显示桌面状态（true=再点�
 // 类名与各组件源码一致；MyWigetsTrayWindow 通常隐藏，不影响判断
 std::vector<HWND> g_suiteWindows;
 
-void RefreshSuiteWindowCache() {
-    g_suiteWindows.clear();
+// 是否为套件组件窗口（类名判定：显式归属，防御同名窗口）
+bool IsSuiteWindowClass(HWND hwnd) {
+    if (!hwnd) return false;
+    wchar_t cls[64] = {};
+    if (GetClassNameW(hwnd, cls, 63) <= 0) return false;
     static const wchar_t* kSuiteCls[] = {
         L"DesktopTopBarWindow", L"DesktopAnalogClockWindow",
         L"DesktopCalendarWindow", L"DesktopLauncherWindow",
         L"MyWigetsTrayWindow",
     };
+    for (const wchar_t* c : kSuiteCls) {
+        if (wcscmp(cls, c) == 0) return true;
+    }
+    return false;
+}
+
+void RefreshSuiteWindowCache() {
+    g_suiteWindows.clear();
     EnumWindows(
         [](HWND hwnd, LPARAM) -> BOOL {
-            wchar_t cls[64] = {};
-            GetClassNameW(hwnd, cls, 63);
-            for (const wchar_t* c : kSuiteCls) {
-                if (wcscmp(cls, c) == 0) {
-                    g_suiteWindows.push_back(hwnd);
-                    break;
-                }
-            }
+            if (IsSuiteWindowClass(hwnd)) g_suiteWindows.push_back(hwnd);
             return TRUE;
         },
         0);
@@ -1311,6 +1344,84 @@ void UninstallShowDesktopHook() {
         UnhookWindowsHookEx(g_showDesktopHook);
         g_showDesktopHook = nullptr;
     }
+}
+
+// ============================== 事件驱动（替代轮询）==============================
+// 原实现的“全量刷新”由定时器每 1.2s 轮询触发（EnumWindows + 全进程枚举），
+// 空闲时也持续唤醒。改为 Windows 原生事件机制，空闲零唤醒：
+//   1. 窗口集合变化 → SetWinEventHook（CREATE/DESTROY/SHOW/HIDE）→ 合并刷新；
+//   2. Win+D 把组件最小化 → EVENT_SYSTEM_MINIMIZESTART → 立即恢复（自愈）；
+//   3. explorer 重启重建任务栏 → TaskbarCreated 广播 → 立即重新隐藏；
+//   4. 托盘注册表变化 → RegNotifyChangeKeyValue 阻塞等待（专用线程），
+//      变化即刷新，托盘条目不依赖轮询。
+// 另保留 1 次/分钟的保底刷新（防极端情况下事件丢失），功耗可忽略。
+
+std::vector<HWINEVENTHOOK> g_winEventHooks;
+
+void CALLBACK DockWinEventProc(HWINEVENTHOOK /*hook*/, DWORD event, HWND hwnd,
+                               LONG idObject, LONG /*idChild*/,
+                               DWORD /*idThread*/, DWORD /*time*/) {
+    if (!g_state.hwnd) return;
+    if (event == EVENT_SYSTEM_MINIMIZESTART && idObject == OBJID_WINDOW) {
+        // Win+D 把套件组件最小化：立即恢复（事件级延迟 <10ms，无闪烁）
+        if (IsSuiteWindowClass(hwnd)) {
+            PostMessageW(g_state.hwnd, kMsgHeal, 0, 0);
+        }
+        return;
+    }
+    if (idObject != OBJID_WINDOW) return;  // 只关心窗口级事件
+    PostMessageW(g_state.hwnd, kMsgRefresh, 0, 0);
+}
+
+void InstallDockWinEventHook() {
+    // 创建/销毁/显示/隐藏（0x8000-0x8003 连续区间）：窗口集合变化 → 刷新条目
+    HWINEVENTHOOK h1 = SetWinEventHook(
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, GetModuleHandleW(nullptr),
+        DockWinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+    // 最小化开始/结束（0x0016-0x0017 连续区间）：组件自愈
+    HWINEVENTHOOK h2 = SetWinEventHook(
+        EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
+        GetModuleHandleW(nullptr), DockWinEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT);
+    if (h1) g_winEventHooks.push_back(h1);
+    if (h2) g_winEventHooks.push_back(h2);
+    if (g_winEventHooks.empty()) {
+        Logf(L"WinEvent 钩子安装失败（回退 60s 保底轮询）");
+    }
+}
+
+void UninstallDockWinEventHook() {
+    for (HWINEVENTHOOK h : g_winEventHooks) UnhookWinEvent(h);
+    g_winEventHooks.clear();
+}
+
+// 托盘注册表阻塞式监听：RegNotifyChangeKeyValue 阻塞等待变化，
+// 变化时通知主窗口刷新（托盘条目零轮询）
+void TrayRegistryWatchThread() {
+    for (;;) {
+        HKEY root = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kNotifyIconsKey, 0,
+                          KEY_NOTIFY | KEY_READ, &root) != ERROR_SUCCESS) {
+            Sleep(30000);  // 键不存在（旧系统）时低速重试
+            continue;
+        }
+        // REG_NOTIFY_CHANGE_LAST_WRITE(0x4) | REG_NOTIFY_CHANGE_SUBKEYS(0x1)
+        // （常量在部分 SDK 头配置下未导出，按 ABI 值使用）
+        const DWORD filter = 0x4 | 0x1;
+        // fAsynchronous=FALSE：本线程阻塞等待下一次托盘注册表变化
+        const LONG hr =
+            RegNotifyChangeKeyValue(root, TRUE, filter, nullptr, FALSE);
+        RegCloseKey(root);
+        if (hr != ERROR_SUCCESS) {
+            Sleep(30000);
+            continue;
+        }
+        PostMessageW(g_state.hwnd, kMsgRefresh, 0, 0);
+    }
+}
+
+void StartTrayRegistryWatch() {
+    std::thread([]() { TrayRegistryWatchThread(); }).detach();
 }
 
 // ============================== 刷新合并 ==============================
@@ -1444,7 +1555,14 @@ bool RefreshItems(AppState& s) {
     }
 
     // ---- 来源 3：托盘驻留第三方 —— 特别需求核心 ----
-    const auto runningNow = CollectRunningExePaths();
+    // 进程级全量枚举（每个进程 OpenProcess + 查询镜像路径）较耗电，
+    // “是否存活”容忍 3s 缓存延迟（应用启动/退出后托盘条目 ≤3s 校正）
+    const ULONGLONG nowForCache = GetTickCount64();
+    if (nowForCache - s.runningExeCacheAt > kRunningPathsCacheMs) {
+        s.runningExeCache = CollectRunningExePaths();
+        s.runningExeCacheAt = nowForCache;
+    }
+    const auto& runningNow = s.runningExeCache;
     for (const auto& raw : ReadRegisteredTrayRawPaths()) {
         const std::wstring expanded = ExpandKnownFolderPrefix(raw);
         const std::wstring key = NormalizePath(expanded);
@@ -2098,10 +2216,21 @@ int HitIndexAt(AppState& s, float x, float y) {
     return -1;
 }
 
+// 主窗口形态门槛：≥ 400×300（多窗口应用的辅助窗——网易云歌词/迷你/弹窗
+// 等——都不达标，不会被当成“应用本体”）
+constexpr long kMainWindowMinArea = 400L * 300L;
+
 bool AppOwnsForeground(const DockItem& item) {
     HWND fg = GetForegroundWindow();
     if (!fg) return false;
     if (IsCloaked(fg)) return false;
+    // 前台必须是“主窗口形态”：歌词/迷你/弹窗等辅助窗抢前台时不算聚焦态，
+    // 否则点 Dock 图标会误触发“最小化全部”而非“聚焦主窗口”
+    RECT rc{};
+    if (!GetWindowRect(fg, &rc)) return false;
+    const long area = static_cast<long>(rc.right - rc.left) *
+                      static_cast<long>(rc.bottom - rc.top);
+    if (area < kMainWindowMinArea) return false;
     for (HWND w : item.windows) {
         if (!IsWindow(w)) continue;
         if (fg == w) return true;
@@ -2113,6 +2242,32 @@ bool AppOwnsForeground(const DockItem& item) {
         if (PidOf(w) == fgPid) return true;
     }
     return false;
+}
+
+// 在多窗口集合中挑选“主窗口”：面积 + 有标题评分（主窗口最大且带标题），
+// 辅助窗（歌词/迷你/弹窗，面积通常 < 400×300）自然落选
+HWND PickMainWindow(const std::vector<HWND>& windows) {
+    HWND best = nullptr;
+    long bestScore = -1;
+    for (HWND w : windows) {
+        if (!IsWindow(w) || !IsWindowVisible(w) || IsIconic(w) ||
+            IsCloaked(w)) {
+            continue;
+        }
+        RECT rc{};
+        if (!GetWindowRect(w, &rc)) continue;
+        const long area = static_cast<long>(rc.right - rc.left) *
+                          static_cast<long>(rc.bottom - rc.top);
+        wchar_t title[128] = {};
+        GetWindowTextW(w, title, 127);
+        const long sc = (title[0] ? 100 : 0) +
+                        std::min(area / 10000L, 100L);
+        if (sc > bestScore) {
+            bestScore = sc;
+            best = w;
+        }
+    }
+    return best;
 }
 
 void LaunchItem(AppState& s, size_t idx) {
@@ -2159,7 +2314,10 @@ std::vector<DWORD> FindPidsByKey(const std::wstring& key) {
 }
 
 // 关闭应用：给其全部窗口发 WM_CLOSE 优雅退出，轮询约 1.5s
-// 仍存活则 TerminateProcess（与 MyWigets 关闭组件策略一致）
+// 仍存活则 TerminateProcess（与 MyWigets 关闭组件策略一致）。
+// 特殊：explorer.exe 是系统 shell（桌面/任务栏/托盘宿主）——“关闭应用”
+// 只能关闭其用户意义上的窗口（文件管理器 CabinetWClass），绝不终止进程，
+// 否则会把整个资源管理器杀掉（桌面/任务栏全部重建）。
 void CloseAppByKey(const std::wstring& key, const std::wstring& displayName) {
     std::vector<DWORD> pids = FindPidsByKey(key);
     if (pids.empty()) {
@@ -2167,47 +2325,78 @@ void CloseAppByKey(const std::wstring& key, const std::wstring& displayName) {
         return;
     }
 
-    // 1. 给全部线程的所有窗口发 WM_CLOSE（含隐藏/工具窗，尽力优雅）
+    const std::wstring baseLower = ToLower(PathBasename(key));
+    const bool isShellHost = baseLower == L"explorer.exe";  // 系统 shell 宿主
+    const bool isInfra = IsInfraBaseline(baseLower);        // 其余基础设施进程
+
+    // 1. 给进程的“主窗口形态”窗口发 WM_CLOSE（可见或隐藏但几何完整、
+    //    面积 ≥ 400×300 —— 多窗口应用的歌词/迷你/弹窗/0×0 消息窗不再被
+    //    轰炸；隐藏的大几何主窗仍优雅关闭）；shell 宿主只关文件管理器窗口
     for (DWORD pid : pids) {
         HANDLE tsnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (tsnap == INVALID_HANDLE_VALUE) break;
         THREADENTRY32 te{};
         te.dwSize = sizeof(te);
+        const LPARAM onlyFileExplorer = isShellHost ? 1 : 0;
         if (Thread32First(tsnap, &te)) {
             do {
                 if (te.th32OwnerProcessID != pid) continue;
                 EnumThreadWindows(
                     te.th32ThreadID,
-                    [](HWND hwnd, LPARAM) -> BOOL {
+                    [](HWND hwnd, LPARAM lp) -> BOOL {
+                        if (lp && !IsFileExplorerWindow(hwnd)) {
+                            return TRUE;  // 系统窗口不关（任务栏等）
+                        }
+                        if (IsCloaked(hwnd)) return TRUE;  // UWP 幽灵窗
+                        RECT rc{};
+                        if (!GetWindowRect(hwnd, &rc)) return TRUE;
+                        const long area =
+                            static_cast<long>(rc.right - rc.left) *
+                            static_cast<long>(rc.bottom - rc.top);
+                        if (area < kMainWindowMinArea) {
+                            return TRUE;  // 辅助窗（歌词/迷你/弹窗/消息窗）
+                        }
                         PostMessageW(hwnd, WM_CLOSE, 0, 0);
                         return TRUE;
                     },
-                    0);
+                    onlyFileExplorer);
             } while (Thread32Next(tsnap, &te));
         }
         CloseHandle(tsnap);
     }
     Logf(L"关闭 %ls（已发 WM_CLOSE，等待退出…）", displayName.c_str());
 
-    // 2. 轮询等待退出
-    for (int i = 0; i < 15; ++i) {
-        Sleep(100);
-        if (FindPidsByKey(key).empty()) {
-            Logf(L"关闭 %ls：已退出", displayName.c_str());
-            return;
-        }
+    if (isShellHost || isInfra) {
+        // 系统进程绝不等待退出、绝不强杀：窗口已发关闭（文件管理器会自行
+        // 关闭），进程（explorer）必须继续驻留
+        Logf(L"关闭 %ls：系统进程，不终止（仅关闭文件管理器窗口）",
+             displayName.c_str());
+        return;
     }
 
-    // 3. 超时强杀
-    pids = FindPidsByKey(key);
-    for (DWORD pid : pids) {
-        HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-        if (proc) {
-            TerminateProcess(proc, 1);
-            CloseHandle(proc);
-        }
-    }
-    Logf(L"关闭 %ls：超时已强制结束", displayName.c_str());
+    // 2+3. 后台轮询等待退出，超时强杀 —— 同步等待会让中键后的 Dock
+    //    冻结约 1.5s（窗口不重绘、不响应鼠标），改为后台线程，UI 立即恢复
+    std::thread(
+        [key, displayName]() {
+            // 2. 轮询等待退出（最多 1.5s）
+            for (int i = 0; i < 15; ++i) {
+                Sleep(100);
+                if (FindPidsByKey(key).empty()) {
+                    Logf(L"关闭 %ls：已退出", displayName.c_str());
+                    return;
+                }
+            }
+            // 3. 超时强杀
+            for (DWORD pid : FindPidsByKey(key)) {
+                HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+                if (proc) {
+                    TerminateProcess(proc, 1);
+                    CloseHandle(proc);
+                }
+            }
+            Logf(L"关闭 %ls：超时已强制结束", displayName.c_str());
+        })
+        .detach();
 }
 
 // ============ 托盘图标触发（Win11 XAML 托盘）============
@@ -2347,39 +2536,46 @@ bool UiTrayIconInvokeOnce(IUIAutomation* uia, const std::wstring& nameHint,
     return done;
 }
 
-// 托盘图标触发主流程：临时显示任务栏 → 重试 UIA 触发 → 立即收回任务栏。
-// 触发期间禁止周期性抢收（EnsureTaskbarHidden 见 taskbarShowUntil），
-// 结束后恢复“任务栏常隐”约定。返回 true = 已触发。
-bool TrayIconTrigger(AppState& s, const std::wstring& nameHint,
-                     const std::vector<DWORD>& pids) {
-    if (pids.empty()) return false;
+// 托盘图标触发（异步）：临时显示任务栏 → 后台线程重试 UIA 触发 →
+// 完成后通知主线程收回任务栏（kMsgTriggerDone）。
+// 原同步实现把“显示任务栏 → UIA 查找/重试 → 收回”整个流程卡在点击线程上
+// （最长 3.5s），期间 Dock 冻结、任务栏长时间闪现 —— “打开很慢”的主因。
+bool g_skipTrayTriggerOnce = false;  // 触发失败后的二次回退：直接评分强显
 
-    const ULONGLONG until = GetTickCount64() + kTrayTriggerWindowMs;
-    s.taskbarShowUntil = until;   // 抑制 EnsureTaskbarHidden 抢收
-    ShowTaskbar();                // 任务栏可见 + 工作区还原为任务栏占位值
+void TrayIconTriggerAsync(AppState& s, const std::wstring& nameHint,
+                          const std::vector<DWORD>& pids, size_t itemIdx) {
+    if (pids.empty()) return;
+    s.taskbarShowUntil = GetTickCount64() + kTrayTriggerWindowMs;
+    ShowTaskbar();  // 任务栏可见 + 工作区还原为任务栏占位值
 
-    bool ok = false;
-    IUIAutomation* uia = nullptr;
-    if (SUCCEEDED(CoCreateInstance(CLSID_CUIAutomation, nullptr,
-                                   CLSCTX_INPROC_SERVER,
-                                   IID_PPV_ARGS(&uia))) &&
-        uia) {
-        while (!ok && GetTickCount64() < until) {
-            ok = UiTrayIconInvokeOnce(uia, nameHint, pids);
-            if (!ok) {
-                // XAML 托盘树在任务栏显示后有一个装配延迟，重试直至超时
-                const ULONGLONG remain = until - GetTickCount64();
-                const ULONGLONG step = std::min<ULONGLONG>(remain, 300);
-                if (step == 0) break;
-                Sleep(static_cast<DWORD>(step));
+    std::thread([nameHint, pids, itemIdx]() {
+        bool ok = false;
+        IUIAutomation* uia = nullptr;
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
+            if (SUCCEEDED(CoCreateInstance(CLSID_CUIAutomation, nullptr,
+                                           CLSCTX_INPROC_SERVER,
+                                           IID_PPV_ARGS(&uia))) &&
+                uia) {
+                const ULONGLONG until =
+                    GetTickCount64() + kTrayTriggerWindowMs;
+                while (!ok && GetTickCount64() < until) {
+                    ok = UiTrayIconInvokeOnce(uia, nameHint, pids);
+                    if (!ok) {
+                        // XAML 托盘树在任务栏显示后有一个装配延迟，重试
+                        Sleep(250);
+                    }
+                }
+                uia->Release();
             }
+            if (SUCCEEDED(hr)) CoUninitialize();
         }
-        uia->Release();
-    }
-
-    s.taskbarShowUntil = 0;   // 恢复周期性保护
-    EnsureTaskbarHidden(s);   // 立即收回：隐藏任务栏 + 工作区扩回全屏
-    return ok;
+        Logf(ok ? L"托盘图标触发成功：%ls（等待应用自行恢复）"
+                : L"托盘图标触发失败：%ls",
+             nameHint.c_str());
+        PostMessageW(g_state.hwnd, kMsgTriggerDone, ok ? 1 : 0,
+                     static_cast<LPARAM>(itemIdx));
+    }).detach();
 }
 
 // 仅托盘驻留时的点击：尽力唤出主窗口，找不到再启动
@@ -2388,20 +2584,6 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
 
     // 找该应用的全部存活 pid（按 exe 镜像路径匹配 key）
     std::vector<DWORD> pids = FindPidsByKey(item.key);
-
-    // ---- 方案 A：托盘图标触发（微信等自绘 Qt 主窗唯一可靠恢复方式）----
-    // 临时显示任务栏（触发后立即收回）→ 等价于用户点击该应用的托盘图标，
-    // 由应用自己恢复主窗口。外部 ShowWindow 强显对这类窗口只会得到
-    // “看得见点不动”的影子窗口
-    if (item.trayMarked && !pids.empty()) {
-        if (TrayIconTrigger(s, item.displayName, pids)) {
-            Logf(L"托盘图标触发成功：%ls（等待应用自行恢复）",
-                 item.displayName.c_str());
-            return;
-        }
-        Logf(L"托盘图标触发不可用：%ls（回退窗口评分唤起）",
-             item.displayName.c_str());
-    }
 
     // 收集该应用全部“有界面”窗口。钉钉等进程动辄几十个隐藏窗口
     // （消息窗/阴影窗/工具窗），必须按“像不像主窗口”打分挑选，
@@ -2488,14 +2670,37 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
     }
 
     if (best) {
-        const bool needWake =
-            !IsWindowVisible(best) || IsIconic(best);
-        if (needWake) {
-            if (IsIconic(best)) {
-                ShowWindow(best, SW_RESTORE);
-            } else {
-                ShowWindow(best, SW_SHOW);
+        wchar_t bestCls[64] = {};
+        GetClassNameW(best, bestCls, 63);
+        const bool qtClass = wcsstr(bestCls, L"Qt5") != nullptr ||
+                             wcsstr(bestCls, L"Qt6") != nullptr;
+
+        if (IsIconic(best)) {
+            // 任务栏语义：最小化窗口在任务栏有条目 —— 走标准恢复（等同点击
+            // 任务栏按钮：WM_SYSCOMMAND/SC_RESTORE 进入应用自身消息队列，
+            // 由应用自己处理恢复，Qt 自绘窗口同样安全），即时、无任务栏闪现。
+            DWORD_PTR dummy = 0;
+            SendMessageTimeoutW(best, WM_SYSCOMMAND, SC_RESTORE, 0,
+                                SMTO_ABORTIFHUNG | SMTO_BLOCK, 500,
+                                &dummy);
+            BringWindowToTop(best);
+            ForceForegroundWindow(best);
+            Logf(L"恢复任务栏窗口：%ls", item.displayName.c_str());
+            return;
+        }
+
+        if (!IsWindowVisible(best)) {
+            // 完全隐藏 → 无任务栏条目（托盘驻留），Dock 不关心是否托盘应用，
+            // 只按窗口状态分派：
+            //  Qt 自绘窗口（微信等）外部 ShowWindow 会得到“看得见点不动”的
+            //  影子窗口 → 异步托盘图标触发（UI 不冻结）；
+            //  其他应用 → 直接显示（毫秒级）。
+            if (qtClass && item.trayMarked && !pids.empty() &&
+                !g_skipTrayTriggerOnce) {
+                TrayIconTriggerAsync(s, item.displayName, pids, idx);
+                return;
             }
+            ShowWindow(best, SW_SHOW);
             BringWindowToTop(best);
             SetForegroundWindow(best);
             ForceForegroundWindow(best);
@@ -2535,7 +2740,7 @@ void ToggleFocusOrLaunch(AppState& s, size_t idx) {
         if (GetWindowRect(w, &rc)) {
             const long area = static_cast<long>(rc.right - rc.left) *
                               static_cast<long>(rc.bottom - rc.top);
-            if (area >= 400L * 300L) {  // 主窗口下限
+            if (area >= kMainWindowMinArea) {  // 主窗口下限
                 anyVisible = true;
                 break;
             }
@@ -2554,18 +2759,14 @@ void ToggleFocusOrLaunch(AppState& s, size_t idx) {
         }
         Logf(L"最小化：%ls", item.displayName.c_str());
     } else {
-        HWND target = nullptr;
-        for (HWND w : item.windows) {
-            if (IsWindow(w) && IsWindowVisible(w) && !IsIconic(w) &&
-                !IsCloaked(w)) {
-                target = w;  // 取最后一个可见者（贴近用户最近使用）
-            }
-        }
+        // 多窗口应用（网易云等）：主窗口优先，避免聚焦到歌词/迷你/弹窗
+        HWND target = PickMainWindow(item.windows);
         if (!target) {
+            // 兜底：无主窗口形态时取任一可见窗口（贴近旧行为）
             for (HWND w : item.windows) {
-                if (IsWindow(w)) {
+                if (IsWindow(w) && IsWindowVisible(w) && !IsIconic(w) &&
+                    !IsCloaked(w)) {
                     target = w;
-                    if (IsIconic(w)) ShowWindow(w, SW_RESTORE);
                     break;
                 }
             }
@@ -2725,7 +2926,13 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
             break;
         case ItemAction::SwitchToWindow:
             if (e.window && IsWindow(e.window)) {
-                if (IsIconic(e.window)) ShowWindow(e.window, SW_RESTORE);
+                if (IsIconic(e.window)) {
+                    // 任务栏语义恢复（等同点击任务栏按钮）
+                    DWORD_PTR dummy = 0;
+                    SendMessageTimeoutW(e.window, WM_SYSCOMMAND, SC_RESTORE,
+                                        0, SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                                        500, &dummy);
+                }
                 ForceForegroundWindow(e.window);
             }
             break;
@@ -2776,15 +2983,33 @@ void ShowBlankContextMenu(AppState& s) {
 
 // ============================== 主循环一帧 ==============================
 
+// 自适应定时器节奏：动画/悬停/启动弹跳期间 15ms（保流畅），空闲停止定时器
+// （零唤醒；重新活动由 WM_MOUSEMOVE / WinEvent 触发）
+void SetFrameCadence(AppState& s, bool fast) {
+    const UINT want = fast ? kFrameIntervalMs : 0;  // 0 = 停止
+    if (s.frameIntervalMs == static_cast<int>(want)) return;
+    s.frameIntervalMs = static_cast<int>(want);
+    if (want == 0) {
+        KillTimer(s.hwnd, kFrameTimerId);
+    } else {
+        SetTimer(s.hwnd, kFrameTimerId, want, nullptr);
+    }
+}
+
+// 全量刷新（事件驱动回调 + 60s 保底）：条目/尺寸/任务栏/组件自愈
+void DoPoll(AppState& s) {
+    s.lastPollTick = GetTickCount64();
+    RefreshItems(s);
+    EnsureWindowSize(s);
+    EnsureTaskbarHidden(s);        // explorer 重启重建任务栏后再次隐藏
+    RefreshSuiteWindowCache();     // 组件可能重启/重建窗口，刷新自愈缓存
+    HealMinimizedSuiteWindows();   // 保底（正常由 WinEvent 即时触发）
+    if (s.needsRedraw) DrawAndPresent(s);  // 无帧定时器时也立即重绘
+}
+
 void FrameTick(AppState& s) {
     s.frameCounter++;
-    if (s.frameCounter % kPollEveryFrames == 0) {
-        RefreshItems(s);
-        EnsureWindowSize(s);
-        EnsureTaskbarHidden(s);  // explorer 重启重建任务栏后再次隐藏
-        RefreshSuiteWindowCache();  // 组件可能重启/重建窗口，刷新自愈缓存
-    }
-    HealMinimizedSuiteWindows();  // 每帧：Win+D 系统级最小化组件时立即恢复
+    HealMinimizedSuiteWindows();  // 保底（事件路径之外的兜底检查）
 
     const bool animating = UpdateLayoutOneFrame(s);
     const std::string sig = MakeSignature(s);
@@ -2797,12 +3022,21 @@ void FrameTick(AppState& s) {
     if (s.needsRedraw || animating) {
         DrawAndPresent(s);
     }
+
+    // 空闲即停帧：动画收敛/鼠标离开/无弹跳 → 停止定时器（零唤醒）
+    SetFrameCadence(s, animating || s.mouseInside || !s.pendingLaunches.empty());
 }
 
 // ============================== 窗口过程 ==============================
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     AppState* s = &g_state;
+
+    // explorer 重启后重建任务栏的广播：立即重新隐藏（替代周期 FindWindow 轮询）
+    if (s->taskbarCreatedMsg && msg == s->taskbarCreatedMsg) {
+        EnsureTaskbarHidden(*s);
+        return 0;
+    }
 
     switch (msg) {
         case WM_ERASEBKGND:
@@ -2830,6 +3064,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             s->mouseX = static_cast<float>(GET_X_LPARAM(lParam));
             s->mouseY = static_cast<float>(GET_Y_LPARAM(lParam));
             s->mouseInside = true;
+            SetFrameCadence(*s, true);  // 进入 Dock：立即切回动画帧（放大不卡顿）
             s->needsRedraw = true;
             return 0;
         }
@@ -2921,8 +3156,57 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_TIMER:
             if (wParam == kFrameTimerId) {
                 FrameTick(*s);
+            } else if (wParam == kRefreshTimerId) {
+                // 事件风暴合并定时器到期：执行合并后的刷新
+                KillTimer(hwnd, kRefreshTimerId);
+                s->refreshArmed = false;
+                DoPoll(*s);
+            } else if (wParam == kSafetyTimerId) {
+                DoPoll(*s);  // 事件失效保底（1 次/分钟）
             }
             return 0;
+
+        // WinEvent 事件：窗口集合/托盘状态变化 → 合并刷新（事件风暴下限 1s）
+        case kMsgRefresh: {
+            if (s->lastPollTick == 0) {
+                DoPoll(*s);
+                return 0;
+            }
+            const ULONGLONG now = GetTickCount64();
+            if (now - s->lastPollTick >= kRefreshMinGapMs) {
+                DoPoll(*s);
+            } else if (!s->refreshArmed) {
+                s->refreshArmed = true;
+                const ULONGLONG wait =
+                    kRefreshMinGapMs - (now - s->lastPollTick);
+                SetTimer(hwnd, kRefreshTimerId, static_cast<UINT>(wait),
+                         nullptr);
+            }
+            return 0;
+        }
+
+        // WinEvent 事件：套件组件被最小化（Win+D）→ 立即恢复
+        case kMsgHeal:
+            HealMinimizedSuiteWindows();
+            return 0;
+
+        // 托盘图标触发完成（worker 线程）：收回任务栏并收尾
+        case kMsgTriggerDone: {
+            const bool ok = wParam != 0;
+            s->taskbarShowUntil = 0;
+            EnsureTaskbarHidden(*s);  // 立即收回：隐藏任务栏 + 工作区扩回全屏
+            if (!ok) {
+                // 触发失败：回退评分强显（旧行为兜底，尽力而为）
+                const size_t idx = static_cast<size_t>(lParam);
+                if (idx < s->items.size()) {
+                    g_skipTrayTriggerOnce = true;
+                    WakeTrayOnlyApp(*s, idx);
+                    g_skipTrayTriggerOnce = false;
+                }
+            }
+            DoPoll(*s);  // 尽快把恢复的窗口纳入条目/更新运行状态
+            return 0;
+        }
 
         case WM_DPICHANGED: {
             s->dpi = static_cast<int>(HIWORD(wParam));
@@ -2944,6 +3228,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_DESTROY:
             KillTimer(hwnd, kFrameTimerId);
+            KillTimer(hwnd, kRefreshTimerId);
+            KillTimer(hwnd, kSafetyTimerId);
+            UninstallDockWinEventHook();
+            UninstallShowDesktopHook();
             ShowTaskbar();  // 恢复 Windows 任务栏
             PostQuitMessage(0);
             return 0;
@@ -3045,6 +3333,13 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     DrawAndPresent(s);
     // ULW 窗口同样必须 ShowWindow 一次，否则始终处于隐藏态
     ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+    // 事件驱动接管（替代定时轮询）：空暇零唤醒
+    s.taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
+    InstallDockWinEventHook();   // 窗口集合变化 / Win+D 最小化自愈
+    StartTrayRegistryWatch();    // 托盘注册表阻塞式监听（RegNotifyChangeKeyValue）
+    SetTimer(s.hwnd, kSafetyTimerId, static_cast<UINT>(kSafetyPollMs),
+             nullptr);           // 事件失效保底（1 次/分钟）
+    s.lastPollTick = GetTickCount64();  // 启动后立即首次轮询
     SetTimer(s.hwnd, kFrameTimerId, kFrameIntervalMs, nullptr);
 
     MSG msg{};
