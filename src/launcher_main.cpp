@@ -70,8 +70,43 @@ constexpr int kFolderRows = 4;
 constexpr float kFolderPanelHeight = 306.0f; // 文件夹面板固定高度（不随组件变高）
 constexpr UINT kDrawTimerId = 1;
 constexpr UINT kDrawIntervalMs = 16; // 约 60fps，保证翻页动画流畅
+constexpr UINT kIdlePollMs = 500;    // 空闲态低频轮询：无动画/交互时降频省电
 constexpr UINT kPageAnimMs = 240;
 constexpr UINT kRenameCommand = WM_APP + 3;
+// 双指左右滑（水平滚轮）翻页消息（经全局钩子转发，wParam = 带符号 delta）
+constexpr UINT kPageWheelMsg = WM_APP + 10;
+// 手势“抬起”信号消息（经全局钩子转发）：手指离开触控板/手势被其他输入
+// 取代时立即结束手势（翻页/回弹），无需等待 kGestureEndMs 兜底超时
+constexpr UINT kGestureSettleMsg = WM_APP + 11;
+// 手势事件停顿超过该时长判定手势结束（翻页/回弹）——这是兜底值：
+// 双指滑动中途停顿（手指未抬起）不应触发翻页/回弹，停顿超过该值才兜底
+// 结束；真实“松手”由钩子检测的外部信号（光标移动/按键/垂直滚轮）即时
+// 触发，见 WheelLowLevelMouseProc
+constexpr UINT kGestureEndMs = 200;
+// 手势停顿后，外部“抬起”信号生效所需的最短安静时间：
+// 避免滚动中触控板抖动/杂散事件误判松手
+constexpr UINT kGestureQuietMs = 40;
+// 光标移动多少像素视为“手势已结束”：触控板双指滚动期间光标不移动，
+// 光标明显移动说明至少一根手指已离开/转为指针操作
+constexpr int kGestureLiftMovePx = 4;
+// 滚轮一格（120 delta）对应的像素位移：系统默认一格 = 3 行 ≈ 48px @96DPI。
+// 用此标定让双指跟手接近物理 1:1（手指滑多少页面走多少），而非整页跳变
+constexpr float kGesturePixelsPerWheel = 48.0f;
+// 双指滑动的方向标定：WM_MOUSEHWHEEL 的 delta 符号由触控板驱动及
+// “自然滚动/反向滚动”设置决定——多数设备上双指左滑给出正 delta，
+// 与“手指往哪滑页面往哪走”的跟手期望相反（按住拖动无此问题）。
+// 取反后与按住拖动完全一致；若个别设备方向仍反，翻转此常量即可。
+constexpr float kGestureWheelDir = -1.0f;
+// 手势事件同步重绘的节流间隔：触控板事件可能短时爆发（>~120Hz），
+// 每事件都做一次全量重绘（GDI+ 双页 + UpdateLayeredWindow）会拖慢事件
+// 处理；被跳过的帧由 WM_TIMER 兜底补绘，视觉上无感知。
+constexpr UINT kMinGesturePaintMs = 8;
+// 第一页右滑 / 最后一页左滑（边界无页可翻）时页面位移的阻尼系数，
+// 与回位动画的起始偏移共用同一标定
+constexpr float kEdgeDamping = 0.28f;
+// 触发换页的位移阈值（占窗口宽度的比例）：页面边缘越过窗口中线
+// （|dx| ≥ w * kPageFlipRatio）才换页，与手机桌面一致
+constexpr float kPageFlipRatio = 0.5f;
 
 // 点击按压动画（安卓风格：按下缩小，松手弹簧回弹带过冲）
 constexpr float kPressScale = 0.85f;      // 按下时图标缩放
@@ -161,6 +196,28 @@ struct AppState {
 
     bool dirty = false;
 
+    // 页面预渲染缓存：滑动/翻页动画期间每帧只对整页位图做 blit，
+    // 不再逐图标/逐文字重绘，帧率显著提升。
+    // 任何页面内容变更必须调用 InvalidatePageCache，否则画面不更新。
+    std::vector<Gdiplus::Bitmap*> pageCache;   // 每页一张网格位图（透明底）
+    std::vector<bool> pageCacheValid;
+    Gdiplus::Bitmap* bgBitmap = nullptr;       // 卡片背景缓存（渐变+圆角+手柄）
+
+    // 缓存字体：GDI+ 每次 new Font 开销很大，逐帧创建会拖慢绘制
+    Gdiplus::Font* fontLabel = nullptr;        // 主网格图标标签 12.5 bold
+    Gdiplus::Font* fontHint = nullptr;         // 空页提示 13 regular
+    Gdiplus::Font* fontTitle = nullptr;        // 文件夹面板标题 14 bold
+    Gdiplus::Font* fontFolderLabel = nullptr;  // 文件夹子项标签 11.5 bold
+    Gdiplus::Font* fontFallback = nullptr;     // 图标缺失时的占位首字母 20 bold
+
+    // 双指左右滑手势（跟手翻页）：位移实时驱动翻页进度，事件流停顿即结束
+    bool gestureActive = false;
+    float gestureOffset = 0.0f;  // 累计位移（像素，左负右正，物理跟手）
+    ULONGLONG gestureLastT = 0;  // 最后一条手势事件的时间
+    ULONGLONG gesturePaintT = 0;     // 上次手势同步重绘时间（节流用）
+    bool gesturePaintPending = false; // 节流期间被跳过的帧，交由 WM_TIMER 补绘
+    float returnFromOffset = 0.0f; // 同页回位动画的起始偏移（边缘阻尼/位移不足松手）
+
     // 点击按压动画（安卓风格图标回弹）
     enum class PressPhase { None, Pressing, Releasing };
     PressPhase pressPhase = PressPhase::None;
@@ -175,6 +232,18 @@ struct AppState {
 };
 
 // ---------- 基础工具 ----------
+
+// 页面缓存失效：pageIndex < 0 表示全部失效。
+// 必须在任何页面数据（图标/标签/布局）变更后调用。
+void InvalidatePageCache(AppState& s, int pageIndex = -1) {
+    if (pageIndex < 0) {
+        std::fill(s.pageCacheValid.begin(), s.pageCacheValid.end(), false);
+        return;
+    }
+    if (pageIndex >= 0 && pageIndex < static_cast<int>(s.pageCacheValid.size())) {
+        s.pageCacheValid[pageIndex] = false;
+    }
+}
 
 using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(HANDLE);
 using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
@@ -493,14 +562,13 @@ void DrawAppIcon(Graphics& g, AppState& s, const std::wstring& path,
         Pen border(Color(255, 220, 222, 228), 1.0f * k);
         g.DrawRectangle(&border, rect);
         const std::wstring name = DisplayNameOf(path);
-        FontFamily ff(L"Microsoft YaHei UI");
-        Gdiplus::Font font(&ff, std::round(20.0f * k), FontStyleBold, UnitPixel);
+        Gdiplus::Font* font = s.fontFallback;
         StringFormat sf;
         sf.SetAlignment(StringAlignmentCenter);
         sf.SetLineAlignment(StringAlignmentCenter);
         SolidBrush text(Color(255, 255, 255, 255));
         g.DrawString(name.empty() ? L"?" : name.substr(0, 1).c_str(), -1,
-                     &font, rect, &sf, &text);
+                     font, rect, &sf, &text);
     }
 }
 
@@ -727,6 +795,18 @@ void DestroyBacking(AppState& s) {
     }
     s.iconCache.clear();
 
+    delete s.bgBitmap;
+    s.bgBitmap = nullptr;
+    for (Gdiplus::Bitmap* bmp : s.pageCache) delete bmp;
+    s.pageCache.clear();
+    s.pageCacheValid.clear();
+
+    delete s.fontLabel; s.fontLabel = nullptr;
+    delete s.fontHint; s.fontHint = nullptr;
+    delete s.fontTitle; s.fontTitle = nullptr;
+    delete s.fontFolderLabel; s.fontFolderLabel = nullptr;
+    delete s.fontFallback; s.fontFallback = nullptr;
+
     delete s.bitmap;
     s.bitmap = nullptr;
     if (s.hdcMem) {
@@ -764,6 +844,19 @@ bool CreateBacking(AppState& s, int width, int height) {
     s.width = width;
     s.height = height;
     s.scale = static_cast<float>(s.dpi) / 96.0f;
+
+    // 缓存字体（随尺寸/DPI 重建一次，避免逐帧创建 Font）
+    FontFamily family(L"Microsoft YaHei UI");
+    s.fontLabel = new Gdiplus::Font(&family, std::round(12.5f * s.scale),
+                                    FontStyleBold, UnitPixel);
+    s.fontHint = new Gdiplus::Font(&family, std::round(13.0f * s.scale),
+                                   FontStyleRegular, UnitPixel);
+    s.fontTitle = new Gdiplus::Font(&family, std::round(14.0f * s.scale),
+                                    FontStyleBold, UnitPixel);
+    s.fontFolderLabel = new Gdiplus::Font(&family, std::round(11.5f * s.scale),
+                                          FontStyleBold, UnitPixel);
+    s.fontFallback = new Gdiplus::Font(&family, std::round(20.0f * s.scale),
+                                       FontStyleBold, UnitPixel);
     return true;
 }
 
@@ -801,10 +894,23 @@ void PresentLauncher(AppState& s) {
 
 // ---------- 分页动画 ----------
 
+// 进入动画/交互态时恢复快定时器（空闲态 WM_TIMER 会自动降到 kIdlePollMs）
+void EnsureFastTimer(AppState& s) {
+    SetTimer(s.hwnd, kDrawTimerId, kDrawIntervalMs, nullptr);
+}
+
 float EaseOutCubic(float t) {
     t = std::clamp(t, 0.0f, 1.0f);
     const float inv = 1.0f - t;
     return 1.0f - inv * inv * inv;
+}
+
+// EaseOutCubic 的反函数：把"视觉进度"折算回"原始动画进度"。
+// 吸附翻页动画的起始进度用它反解，保证动画首帧与松手时画面完全连续
+// （直接把线性位移比当原始进度会使首帧被 ease 放大、页面瞬跳）。
+float EaseOutCubicInverse(float p) {
+    p = std::clamp(p, 0.0f, 1.0f);
+    return 1.0f - std::cbrt(1.0f - p);
 }
 
 void StartPageAnimation(AppState& s, int targetPage, float initialProgress = 0.0f) {
@@ -819,6 +925,138 @@ void StartPageAnimation(AppState& s, int targetPage, float initialProgress = 0.0
     s.animStart = GetTickCount64() -
                   static_cast<ULONGLONG>(initialProgress * kPageAnimMs);
     s.pageAnimating = true;
+    EnsureFastTimer(s);
+}
+
+// 同页回位动画：页面当前偏离居中位置（边缘阻尼、位移不足未翻页），
+// 松手/手势结束后从该偏移平滑动画回居中，而不是瞬间跳回。
+// 复用 pageAnimating 机制（animFromPage == animToPage == currentPage）。
+void StartReturnAnimation(AppState& s, float fromOffset) {
+    if (std::abs(fromOffset) < 0.5f) return;
+    s.animFromPage = s.currentPage;
+    s.animToPage = s.currentPage;
+    s.returnFromOffset = fromOffset;
+    s.animProgress = 0.0f;
+    s.animStart = GetTickCount64();
+    s.pageAnimating = true;
+    EnsureFastTimer(s);
+}
+
+// 拖动/手势松手后的统一收尾判定（按住拖动与双指滑动共用）：
+// 位移超过页面宽度一半（页面边缘越过窗口中线）且方向上有页可翻 →
+// 吸附翻页动画（起始进度用 ease 反函数折算，动画首帧与松手画面连续；
+// 划过头 |dx|≥w 时目标页已停在窗口中线，翻页直接完成，无任何越位）；
+// 否则（边界阻尼 / 位移不足）→ 只在头/尾页从当前视觉偏移平滑回位。
+// 一次拖动至多翻一页。
+void SettlePageDrag(AppState& s, float dx) {
+    const float w = static_cast<float>(s.width);
+    const bool hasNext = s.currentPage < static_cast<int>(s.pages.size()) - 1;
+    const bool hasPrev = s.currentPage > 0;
+    const bool atEdge = (dx < 0 && !hasNext) || (dx > 0 && !hasPrev);
+    // 边界处绘制用的是阻尼后的位移（与 DrawMainGrid 同一标定）
+    const float visual = atEdge ? dx * kEdgeDamping : dx;
+
+    bool flipped = false;
+    if (std::abs(dx) >= w * kPageFlipRatio) {
+        if (dx < 0 && hasNext) {
+            flipped = true;
+            StartPageAnimation(s, s.currentPage + 1,
+                               EaseOutCubicInverse(
+                                   std::clamp(-dx / w, 0.0f, 1.0f)));
+        } else if (dx > 0 && hasPrev) {
+            flipped = true;
+            StartPageAnimation(s, s.currentPage - 1,
+                               EaseOutCubicInverse(
+                                   std::clamp(dx / w, 0.0f, 1.0f)));
+        }
+    }
+    if (!flipped && std::abs(visual) > 0.5f) {
+        StartReturnAnimation(s, visual);
+    }
+}
+
+// 手势结束（事件停顿）：与按住拖动松手同一判定
+void EndGesture(AppState& s) {
+    SettlePageDrag(s, s.gestureOffset);
+    s.gestureActive = false;
+    s.gestureOffset = 0.0f;
+}
+
+// ---- 全局鼠标钩子：双指左右滑（水平滚轮）翻页 ----
+// launcher 是 WS_EX_NOACTIVATE 桌面组件，永不获得焦点，收不到滚轮消息；
+// 用 WH_MOUSE_LL 拦截水平滚轮（触控板双指左右滑 = WM_MOUSEHWHEEL）：
+// 光标位于组件矩形内时把滚轮消息转发为 kPageWheelMsg，并吞掉原消息
+// （否则焦点窗口（如浏览器）会被误滚动）。仅拦截水平方向，上下滑不翻页。
+// 钩子同时在手势停顿期间检测"手指已抬起"的外部信号（光标明显移动 /
+// 任意按键 / 垂直滚轮），转发 kGestureSettleMsg 立即结束手势——因为
+// 双指滚动期间光标不会移动，光标一动就说明手势已结束；这样松手即收尾，
+// 不必等 kGestureEndMs 兜底超时（兜底超时只防"抬手后静置不动"）。
+// 钩子仅在鼠标活动时被系统唤醒，空闲零功耗。
+HHOOK g_wheelHook = nullptr;
+HWND g_wheelHookHwnd = nullptr;
+POINT g_wheelHookLastCursor = {};
+
+LRESULT CALLBACK WheelLowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode != HC_ACTION) return CallNextHookEx(nullptr, nCode, wParam, lParam);
+    const auto* info = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+    HWND hwnd = g_wheelHookHwnd;
+
+    if (wParam == WM_MOUSEHWHEEL) {
+        if (hwnd && IsWindow(hwnd)) {
+            RECT rc{};
+            GetWindowRect(hwnd, &rc);
+            if (PtInRect(&rc, info->pt) != FALSE) {
+                // MSLLHOOKSTRUCT.mouseData 高位即滚轮 delta（与 WM_MOUSEHWHEEL 一致）
+                const short delta = static_cast<short>(HIWORD(info->mouseData));
+                PostMessageW(hwnd, kPageWheelMsg, static_cast<WPARAM>(delta), 0);
+                g_wheelHookLastCursor = info->pt;
+                return 1; // 已处理：不落入焦点窗口
+            }
+        }
+    } else {
+        // 手势停顿期间的外部"抬起"信号：手势活动且事件安静超过
+        // kGestureQuietMs 时，光标移动 / 按键 / 垂直滚轮都视为手势结束
+        if (hwnd && IsWindow(hwnd)) {
+            AppState* s =
+                reinterpret_cast<AppState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            if (s && s->gestureActive &&
+                GetTickCount64() - s->gestureLastT > kGestureQuietMs) {
+                bool lift = false;
+                if (wParam == WM_MOUSEMOVE) {
+                    const LONG dx = info->pt.x - g_wheelHookLastCursor.x;
+                    const LONG dy = info->pt.y - g_wheelHookLastCursor.y;
+                    lift = dx > kGestureLiftMovePx || dx < -kGestureLiftMovePx ||
+                           dy > kGestureLiftMovePx || dy < -kGestureLiftMovePx;
+                } else if (wParam == WM_MOUSEWHEEL || wParam == WM_LBUTTONDOWN ||
+                           wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN ||
+                           wParam == WM_XBUTTONDOWN) {
+                    lift = true;
+                }
+                if (lift) {
+                    PostMessageW(hwnd, kGestureSettleMsg, 0, 0);
+                }
+            }
+        }
+    }
+    g_wheelHookLastCursor = info->pt;
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+void InstallWheelHook(HWND hwnd) {
+    if (!g_wheelHook) {
+        g_wheelHookHwnd = hwnd;
+        GetCursorPos(&g_wheelHookLastCursor);
+        g_wheelHook = SetWindowsHookExW(WH_MOUSE_LL, WheelLowLevelMouseProc,
+                                        GetModuleHandleW(nullptr), 0);
+    }
+}
+
+void UninstallWheelHook() {
+    if (g_wheelHook) {
+        UnhookWindowsHookEx(g_wheelHook);
+        g_wheelHook = nullptr;
+    }
+    g_wheelHookHwnd = nullptr;
 }
 
 // ---------- 布局 ----------
@@ -960,6 +1198,7 @@ void PruneEmptyPages(AppState& s) {
 
     s.pages = std::move(kept);
     s.currentPage = newPage;
+    InvalidatePageCache(s); // 页面删除/重排：全部缓存失效
 }
 
 int FirstEmptySlot(const PageData& page) {
@@ -974,6 +1213,7 @@ int AddAppToPage(AppState& s, int page, const std::wstring& path) {
         s.pages[page].slots[slot].type = 1;
         s.pages[page].slots[slot].path = path;
         s.pages[page].slots[slot].folderApps.clear();
+        InvalidatePageCache(s, page);
         return slot;
     }
     return -1;
@@ -1061,6 +1301,7 @@ void StartFolderRename(AppState& s, int page, int slot) {
     s.renamingFolder = true;
     s.renamePage = page;
     s.renameSlot = slot;
+    EnsureFastTimer(s);
     s.renameText = s.pages[page].slots[slot].folderName.empty()
                        ? L"文件夹"
                        : s.pages[page].slots[slot].folderName;
@@ -1122,6 +1363,7 @@ void CommitFolderRename(AppState& s) {
         AppEntry& entry = s.pages[s.renamePage].slots[s.renameSlot];
         if (entry.type == 2) {
             entry.folderName = name;
+            InvalidatePageCache(s, s.renamePage); // 文件夹标签变化
             SavePages(s);
         }
     }
@@ -1219,6 +1461,7 @@ void StartPress(AppState& s, bool inFolder, int page, int slot, int child) {
     s.pressOffset = 0.0f;
     s.pressVel = 0.0f;
     s.pressStart = GetTickCount64();
+    EnsureFastTimer(s);
 }
 
 void CancelPress(AppState& s) {
@@ -1238,6 +1481,7 @@ void StartPressRelease(AppState& s) {
     s.pressOffset = s.pressScale - 1.0f; // 从当前缩放开始回弹
     s.pressVel = 0.0f;
     s.pressStart = GetTickCount64();
+    EnsureFastTimer(s);
 }
 
 // 推进动画一帧；返回 true 表示画面有变化需要重绘
@@ -1316,7 +1560,9 @@ void DrawPressTint(Graphics& g, const RectF& rect, float k, int alpha) {
     g.FillPath(&tint, &path);
 }
 
-void DrawCardBackground(Graphics& g, const AppState& s) {
+// 卡片背景（渐变+圆角+手柄）是静态内容：渲染一次缓存，每帧只做整图 blit，
+// 省去每帧的渐变填充、抗锯齿圆角路径与描边
+void DrawCardBackgroundInto(Graphics& g, const AppState& s) {
     const float k = s.scale;
     RectF card(8.0f * k, 8.0f * k, s.width - 16.0f * k, s.height - 16.0f * k);
     GraphicsPath path;
@@ -1335,6 +1581,29 @@ void DrawCardBackground(Graphics& g, const AppState& s) {
     const float hw = 36.0f * k;
     g.DrawLine(&handlePen, PointF(s.width / 2.0f - hw, handleY),
                PointF(s.width / 2.0f + hw, handleY));
+}
+
+void EnsureBackgroundCache(AppState& s) {
+    if (s.bgBitmap) return;
+    s.bgBitmap = new Gdiplus::Bitmap(s.width, s.height, PixelFormat32bppPARGB);
+    if (!s.bgBitmap) return;
+    Graphics g(s.bgBitmap);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+    g.Clear(Color(0, 0, 0, 0));
+    DrawCardBackgroundInto(g, s);
+}
+
+void DrawCardBackground(Graphics& g, AppState& s) {
+    EnsureBackgroundCache(s);
+    if (s.bgBitmap) {
+        // 1:1 整数偏移：最近邻即为纯拷贝，无插值开销
+        g.SetInterpolationMode(InterpolationModeNearestNeighbor);
+        g.DrawImage(s.bgBitmap, 0.0f, 0.0f);
+        g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+        return;
+    }
+    DrawCardBackgroundInto(g, s);
 }
 
 void DrawStringCentered(Graphics& g, const std::wstring& text,
@@ -1385,8 +1654,7 @@ void DrawPageGridAt(Graphics& g, AppState& s, int pageIndex, float offsetX) {
     if (pageIndex < 0 || pageIndex >= static_cast<int>(s.pages.size())) return;
 
     const float k = s.scale;
-    FontFamily family(L"Microsoft YaHei UI");
-    Gdiplus::Font labelFont(&family, std::round(12.5f * k), FontStyleBold, UnitPixel);
+    Gdiplus::Font* labelFont = s.fontLabel;
 
     const PageData& page = s.pages[pageIndex];
     RectF grid = MainGridRect(s);
@@ -1438,9 +1706,9 @@ void DrawPageGridAt(Graphics& g, AppState& s, int pageIndex, float offsetX) {
 
         if (s.renamingFolder && s.renamePage == pageIndex &&
             s.renameSlot == slot) {
-            DrawRenameBox(g, s, textRect, k, &labelFont);
+            DrawRenameBox(g, s, textRect, k, labelFont);
         } else {
-            DrawStringCentered(g, label, &labelFont, textRect,
+            DrawStringCentered(g, label, labelFont, textRect,
                                Color(235, 245, 245, 247));
         }
     }
@@ -1450,10 +1718,70 @@ void DrawPageGridAt(Graphics& g, AppState& s, int pageIndex, float offsetX) {
         if (page.slots[slot].type != 0) { empty = false; break; }
     }
     if (empty) {
-        Gdiplus::Font hintFont(&family, std::round(13.0f * k), FontStyleRegular, UnitPixel);
         DrawStringCentered(g, L"将 .exe 或 .lnk 拖入此处",
-                           &hintFont, grid, Color(140, 255, 255, 255));
+                           s.fontHint, grid, Color(140, 255, 255, 255));
     }
+}
+
+// ---------- 页面预渲染缓存 ----------
+
+void EnsurePageCacheSize(AppState& s) {
+    const size_t n = s.pages.size();
+    if (s.pageCache.size() < n) {
+        s.pageCache.resize(n, nullptr);
+        s.pageCacheValid.resize(n, false);
+    }
+}
+
+// 该页是否需要逐帧实时绘制：缓存只含静态网格内容，按压缩放/遮罩、
+// 重命名框等动态元素必须实时画
+bool PageNeedsLiveDraw(const AppState& s, int pageIndex) {
+    if (s.pressPhase != AppState::PressPhase::None && !s.pressInFolder &&
+        s.pressPage == pageIndex) {
+        return true;
+    }
+    if (s.renamingFolder && s.renamePage == pageIndex) return true;
+    return false;
+}
+
+// 绘制一页：优先整页位图 blit（滑动/翻页动画每帧只做两次整图拷贝），
+// 仅在页面有动态元素时退回逐项实时绘制
+void DrawPageCached(Graphics& g, AppState& s, int pageIndex, float offsetX) {
+    if (pageIndex < 0 || pageIndex >= static_cast<int>(s.pages.size())) return;
+    if (PageNeedsLiveDraw(s, pageIndex)) {
+        DrawPageGridAt(g, s, pageIndex, offsetX);
+        return;
+    }
+
+    EnsurePageCacheSize(s);
+    if (!s.pageCacheValid[pageIndex]) {
+        if (!s.pageCache[pageIndex]) {
+            s.pageCache[pageIndex] =
+                new Gdiplus::Bitmap(s.width, s.height, PixelFormat32bppPARGB);
+        }
+        Gdiplus::Bitmap* page = s.pageCache[pageIndex];
+        if (page) {
+            Graphics cg(page);
+            cg.SetSmoothingMode(SmoothingModeAntiAlias);
+            cg.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+            cg.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+            cg.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+            cg.SetTextContrast(6);
+            cg.Clear(Color(0, 0, 0, 0));
+            DrawPageGridAt(cg, s, pageIndex, 0.0f);
+            s.pageCacheValid[pageIndex] = true;
+        }
+    }
+
+    Gdiplus::Bitmap* page = s.pageCache[pageIndex];
+    if (!page) {
+        DrawPageGridAt(g, s, pageIndex, offsetX); // 分配失败的兜底
+        return;
+    }
+    // 亚像素偏移用双线性，边缘平滑无抖动
+    g.SetInterpolationMode(InterpolationModeHighQualityBilinear);
+    g.DrawImage(page, offsetX, 0.0f);
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
 }
 
 void DrawMainGrid(Graphics& g, AppState& s) {
@@ -1464,25 +1792,35 @@ void DrawMainGrid(Graphics& g, AppState& s) {
     RectF card(8.0f * k, 8.0f * k,
                s.width - 16.0f * k, s.height - 16.0f * k);
 
-    if (s.dragMode == AppState::DragMode::PageSwipe) {
-        // 未松开鼠标：页面位移实时跟随手指
-        const float dx = static_cast<float>(s.swipeLastX - s.swipeStartX);
+    if (s.dragMode == AppState::DragMode::PageSwipe || s.gestureActive) {
+        // 指针拖动 / 双指手势：页面位移实时跟随（物理跟手，左滑=下一页）
+        const float dx = s.gestureActive
+                             ? s.gestureOffset
+                             : static_cast<float>(s.swipeLastX - s.swipeStartX);
         const float w = static_cast<float>(s.width);
         const bool hasNext = s.currentPage < static_cast<int>(s.pages.size()) - 1;
         const bool hasPrev = s.currentPage > 0;
 
+        // 翻页方向：目标页硬停在窗口中线（|dx| 超过一页宽也不越位），
+        // 切换过程不出现任何"划过头"的页面偏移；松手时若已在中线则
+        // 翻页直接完成、无跳变。头/尾页往外滑的阻尼在下方 else 分支
+        float disp = dx;
+        if ((dx < 0.0f && hasNext) || (dx > 0.0f && hasPrev)) {
+            disp = std::clamp(dx, -w, w);
+        }
+
         GraphicsState state = g.Save();
         g.SetClip(card);
 
-        if (dx < 0.0f && hasNext) {
-            DrawPageGridAt(g, s, s.currentPage, dx);
-            DrawPageGridAt(g, s, s.currentPage + 1, w + dx);
-        } else if (dx > 0.0f && hasPrev) {
-            DrawPageGridAt(g, s, s.currentPage, dx);
-            DrawPageGridAt(g, s, s.currentPage - 1, -w + dx);
+        if (disp < 0.0f && hasNext) {
+            DrawPageCached(g, s, s.currentPage, disp);
+            DrawPageCached(g, s, s.currentPage + 1, w + disp);
+        } else if (disp > 0.0f && hasPrev) {
+            DrawPageCached(g, s, s.currentPage, disp);
+            DrawPageCached(g, s, s.currentPage - 1, -w + disp);
         } else {
             // 第一页/最后一页继续拖动时给一点阻尼
-            DrawPageGridAt(g, s, s.currentPage, dx * 0.28f);
+            DrawPageCached(g, s, s.currentPage, dx * kEdgeDamping);
         }
 
         g.Restore(state);
@@ -1490,25 +1828,34 @@ void DrawMainGrid(Graphics& g, AppState& s) {
         // 用 ease-out 位移模拟左右滑动翻页
         const float p = EaseOutCubic(s.animProgress);
         const float w = static_cast<float>(s.width);
-        float fromOffset = 0.0f;
-        float toOffset = 0.0f;
-        if (s.animToPage > s.animFromPage) {
-            // 下一页从右侧进入，旧页向左退出
-            fromOffset = -p * w;
-            toOffset = (1.0f - p) * w;
+        if (s.animToPage == s.animFromPage) {
+            // 同页回位：从 returnFromOffset 平滑动画回居中
+            GraphicsState state = g.Save();
+            g.SetClip(card);
+            DrawPageCached(g, s, s.currentPage,
+                           s.returnFromOffset * (1.0f - p));
+            g.Restore(state);
         } else {
-            // 上一页从左侧进入，旧页向右退出
-            fromOffset = p * w;
-            toOffset = -(1.0f - p) * w;
-        }
+            float fromOffset = 0.0f;
+            float toOffset = 0.0f;
+            if (s.animToPage > s.animFromPage) {
+                // 下一页从右侧进入，旧页向左退出
+                fromOffset = -p * w;
+                toOffset = (1.0f - p) * w;
+            } else {
+                // 上一页从左侧进入，旧页向右退出
+                fromOffset = p * w;
+                toOffset = -(1.0f - p) * w;
+            }
 
-        GraphicsState state = g.Save();
-        g.SetClip(card);
-        DrawPageGridAt(g, s, s.animFromPage, fromOffset);
-        DrawPageGridAt(g, s, s.animToPage, toOffset);
-        g.Restore(state);
+            GraphicsState state = g.Save();
+            g.SetClip(card);
+            DrawPageCached(g, s, s.animFromPage, fromOffset);
+            DrawPageCached(g, s, s.animToPage, toOffset);
+            g.Restore(state);
+        }
     } else {
-        DrawPageGridAt(g, s, s.currentPage, 0.0f);
+        DrawPageCached(g, s, s.currentPage, 0.0f);
     }
 
     // 分页圆点
@@ -1534,8 +1881,7 @@ void DrawFolderPanel(Graphics& g, AppState& s) {
     Pen border(Color(160, 255, 255, 255), 1.2f * k);
     g.DrawPath(&border, &path);
 
-    FontFamily family(L"Microsoft YaHei UI");
-    Gdiplus::Font titleFont(&family, std::round(14.0f * k), FontStyleBold, UnitPixel);
+    Gdiplus::Font* titleFont = s.fontTitle;
 
     std::wstring title = L"文件夹";
     if (s.folderPage >= 0 && s.folderSlot >= 0 &&
@@ -1543,7 +1889,7 @@ void DrawFolderPanel(Graphics& g, AppState& s) {
         const AppEntry& folder = s.pages[s.folderPage].slots[s.folderSlot];
         if (!folder.folderName.empty()) title = folder.folderName;
     }
-    DrawStringCentered(g, title, &titleFont,
+    DrawStringCentered(g, title, titleFont,
                        RectF(panel.X, panel.Y + 6.0f * k, panel.Width, 26.0f * k),
                        Color(255, 250, 250, 252));
 
@@ -1552,7 +1898,7 @@ void DrawFolderPanel(Graphics& g, AppState& s) {
     AppEntry& folder = s.pages[s.folderPage].slots[s.folderSlot];
     if (folder.type != 2) return;
 
-    Gdiplus::Font labelFont(&family, std::round(11.5f * k), FontStyleBold, UnitPixel);
+    Gdiplus::Font* labelFont = s.fontFolderLabel;
     for (int i = 0; i < static_cast<int>(folder.folderApps.size()); ++i) {
         const RectF cell = FolderCellRect(s, i);
         const float iconSize = std::min(cell.Width, cell.Height) * 0.58f;
@@ -1570,7 +1916,7 @@ void DrawFolderPanel(Graphics& g, AppState& s) {
         }
         RectF textRect(cell.X + 1.0f * k, iconRect.Y + iconRect.Height + 2.0f * k,
                        cell.Width - 2.0f * k, cell.Height - iconRect.Height - 4.0f * k);
-        DrawStringCentered(g, DisplayNameOf(folder.folderApps[i]), &labelFont,
+        DrawStringCentered(g, DisplayNameOf(folder.folderApps[i]), labelFont,
                            textRect, Color(230, 245, 245, 247));
     }
 }
@@ -1637,6 +1983,194 @@ void DrawLauncher(AppState& s) {
     PresentLauncher(s);
 }
 
+// ---------- 拖拽幽灵跟随窗口 ----------
+// 启动台是分层窗口：浮起图标画在自身 GDI+ 表面，光标一旦离开窗口矩形
+// 就被裁剪隐形（跨窗口拖动（含拖向 Dock）时图标“消失”）。
+// 挂一个独立顶层分层小窗跟随光标渲染被拖图标，离开启动台也可视。
+
+struct DragGhostState {
+    HWND hwnd = nullptr;
+    Bitmap* bmp = nullptr;   // GDI+ 渲染面（内容一次渲染，仅位置变化）
+    HDC dc = nullptr;
+    HBITMAP dib = nullptr;
+    HBITMAP dibOld = nullptr;
+    void* bits = nullptr;
+    int size = 0;            // 当前像素尺寸（DPI 变化会重建）
+    std::wstring path;       // 当前渲染条目（变化才重渲染）
+    bool isFolder = false;
+} g_dragGhost;
+
+void EnsureGhostWindow() {
+    if (g_dragGhost.hwnd) return;
+    static bool clsRegistered = false;
+    if (!clsRegistered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.lpszClassName = L"DesktopLauncherDragGhost";
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        RegisterClassExW(&wc);
+        clsRegistered = true;
+    }
+    g_dragGhost.hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        L"DesktopLauncherDragGhost", L"", WS_POPUP, 0, 0, 1, 1, nullptr,
+        nullptr, GetModuleHandleW(nullptr), nullptr);
+}
+
+void FreeGhostContent() {
+    delete g_dragGhost.bmp;
+    g_dragGhost.bmp = nullptr;
+    if (g_dragGhost.dc) {
+        if (g_dragGhost.dibOld) SelectObject(g_dragGhost.dc, g_dragGhost.dibOld);
+        if (g_dragGhost.dib) DeleteObject(g_dragGhost.dib);
+        DeleteDC(g_dragGhost.dc);
+    }
+    g_dragGhost.dc = nullptr;
+    g_dragGhost.dib = nullptr;
+    g_dragGhost.dibOld = nullptr;
+    g_dragGhost.bits = nullptr;
+    g_dragGhost.size = 0;
+}
+
+void RenderGhostContent(AppState& s, const std::wstring& path, bool isFolder,
+                        const std::vector<std::wstring>* folderApps, int size) {
+    HDC screenDc = GetDC(nullptr);
+    g_dragGhost.dc = screenDc ? CreateCompatibleDC(screenDc) : nullptr;
+    if (screenDc) ReleaseDC(nullptr, screenDc);
+    if (g_dragGhost.dc) {
+        BITMAPINFO bmi{};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = size;
+        bmi.bmiHeader.biHeight = -size;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        g_dragGhost.dib = CreateDIBSection(g_dragGhost.dc, &bmi,
+                                           DIB_RGB_COLORS, &g_dragGhost.bits,
+                                           nullptr, 0);
+    }
+    if (!g_dragGhost.dib) {
+        FreeGhostContent();
+        return;
+    }
+    g_dragGhost.dibOld =
+        static_cast<HBITMAP>(SelectObject(g_dragGhost.dc, g_dragGhost.dib));
+
+    const float k = s.scale;
+    g_dragGhost.bmp = new Bitmap(size, size, PixelFormat32bppPARGB);
+    Graphics g(g_dragGhost.bmp);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+    const RectF iconRect(4.0f * k, 4.0f * k, 52.0f * k, 52.0f * k);
+    if (isFolder) {
+        DrawFolderIcon(g, s, *folderApps, iconRect, k);
+    } else {
+        DrawAppIcon(g, s, path, iconRect, k);
+    }
+
+    Gdiplus::Rect lockRect(0, 0, size, size);
+    BitmapData bd{};
+    if (g_dragGhost.bmp->LockBits(&lockRect, ImageLockModeRead,
+                                  PixelFormat32bppPARGB, &bd) == Ok) {
+        const auto* src = static_cast<const BYTE*>(bd.Scan0);
+        auto* dst = static_cast<BYTE*>(g_dragGhost.bits);
+        const size_t rowBytes = static_cast<size_t>(size) * 4u;
+        for (int y = 0; y < size; ++y) {
+            std::memcpy(dst + static_cast<size_t>(y) * rowBytes,
+                        src + static_cast<size_t>(y) *
+                                  static_cast<size_t>(bd.Stride),
+                        rowBytes);
+        }
+        g_dragGhost.bmp->UnlockBits(&bd);
+    }
+}
+
+void HideDragGhost();  // 定义在下方；UpdateDragGhost 先使用
+
+void UpdateDragGhost(AppState& s) {
+    if (!s.dragMoved) {
+        HideDragGhost();
+        return;
+    }
+    if (!(s.dragMode == AppState::DragMode::MainApp ||
+          s.dragMode == AppState::DragMode::FolderChild)) {
+        HideDragGhost();
+        return;
+    }
+    if (s.dragMode == AppState::DragMode::MainApp &&
+        (s.dragPage < 0 || s.dragSlot < 0 ||
+         s.dragPage >= static_cast<int>(s.pages.size()))) {
+        HideDragGhost();
+        return;
+    }
+    if (s.dragMode == AppState::DragMode::FolderChild &&
+        (s.folderPage < 0 || s.folderSlot < 0 ||
+         s.dragChild < 0 ||
+         s.folderPage >= static_cast<int>(s.pages.size()))) {
+        HideDragGhost();
+        return;
+    }
+
+    const std::wstring* path = nullptr;
+    const std::vector<std::wstring>* folderApps = nullptr;
+    bool isFolder = false;
+    if (s.dragMode == AppState::DragMode::MainApp) {
+        const AppEntry& entry = s.pages[s.dragPage].slots[s.dragSlot];
+        path = &entry.path;
+        isFolder = entry.type == 2;
+        if (isFolder) folderApps = &entry.folderApps;
+    } else {
+        const AppEntry& folder = s.pages[s.folderPage].slots[s.folderSlot];
+        if (folder.type == 2 &&
+            s.dragChild < static_cast<int>(folder.folderApps.size())) {
+            path = &folder.folderApps[s.dragChild];
+        }
+    }
+    if (!path || path->empty() || (isFolder && !folderApps)) {
+        HideDragGhost();
+        return;
+    }
+
+    const float k = s.scale;
+    const int size = static_cast<int>(std::ceil(60.0f * k));
+    if (!g_dragGhost.hwnd || g_dragGhost.size != size ||
+        g_dragGhost.path != *path || g_dragGhost.isFolder != isFolder) {
+        FreeGhostContent();
+        if (!g_dragGhost.hwnd) EnsureGhostWindow();
+        if (!g_dragGhost.hwnd) return;
+        g_dragGhost.size = size;
+        g_dragGhost.path = *path;
+        g_dragGhost.isFolder = isFolder;
+        RenderGhostContent(s, *path, isFolder, folderApps, size);
+        if (!g_dragGhost.dib) return;
+    }
+
+    POINT pt = s.lastCursor;
+    const int x = pt.x - size / 2;
+    const int y = pt.y - size / 2;
+    POINT ptDst{x, y};
+    POINT ptSrc{0, 0};
+    SIZE sz{size, size};
+    BLENDFUNCTION blend{};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+    HDC screenDc = GetDC(nullptr);
+    if (screenDc) {
+        UpdateLayeredWindow(g_dragGhost.hwnd, screenDc, &ptDst, &sz,
+                            g_dragGhost.dc, &ptSrc, 0, &blend, ULW_ALPHA);
+        ReleaseDC(nullptr, screenDc);
+    }
+    ShowWindow(g_dragGhost.hwnd, SW_SHOWNOACTIVATE);
+}
+
+void HideDragGhost() {
+    if (g_dragGhost.hwnd) ShowWindow(g_dragGhost.hwnd, SW_HIDE);
+}
+
 // ---------- 拖拽逻辑 ----------
 
 int HitMainAppSlot(const AppState& s, POINT client) {
@@ -1657,6 +2191,7 @@ void ResetDrag(AppState& s) {
     s.edgeHandled = false;
     s.edgeStart = 0;
     s.dragMoved = false;
+    HideDragGhost();  // 拖拽结束/捕获丢失：幽灵窗一起收
 }
 
 void HandleEdgeHold(AppState& s) {
@@ -1682,12 +2217,70 @@ void HandleEdgeHold(AppState& s) {
             StartPageAnimation(s, s.currentPage + 1);
         } else if (static_cast<int>(s.pages.size()) < kMaxPages) {
             s.pages.push_back(PageData{});
+            InvalidatePageCache(s); // 新增页
             StartPageAnimation(s, static_cast<int>(s.pages.size()) - 1);
         }
     } else if (side == -1 && s.currentPage > 0) {
         StartPageAnimation(s, s.currentPage - 1);
     }
     s.edgeHandled = true;
+}
+
+// ---------- 拖入 Dock 固定（跨组件：WM_COPYDATA 自定协议）----------
+// 与应用内排序拖动共用 MainApp 拖动流程：松手时若光标落在 Dock 栏
+// 区域内，则把该应用路径发给 Dock 固定为常驻应用（不再执行页内排序）。
+// 双方共用同一魔数（“DOCK”），Dock 侧见 dock_main.cpp。
+
+constexpr DWORD kDesktopDockPinMagic =
+    static_cast<DWORD>('D') | (static_cast<DWORD>('O') << 8) |
+    (static_cast<DWORD>('C') << 16) | (static_cast<DWORD>('K') << 24);
+
+HWND FindDockWindow() {
+    HWND found = nullptr;
+    EnumWindows(
+        [](HWND hwnd, LPARAM lp) -> BOOL {
+            wchar_t cls[64] = {};
+            GetClassNameW(hwnd, cls, 63);
+            if (wcscmp(cls, L"DesktopDockWindow") == 0) {
+                *reinterpret_cast<HWND*>(lp) = hwnd;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&found));
+    return found;
+}
+
+bool IsDropOverDock(POINT screenPt) {
+    HWND dock = FindDockWindow();
+    if (!dock) return false;
+    RECT rc{};
+    if (!GetWindowRect(dock, &rc)) return false;
+    return screenPt.x >= rc.left && screenPt.x < rc.right &&
+           screenPt.y >= rc.top && screenPt.y < rc.bottom;
+}
+
+// 拖动结束落在 Dock：发送固定请求，返回 true 表示已处理（放弃页内排序）
+bool TryDropToDock(AppState& s) {
+    if (!IsDropOverDock(s.lastCursor)) return false;
+    if (s.dragPage < 0 || s.dragSlot < 0 ||
+        s.dragPage >= static_cast<int>(s.pages.size()) ||
+        s.dragSlot >= kSlots) {
+        return false;
+    }
+    const AppEntry& entry = s.pages[s.dragPage].slots[s.dragSlot];
+    if (entry.type != 1 || entry.path.empty()) return false;  // 仅应用条目
+
+    HWND dock = FindDockWindow();
+    if (!dock) return false;
+    std::wstring path = entry.path;
+    COPYDATASTRUCT cds{};
+    cds.dwData = kDesktopDockPinMagic;
+    cds.cbData = static_cast<DWORD>((path.size() + 1) * sizeof(wchar_t));
+    cds.lpData = const_cast<wchar_t*>(path.c_str());
+    SendMessageW(dock, WM_COPYDATA, reinterpret_cast<WPARAM>(s.hwnd),
+                 reinterpret_cast<LPARAM>(&cds));
+    return true;
 }
 
 void DropMainDrag(AppState& s, POINT client) {
@@ -1786,6 +2379,11 @@ void OnLeftButtonDown(AppState& s, WPARAM wParam, LPARAM lParam) {
     s.dragMoved = false;
     GetCursorPos(&s.lastCursor);
 
+    if (s.gestureActive) {
+        EndGesture(s);  // 指针按下：终止进行中的双指手势
+        DrawLauncher(s);
+    }
+
     if (s.renamingFolder) {
         CommitFolderRename(s);
         return; // 本次点击只用于结束重命名
@@ -1821,6 +2419,7 @@ void OnLeftButtonDown(AppState& s, WPARAM wParam, LPARAM lParam) {
     if (IsInTopHandle(s, client)) {
         s.dragMode = AppState::DragMode::Widget;
         s.draggingWidget = true;
+        EnsureFastTimer(s);
         POINT cursor{};
         GetCursorPos(&cursor);
         s.widgetCursor = cursor;
@@ -1847,6 +2446,7 @@ void OnLeftButtonDown(AppState& s, WPARAM wParam, LPARAM lParam) {
         s.dragMode = AppState::DragMode::PageSwipe;
         s.swipeStartX = client.x;
         s.swipeLastX = client.x;
+        EnsureFastTimer(s);
         SetCapture(s.hwnd);
     }
 }
@@ -1878,6 +2478,7 @@ void OnMouseMove(AppState& s, WPARAM wParam, LPARAM lParam) {
             return; // 还没超过阈值，不显示拖动状态
         }
         HandleEdgeHold(s);
+        UpdateDragGhost(s);  // 幽灵窗跟随光标（离开启动台窗口仍可见）
         DrawLauncher(s);
         return;
     }
@@ -1886,6 +2487,7 @@ void OnMouseMove(AppState& s, WPARAM wParam, LPARAM lParam) {
         if (!s.dragMoved) {
             return;
         }
+        UpdateDragGhost(s);
         DrawLauncher(s);
         return;
     }
@@ -1921,6 +2523,14 @@ void OnLeftButtonUp(AppState& s, WPARAM wParam, LPARAM lParam) {
             OnClick(s, client);
             DrawLauncher(s);
         } else {
+            // 拖动结束：先判断是否落在 Dock 栏（固定为 Dock 常驻应用），
+            // 不是则按页内排序处理
+            if (TryDropToDock(s)) {
+                DrawLauncher(s);
+                ReleaseCapture();
+                ResetDrag(s);
+                return;
+            }
             DropMainDrag(s, client);
             DrawLauncher(s);
             ReleaseCapture();
@@ -1949,15 +2559,10 @@ void OnLeftButtonUp(AppState& s, WPARAM wParam, LPARAM lParam) {
 
     if (s.dragMode == AppState::DragMode::PageSwipe) {
         const int dx = client.x - s.swipeStartX;
-        if (s.dragMoved && std::abs(dx) > 45.0f * s.scale) {
-            const float startRatio = std::clamp(
-                std::abs(static_cast<float>(dx)) / static_cast<float>(s.width),
-                0.0f, 1.0f);
-            if (dx < 0 && s.currentPage < static_cast<int>(s.pages.size()) - 1) {
-                StartPageAnimation(s, s.currentPage + 1, startRatio);
-            } else if (dx > 0 && s.currentPage > 0) {
-                StartPageAnimation(s, s.currentPage - 1, startRatio);
-            }
+        if (s.dragMoved) {
+            // 与双指手势同一收尾：够阈值翻页吸附，否则从当前视觉偏移
+            // 动画回位（边界阻尼处不再是瞬间跳回居中）
+            SettlePageDrag(s, static_cast<float>(dx));
         } else {
             // 短按空白区域：不做任何事
         }
@@ -2106,6 +2711,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         DragAcceptFiles(hwnd, TRUE);
         SetTimer(hwnd, kDrawTimerId, kDrawIntervalMs, nullptr);
+        InstallWheelHook(hwnd); // 全局钩子：滚轮/双指滑动翻页（光标在组件上时）
         DrawLauncher(*s);
         return 0;
     }
@@ -2227,9 +2833,98 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         break;
 
+    case kGestureSettleMsg: {
+        // 手指抬起/手势被其他输入取代（钩子检测到光标移动/按键/垂直滚轮）：
+        // 立即结束手势（翻页/回弹），不等 kGestureEndMs 兜底超时。
+        // 若事件已恢复（停顿后继续滑动），gestureLastT 已刷新，跳过
+        if (!s || !s->gestureActive) return 0;
+        if (GetTickCount64() - s->gestureLastT <= kGestureQuietMs) return 0;
+        EndGesture(*s);
+        DrawLauncher(*s);
+        return 0;
+    }
+
+    case kPageWheelMsg: {
+        // 双指左右滑 = 滚轮驱动的"虚拟指针拖动"：与按住拖动（PageSwipe）
+        // 完全同一套跟手/判定逻辑。位移按系统滚动标定（一格≈48px@96DPI）
+        // 折算为像素，方向经 kGestureWheelDir 取反以匹配触控板实际符号。
+        // 文件夹打开/重命名中不响应
+        if (!s || s->folderOpen || s->renamingFolder) return 0;
+        const short delta = static_cast<short>(wParam);
+        if (delta == 0) return 0;
+
+        const float w = static_cast<float>(s->width);
+        const float dOffset = kGestureWheelDir *
+                              static_cast<float>(delta) / WHEEL_DELTA *
+                              kGesturePixelsPerWheel * s->scale;
+        const ULONGLONG now = GetTickCount64();
+
+        // 吸附/回位动画进行中收到新手势：无缝接管——以动画源页为基准，
+        // 把当前视觉进度折算为等效拖动位移（下一页动画=左滑、上一页=右滑、
+        // 同页回位=当前偏移），快速连续/反向滑动时页面自然衔接不跳变
+        if (s->pageAnimating) {
+            const float pVis = EaseOutCubic(s->animProgress);
+            float takeOver = 0.0f;
+            if (s->animToPage > s->animFromPage) {
+                takeOver = -pVis * w;   // 下一页从右侧进入 = 左滑
+            } else if (s->animToPage < s->animFromPage) {
+                takeOver = pVis * w;    // 上一页从左侧进入 = 右滑
+            } else {
+                // 同页回位：当前视觉偏移。若回位发生在边界页（绘制会施加
+                // kEdgeDamping 阻尼），需折算回未阻尼位移，接管瞬间画面才连续
+                takeOver = s->returnFromOffset * (1.0f - pVis);
+                const bool hasNext = s->animFromPage + 1 <
+                                     static_cast<int>(s->pages.size());
+                const bool hasPrev = s->animFromPage > 0;
+                const bool damped = (takeOver < 0 && !hasNext) ||
+                                    (takeOver > 0 && !hasPrev);
+                if (damped) takeOver /= kEdgeDamping;
+            }
+            s->currentPage = s->animFromPage;
+            s->pageAnimating = false;
+            s->gestureActive = true;
+            s->gestureOffset = takeOver;
+        }
+
+        s->gestureActive = true;
+        s->gestureOffset += dOffset;
+        // 限制最大位移（边界阻尼 + 防止快速甩动失控）
+        const float limit = w * 1.15f;
+        s->gestureOffset = std::clamp(s->gestureOffset, -limit, limit);
+        s->gestureLastT = now;
+
+        // 与按住拖动同一渲染路径：事件到达即同步重绘，页面紧贴手指移动
+        // （此前仅靠 WM_TIMER 重绘，而定时器是低优先级消息，会被持续涌入
+        // 的手势事件饿死，导致动画一帧一卡）。事件爆发时按
+        // kMinGesturePaintMs 节流，被跳过的帧由 WM_TIMER 兜底补绘。
+        if (now - s->gesturePaintT >= kMinGesturePaintMs) {
+            s->gesturePaintT = now;
+            s->gesturePaintPending = false;
+            DrawLauncher(*s);
+        } else {
+            s->gesturePaintPending = true;
+        }
+        EnsureFastTimer(*s);
+        return 0;
+    }
+
     case WM_TIMER:
         if (!s) return 0;
         if (wParam == kDrawTimerId) {
+            // 自适应频率省电：动画/交互中保持快定时器（60fps），
+            // 空闲时降到 kIdlePollMs 低频轮询，避免定时器 60fps 空转
+            const bool animating =
+                s->renamingFolder || s->pageAnimating ||
+                s->dragMode != AppState::DragMode::None ||
+                s->pressPhase != AppState::PressPhase::None ||
+                s->gestureActive;
+            if (!animating && !s->dirty) {
+                SetTimer(hwnd, kDrawTimerId, kIdlePollMs, nullptr);
+                return 0;
+            }
+            if (animating) {
+                SetTimer(hwnd, kDrawTimerId, kDrawIntervalMs, nullptr);
+            }
             if (s->renamingFolder) {
                 // 光标闪烁和输入回显
                 DrawLauncher(*s);
@@ -2250,6 +2945,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (s->pressPhase != AppState::PressPhase::None &&
                        UpdatePressAnim(*s)) {
                 DrawLauncher(*s);
+            } else if (s->gestureActive) {
+                // 双指手势帧：跟手重绘已在事件路径同步完成，定时器只兜底——
+                // ① 补绘事件节流期间被跳过的帧；② 事件停顿超时结束手势
+                if (s->gesturePaintPending) {
+                    s->gesturePaintPending = false;
+                    s->gesturePaintT = GetTickCount64();
+                    DrawLauncher(*s);
+                }
+                if (GetTickCount64() - s->gestureLastT > kGestureEndMs) {
+                    EndGesture(*s);
+                    DrawLauncher(*s); // 回位当前页 / 翻页吸附动画首帧
+                }
             } else if (s->dirty) {
                 s->dirty = false;
                 DrawLauncher(*s);
@@ -2281,6 +2988,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_DESTROY:
         KillTimer(hwnd, kDrawTimerId);
+        UninstallWheelHook();
         SavePosition(hwnd);
         if (s && s->renamingFolder) {
             CommitFolderRename(*s);

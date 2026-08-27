@@ -111,11 +111,18 @@ constexpr ULONGLONG kLaunchBounceMs = 3600;    // 启动弹跳超时
 constexpr ULONGLONG kTrayTriggerWindowMs = 2200;  // 托盘图标触发：任务栏临时可见窗口
 constexpr int kMenuBaseId = 4000;
 constexpr int kMenuExit = 1001;
+constexpr int kMenuToggleAutoCollapse = 1002;  // 空白区右键：自动收起开关
+constexpr int kDockStripHeightLogical = 2;     // 展开触发条高度（逻辑像素，与 Dock 同宽）
 
 // 事件驱动消息（WinEvent 回调/注册表监听线程 → 主窗口）
 constexpr UINT kMsgRefresh = WM_APP + 1;   // 窗口集合/托盘状态可能变化，合并刷新
 constexpr UINT kMsgHeal = WM_APP + 2;      // 套件组件被最小化，立即恢复
 constexpr UINT kMsgTriggerDone = WM_APP + 3;  // 托盘触发完成（worker → 主窗口收尾）
+
+// 启动台拖入固定（WM_COPYDATA 自定协议）：“DOCK” 魔数，lpData = UTF-16 路径
+constexpr DWORD kDesktopDockPinMagic =
+    static_cast<DWORD>('D') | (static_cast<DWORD>('O') << 8) |
+    (static_cast<DWORD>('C') << 16) | (static_cast<DWORD>('K') << 24);
 
 // 自家套件组件（顶栏/挂件等同样注册了托盘图标）永不进入 Dock。
 // 注意 DesktopLauncher（启动台）不在此列：它是用户可固定的正常应用
@@ -221,6 +228,10 @@ struct AppState {
     std::unordered_set<std::wstring> runningExeCache;  // 进程路径集合缓存（省全进程枚举）
     ULONGLONG runningExeCacheAt = 0;
     bool needsRedraw = true;
+    bool autoCollapse = true;     // 自动收起开关（右键菜单，注册表持久化）
+    bool hideRequested = false;   // 收起目标态（光标离开 Dock / 触碰下缘触发条）
+    float collapseOffset = 0;     // 当前收起偏移（0=展开，winH=完全滑出屏幕底）
+    bool menuOpen = false;        // 右键菜单打开期间不收起
     Font* uiFont = nullptr;
 
     MenuEntry menu[512];
@@ -487,6 +498,7 @@ void LoadConfig(AppState& s, bool* existed) {
                                       static_cast<DWORD>(kBottomGapBase)));
     // 旧版本默认 6（悬空）→ 新版本默认 0（贴底），迁移历史配置
     if (s.bottomGapBase == 6) s.bottomGapBase = 0;
+    s.autoCollapse = ReadRegDword(key, L"AutoCollapse", 1) != 0;
     RegCloseKey(key);
     Logf(L"配置载入：固定 %zu 项，隐藏 %zu 项", s.pins.size(),
          s.hiddenKeys.size());
@@ -525,6 +537,10 @@ void SaveConfig(AppState& s) {
     const DWORD gap = static_cast<DWORD>(s.bottomGapBase);
     RegSetValueExW(key, L"BottomGap", 0, REG_DWORD,
                    reinterpret_cast<const BYTE*>(&gap), sizeof(gap));
+    const DWORD autoCollapse = s.autoCollapse ? 1 : 0;
+    RegSetValueExW(key, L"AutoCollapse", 0, REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&autoCollapse),
+                   sizeof(autoCollapse));
     RegCloseKey(key);
 }
 
@@ -1185,10 +1201,13 @@ void EnsureTaskbarHidden(AppState& s) {
     }
 }
 
-// ============================== 显示桌面（右下角隐形按钮 + Win+D 自愈）==============================
-// Dock 常驻时任务栏隐藏，屏幕右下角让位给“显示桌面”语义：此处放一块与
-// Windows 显示桌面按钮尺寸完全一致（本机 150% DPI 实测 18×72，逻辑 12×48）
-// 的完全隐形点击区，点击 = Windows 的显示桌面（再点恢复）。
+// ============================== 显示桌面（右下角）+ 开始菜单（左下角）==============================
+// Dock 常驻时任务栏隐藏，屏幕两角让位给 Windows 系统按钮语义：
+//   右下角：显示桌面隐形按钮（与 Windows 显示桌面按钮同尺寸 12×48 逻辑像素），
+//            点击 = Windows 的显示桌面（再点恢复）；
+//   左下角：开始按钮隐形按钮（同尺寸），点击 = 触发 Win 键（打开/切换开始菜单），
+//            等价于 Windows 开始按钮。
+// 两者均由 WH_MOUSE_LL 低层鼠标钩子识别并吞掉点击，零窗口零像素遮挡，完全隐形。
 //
 // 关于系统 Win+D 与“组件被最小化”：
 // 早期版本任务栏可见时，系统 Show Desktop 只最小化任务栏窗口，套件组件
@@ -1199,12 +1218,34 @@ void EnsureTaskbarHidden(AppState& s) {
 // 对用户可见的闪烁 ≤1 帧；普通应用窗口维持系统 Show Desktop 的原生行为。
 // 右下角隐形按钮走自家 ToggleShowDesktop（显式排除套件组件，零窗口零像素）。
 
-constexpr int kShowDesktopWLogical = 12;  // Windows 显示桌面按钮宽（逻辑像素）
-constexpr int kShowDesktopHLogical = 48;  // Windows 显示桌面按钮高（逻辑像素）
+constexpr int kShowDesktopWLogical = 12;  // 隐形按钮宽（逻辑像素，与 Windows 按钮一致）
+constexpr int kShowDesktopHLogical = 48;  // 隐形按钮高（逻辑像素，与 Windows 按钮一致）
 
 HHOOK g_showDesktopHook = nullptr;
 std::vector<HWND> g_showDesktopMinimized;  // 本次显示桌面最小化的窗口（再点恢复）
 bool g_showDesktopActive = false;          // 显示桌面状态（true=再点恢复）
+
+// 屏幕角部点击区（主屏物理坐标；尺寸随 DPI 缩放，与 Windows 按钮一致）
+bool InCornerZone(POINT pt, bool left) {
+    const int w = MulDiv(kShowDesktopWLogical, g_state.dpi, 96);
+    const int h = MulDiv(kShowDesktopHLogical, g_state.dpi, 96);
+    const int sw = GetSystemMetrics(SM_CXSCREEN);
+    const int sh = GetSystemMetrics(SM_CYSCREEN);
+    if (pt.y < sh - h || pt.y >= sh) return false;
+    if (left) return pt.x >= 0 && pt.x < w;
+    return pt.x >= sw - w && pt.x < sw;
+}
+
+// 触发 Win 键（干净的一下：按下+弹起，等同系统开始按钮），打开/切换开始菜单
+void TriggerWinKey() {
+    INPUT in[2]{};
+    in[0].type = INPUT_KEYBOARD;
+    in[0].ki.wVk = VK_LWIN;
+    in[1].type = INPUT_KEYBOARD;
+    in[1].ki.wVk = VK_LWIN;
+    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, in, sizeof(INPUT));
+}
 
 // 套件组件顶层窗口（自愈缓存：Win+D 被最小化时立即恢复）
 // 类名与各组件源码一致；MyWigetsTrayWindow 通常隐藏，不影响判断
@@ -1260,15 +1301,6 @@ bool IsOwnSuitePid(DWORD pid) {
     return false;
 }
 
-// 右下角点击区（主屏物理坐标；尺寸随 DPI 缩放，与 Windows 按钮一致）
-bool InShowDesktopZone(POINT pt) {
-    const int w = MulDiv(kShowDesktopWLogical, g_state.dpi, 96);
-    const int h = MulDiv(kShowDesktopHLogical, g_state.dpi, 96);
-    const int sw = GetSystemMetrics(SM_CXSCREEN);
-    const int sh = GetSystemMetrics(SM_CYSCREEN);
-    return pt.x >= sw - w && pt.x < sw && pt.y >= sh - h && pt.y < sh;
-}
-
 // 显示桌面：最小化除桌面/系统/套件组件外的全部可见顶层窗口；
 // 处于显示桌面状态时再次调用则恢复上次最小化的窗口（与 Windows 一致）
 void ToggleShowDesktop() {
@@ -1315,11 +1347,33 @@ void ToggleShowDesktop() {
     Logf(L"显示桌面：最小化 %zu 个窗口", g_showDesktopMinimized.size());
 }
 
+// 展开触发条：与 Dock 栏同宽（含当前呈现宽度）、高 2px（随 DPI）的
+// 屏幕下边缘区域；光标触碰即从收起状态升起
+bool InDockStrip(POINT pt) {
+    const int h = MulDiv(kDockStripHeightLogical, g_state.dpi, 96);
+    const int sh = GetSystemMetrics(SM_CYSCREEN);
+    if (pt.y < sh - h || pt.y >= sh) return false;
+    return pt.x >= g_state.winX && pt.x < g_state.winX + g_state.winW;
+}
+
 LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION) {
         auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
-        if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP) {
-            if (InShowDesktopZone(ms->pt)) {
+        if (wParam == WM_MOUSEMOVE) {
+            // 自动收起：收起态下光标触碰屏幕下缘触发条（与 Dock 同宽 2px 高）
+            // → 请求展开；展开态光标也不会因贴底而误切（无状态变化）
+            if (g_state.autoCollapse && g_state.hideRequested &&
+                InDockStrip(ms->pt)) {
+                g_state.hideRequested = false;
+            }
+        } else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP) {
+            if (InCornerZone(ms->pt, true)) {
+                // 左下角：仿 Windows 开始按钮 —— 触发 Win 键（打开开始菜单）
+                if (wParam == WM_LBUTTONDOWN) TriggerWinKey();
+                return 1;  // 吞掉：点击不穿透到下方窗口
+            }
+            if (InCornerZone(ms->pt, false)) {
+                // 右下角：显示桌面（再点恢复）
                 if (wParam == WM_LBUTTONDOWN) ToggleShowDesktop();
                 return 1;  // 吞掉：点击不穿透到下方窗口
             }
@@ -1768,7 +1822,7 @@ void PresentSurface(AppState& s) {
 
     // ULW 同时应用位置与尺寸：悬停放大的展宽/收窄和底部居中都在这一步完成，
     // 不需要 SetWindowPos（全透明像素自动点击穿透，多出的缓冲区不参与呈现）
-    POINT ptDst{s.winX, s.winY};
+    POINT ptDst{s.winX, s.winY + static_cast<int>(s.collapseOffset + 0.5f)};
     POINT ptSrc{0, 0};
     SIZE size{presentW, s.winH};
     BLENDFUNCTION blend{};
@@ -2824,6 +2878,37 @@ void HideTrayItem(AppState& s, const DockItem& item) {
     s.needsRedraw = true;
 }
 
+// 固定一个应用（资源管理器拖入 WM_DROPFILES / 启动台拖入 WM_COPYDATA）：
+// 校验 .exe/.lnk、解析描述、去重、入库 + 保存 + 刷新布局。
+// 返回 true = 已新增固定。
+bool PinPathIfNew(AppState& s, const std::wstring& path) {
+    const std::wstring lower = ToLower(path);
+    const bool acceptable =
+        lower.size() > 4 &&
+        (lower.rfind(L".exe") == lower.size() - 4 ||
+         lower.rfind(L".lnk") == lower.size() - 4);
+    if (!acceptable) return false;
+    const PinDescriptor d = DescribePin(path);
+    for (const auto& existing : s.pins) {
+        if (DescribePin(existing).key == d.key) {
+            Logf(L"固定请求重复：%ls", path.c_str());
+            return false;  // 已固定
+        }
+    }
+    if (s.pins.size() >= 120) {
+        Logf(L"固定失败（上限 120）：%ls", path.c_str());
+        return false;
+    }
+    s.pins.push_back(path);
+    ClearPinCache();
+    SaveConfig(s);
+    RefreshItems(s);
+    EnsureWindowSize(s);
+    RepositionDock(s, true);
+    Logf(L"固定：%ls", path.c_str());
+    return true;
+}
+
 // ============================== 右键菜单 ==============================
 
 void ResetMenuEntries(AppState& s) {
@@ -2911,11 +2996,13 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
     POINT pt{};
     GetCursorPos(&pt);
     SetForegroundWindow(s.hwnd);
+    s.menuOpen = true;  // 菜单期间保持展开（避免光标移至菜单即被收起）
     const int cmd = TrackPopupMenu(menu,
                                    TPM_RETURNCMD | TPM_RIGHTBUTTON |
                                        TPM_NONOTIFY | TPM_LEFTALIGN |
                                        TPM_BOTTOMALIGN,
                                    pt.x, pt.y, 0, s.hwnd, nullptr);
+    s.menuOpen = false;
     PostMessageW(s.hwnd, WM_NULL, 0, 0);
     DestroyMenu(menu);
     if (cmd < kMenuBaseId || cmd - kMenuBaseId >= s.menuCount) return;
@@ -2964,18 +3051,30 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
 void ShowBlankContextMenu(AppState& s) {
     ResetMenuEntries(s);
     HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu,
+                MF_STRING | (s.autoCollapse ? MF_CHECKED : MF_UNCHECKED),
+                kMenuToggleAutoCollapse,
+                L"自动收起（光标离开收到底部，触碰下缘展开）");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuExit, L"退出桌面 Dock");
 
     POINT pt{};
     GetCursorPos(&pt);
     SetForegroundWindow(s.hwnd);
+    s.menuOpen = true;  // 菜单期间保持展开
     const int cmd = TrackPopupMenu(menu,
                                    TPM_RETURNCMD | TPM_RIGHTBUTTON |
                                        TPM_NONOTIFY | TPM_LEFTALIGN,
                                    pt.x, pt.y, 0, s.hwnd, nullptr);
+    s.menuOpen = false;
     PostMessageW(s.hwnd, WM_NULL, 0, 0);
     DestroyMenu(menu);
-    if (cmd == kMenuExit) {
+    if (cmd == kMenuToggleAutoCollapse) {
+        s.autoCollapse = !s.autoCollapse;
+        if (!s.autoCollapse) s.hideRequested = false;  // 关闭即展开
+        SaveConfig(s);
+        Logf(s.autoCollapse ? L"自动收起：开启" : L"自动收起：关闭");
+    } else if (cmd == kMenuExit) {
         Logf(L"用户请求退出");
         DestroyWindow(s.hwnd);
     }
@@ -3011,6 +3110,21 @@ void FrameTick(AppState& s) {
     s.frameCounter++;
     HealMinimizedSuiteWindows();  // 保底（事件路径之外的兜底检查）
 
+    // 自动收起动画：收起 = 窗口向下滑出屏幕底边，展开 = 从屏幕底边升起
+    // （缓动收敛；菜单打开期间保持展开以便操作）
+    {
+        const float target =
+            (s.autoCollapse && s.hideRequested && !s.menuOpen)
+                ? static_cast<float>(s.winH)
+                : 0.f;
+        const float cur = s.collapseOffset;
+        const float next = cur + (target - cur) * 0.22f;
+        s.collapseOffset =
+            (std::fabs(target - next) < 0.5f) ? target : next;
+    }
+    const bool collapseAnimating =
+        s.collapseOffset != 0.f && s.collapseOffset != static_cast<float>(s.winH);
+
     const bool animating = UpdateLayoutOneFrame(s);
     const std::string sig = MakeSignature(s);
     const bool structureChanged = sig != s.lastSignature;
@@ -3018,13 +3132,14 @@ void FrameTick(AppState& s) {
 
     if (structureChanged) s.needsRedraw = true;
 
-    // 悬停期间持续重绘（提示出现时机也在每帧检查）；空闲时零重绘
-    if (s.needsRedraw || animating) {
+    // 悬停/收起动画期间持续重绘；空闲时零重绘
+    if (s.needsRedraw || animating || collapseAnimating) {
         DrawAndPresent(s);
     }
 
-    // 空闲即停帧：动画收敛/鼠标离开/无弹跳 → 停止定时器（零唤醒）
-    SetFrameCadence(s, animating || s.mouseInside || !s.pendingLaunches.empty());
+    // 空闲即停帧：动画/收起动画/悬停/弹跳 → 快帧，全停 → 停止定时器
+    SetFrameCadence(s, animating || collapseAnimating || s.mouseInside ||
+                          !s.pendingLaunches.empty());
 }
 
 // ============================== 窗口过程 ==============================
@@ -3076,6 +3191,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             s->mouseY = -100000.f;
             s->hoverIndex = static_cast<size_t>(-1);
             s->needsRedraw = true;
+            // 自动收起：光标离开 Dock 栏 → 滑出屏幕底边（触发条触碰可再升起）
+            if (s->autoCollapse) s->hideRequested = true;
             return 0;
 
         case WM_LBUTTONDOWN: {
@@ -3121,36 +3238,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (DragQueryFileW(drop, i, path, MAX_PATH * 2 - 1) == 0) {
                     continue;
                 }
-                std::wstring lower = ToLower(path);
-                const bool acceptable =
-                    lower.size() > 4 &&
-                    (lower.rfind(L".exe") == lower.size() - 4 ||
-                     lower.rfind(L".lnk") == lower.size() - 4);
-                if (!acceptable) continue;
-                PinDescriptor d = DescribePin(path);
-                bool dup = false;
-                for (const auto& existing : s->pins) {
-                    PinDescriptor e = DescribePin(existing);
-                    if (e.key == d.key) {
-                        dup = true;
-                        break;
-                    }
-                }
-                if (!dup && s->pins.size() < 120) {
-                    s->pins.push_back(path);
-                    ++added;
-                    Logf(L"拖入固定：%ls", path);
-                }
+                if (PinPathIfNew(*s, path)) ++added;
             }
             DragFinish(drop);
-            if (added > 0) {
-                ClearPinCache();
-                SaveConfig(*s);
-                RefreshItems(*s);
-                EnsureWindowSize(*s);
-                RepositionDock(*s, true);
-            }
+            if (added > 0) s->needsRedraw = true;
             return 0;
+        }
+
+        // 启动台拖入固定：lpData = UTF-16 路径（见 launcher_main.cpp 协议）
+        case WM_COPYDATA: {
+            auto* cds = reinterpret_cast<COPYDATASTRUCT*>(lParam);
+            if (cds && cds->dwData == kDesktopDockPinMagic && cds->lpData &&
+                cds->cbData >= sizeof(wchar_t)) {
+                std::wstring path(
+                    reinterpret_cast<const wchar_t*>(cds->lpData),
+                    cds->cbData / sizeof(wchar_t));
+                while (!path.empty() && path.back() == L'\0') {
+                    path.pop_back();
+                }
+                if (!path.empty() && PinPathIfNew(*s, path)) {
+                    Logf(L"启动台拖入固定：%ls", path.c_str());
+                    return TRUE;
+                }
+            }
+            return FALSE;
         }
 
         case WM_TIMER:
