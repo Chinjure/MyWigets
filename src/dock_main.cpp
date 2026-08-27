@@ -45,6 +45,7 @@
 #include <gdiplus.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -263,7 +264,7 @@ struct AppState {
     bool autoCollapse = true;     // 自动收起开关（右键菜单，注册表持久化）
     bool hideRequested = false;   // 收起目标态（光标离开 Dock / 触碰下缘触发条）
     float collapseOffset = 0;     // 当前收起偏移（0=展开，winH=完全滑出屏幕底）
-    bool menuOpen = false;        // 右键菜单打开期间不收起
+    std::atomic<bool> menuOpen{false};  // 右键菜单打开期间不收起（低层钩子线程也会读取）
     bool mouseOverDock = false;   // 悬停真值（LL 钩子按光标物理位置维护）
     bool wasOnDock = false;       // 钩子：上一拍光标是否在有效交互区（状态迁移）
     Font* uiFont = nullptr;
@@ -1528,7 +1529,7 @@ void RequestCloseByIndex(AppState& s, size_t idx);  // 中键关闭 + 立即隐�
 // 屏幕下边缘区域；光标触碰即从收起状态升起
 bool InDockStrip(POINT pt) {
     const int h = MulDiv(kDockStripHeightLogical, g_state.dpi, 96);
-    const int bottom = PrimaryWorkArea().bottom;
+    const int bottom = g_primaryWorkArea.bottom;
     // 含 bottom 这一行：物理屏幕最底像素/贴边时系统可能报 sh-1 或 sh，
     // 一律算 Dock 有效区，避免最低一列丢失悬停/点击。
     if (pt.y < bottom - h || pt.y > bottom) return false;
@@ -1539,16 +1540,17 @@ bool InDockStrip(POINT pt) {
 // 2px 高的屏幕下缘）。窗口矩形与屏幕底边之间有间隙/透明区，触发条位于
 // 其下——光标在这些区域（含渲染区下方边缘）都属于“在 Dock 上”
 bool PointInDockOrStrip(POINT pt) {
-    // 廉价早退：可命中区域的最高点 = 展开态窗口顶沿（底边-gap-winH）。
-    // 只用缓存工作区 + 纯算术，屏幕中上部的光标位置零系统调用直接返回；
-    // 收起态窗口顶沿更低、触发条贴屏幕底缘，均不高于该线。
-    const RECT wa = PrimaryWorkArea();
+    // 低层鼠标钩子运行在专用线程上，这里只用 UI 线程维护的缓存几何，
+    // 绝不调用 GetWindowRect / SystemParametersInfo 等可能等待 UI 线程的
+    // 函数——否则 UI 线程一旦阻塞，钩子线程也会被拖住，全局鼠标再次卡死。
+    const RECT wa = g_primaryWorkArea;
     const int gap = MulDiv(g_state.bottomGapBase, g_state.dpi, 96);
     if (pt.y < wa.bottom - gap - g_state.winH) return false;
     const int bottom = wa.bottom;
-    RECT wr{};
-    if (GetWindowRect(g_state.hwnd, &wr) && pt.x >= wr.left &&
-        pt.x < wr.right && pt.y >= wr.top && pt.y <= bottom) {
+    const int left = g_state.winX;
+    const int right = left + g_state.winW;
+    const int top = g_state.winY;
+    if (pt.x >= left && pt.x < right && pt.y >= top && pt.y <= bottom) {
         return true;
     }
     return InDockStrip(pt);
@@ -1562,6 +1564,13 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
     // kMsgHookMouse），以及成对吞掉 Dock 上的左键按下/抬起。
     if (code == HC_ACTION) {
         auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+
+        // 右键菜单（TrackPopupMenu）打开期间，低层钩子必须完全放行鼠标事件，
+        // 否则菜单项一旦落在 Dock 命中区内就会被 Dock 吞掉，导致菜单点了没反应。
+        if (g_state.menuOpen) {
+            return CallNextHookEx(nullptr, code, wParam, lParam);
+        }
+
         if (wParam == WM_MOUSEMOVE) {
             const bool onDock = PointInDockOrStrip(ms->pt);
             if (onDock != g_hookLastOnDock) {
@@ -1585,21 +1594,17 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
 
             // 只采集 Dock/透明底部空隙/贴底边缘的点击，动作由 UI 线程执行。
             if (wParam == WM_LBUTTONDOWN && PointInDockOrStrip(ms->pt)) {
-                RECT wr{};
-                if (GetWindowRect(g_state.hwnd, &wr)) {
-                    float mx = static_cast<float>(ms->pt.x - wr.left);
-                    float my = static_cast<float>(ms->pt.y - wr.top);
-                    // 空隙处于窗口矩形下方时，按最近有效边缘处理
-                    if (my >= static_cast<float>(g_state.winH)) {
-                        my = static_cast<float>(g_state.winH) - 1.f;
-                    }
-                    PostMessageW(
-                        g_state.hwnd, kMsgHookClick, kHookClickDockLeft,
-                        MAKELPARAM(static_cast<short>(mx),
-                                   static_cast<short>(my)));
-                    g_hookLeftDownOnDock = true;
-                    return 1;
+                float mx = static_cast<float>(ms->pt.x - g_state.winX);
+                float my = static_cast<float>(ms->pt.y - g_state.winY);
+                // 空隙处于窗口矩形下方时，按最近有效边缘处理
+                if (my >= static_cast<float>(g_state.winH)) {
+                    my = static_cast<float>(g_state.winH) - 1.f;
                 }
+                PostMessageW(
+                    g_state.hwnd, kMsgHookClick, kHookClickDockLeft,
+                    MAKELPARAM(static_cast<short>(mx), static_cast<short>(my)));
+                g_hookLeftDownOnDock = true;
+                return 1;
             }
 
             // 未在上面 return 的按下 = 不是 Dock/角部消费的按下：
@@ -1618,18 +1623,15 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
         } else if (wParam == WM_MBUTTONUP && PointInDockOrStrip(ms->pt)) {
             // 与窗口内中键一致：底部空隙/贴边也能中键关闭，并立即隐藏圆点。
             // 同样只采集，投递到 UI 线程后执行（避免钩子内做窗口管理）。
-            RECT wr{};
-            if (GetWindowRect(g_state.hwnd, &wr)) {
-                float mx = static_cast<float>(ms->pt.x - wr.left);
-                float my = static_cast<float>(ms->pt.y - wr.top);
-                if (my >= static_cast<float>(g_state.winH)) {
-                    my = static_cast<float>(g_state.winH) - 1.f;
-                }
-                PostMessageW(
-                    g_state.hwnd, kMsgHookClick, kHookClickDockMiddle,
-                    MAKELPARAM(static_cast<short>(mx), static_cast<short>(my)));
-                return 1;
+            float mx = static_cast<float>(ms->pt.x - g_state.winX);
+            float my = static_cast<float>(ms->pt.y - g_state.winY);
+            if (my >= static_cast<float>(g_state.winH)) {
+                my = static_cast<float>(g_state.winH) - 1.f;
             }
+            PostMessageW(
+                g_state.hwnd, kMsgHookClick, kHookClickDockMiddle,
+                MAKELPARAM(static_cast<short>(mx), static_cast<short>(my)));
+            return 1;
         }
     }
     return CallNextHookEx(nullptr, code, wParam, lParam);
