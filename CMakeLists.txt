@@ -17,6 +17,7 @@ add_executable(DesktopCalendar WIN32 src/calendar_main.cpp)
 add_executable(DesktopTopBar WIN32 src/topbar_main.cpp)
 add_executable(MyWigets WIN32 src/mywigets_main.cpp src/app.rc)
 add_executable(DesktopLauncher WIN32 src/launcher_main.cpp src/app.rc)
+add_executable(DesktopDock WIN32 src/dock_main.cpp)
 
 foreach(target IN ITEMS DesktopClock DesktopCalendar DesktopTopBar)
     target_compile_definitions(${target} PRIVATE
@@ -53,6 +54,7 @@ target_link_libraries(MyWigets PRIVATE
     user32
     advapi32
     shell32
+    gdi32
 )
 
 target_compile_definitions(DesktopLauncher PRIVATE
@@ -70,4 +72,30 @@ target_link_libraries(DesktopLauncher PRIVATE
     shell32
     comctl32
     ole32
+)
+
+# DesktopDock：类 macOS Dock 栏。
+# dwmapi：幽灵窗口（UWP cloak）判断；version：exe 文件描述 → 显示名；
+# uuid/ole32/shell32：IShellLink 解析 lnk、SHGetKnownFolderPath 展开托盘登记路径；
+# gdiplus：逐像素透明渲染与图标绘制；
+# uiautomationcore：Win11 XAML 托盘图标触发（UIA Invoke，托盘驻留应用唤醒）
+target_compile_definitions(DesktopDock PRIVATE
+    UNICODE
+    _UNICODE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+)
+
+target_link_libraries(DesktopDock PRIVATE
+    gdiplus
+    user32
+    gdi32
+    advapi32
+    shell32
+    ole32
+    uuid
+    version
+    dwmapi
+    uiautomationcore
+    oleaut32
 )
