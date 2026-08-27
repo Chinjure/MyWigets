@@ -216,7 +216,9 @@ chrome.windows.onRemoved.addListener((windowId) => {
 
 // ---- 保活与重启恢复 ----
 
-chrome.alarms.create('topbar-keepalive', { periodInMinutes: 0.25 });
+// 心跳间隔 60s（省电）：顶栏服务端接收超时 25s × 4 = 100s 才判失联，
+// 60s 心跳足以保活；相比原 15s 心跳，跨进程唤醒（Chrome SW + 顶栏）减少 4 倍。
+chrome.alarms.create('topbar-keepalive', { periodInMinutes: 1 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== 'topbar-keepalive') return;

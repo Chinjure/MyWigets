@@ -114,7 +114,7 @@ constexpr int kMenuBaseId = 4000;
 constexpr int kMenuExit = 1001;
 constexpr int kMenuToggleAutoCollapse = 1002;  // 空白区右键：自动收起开关
 constexpr int kDockStripHeightLogical = 2;     // 展开触发条高度（逻辑像素，与 Dock 同宽）
-constexpr UINT kIdleFrameMs = 100;             // 自动收起开启时的空闲帧节拍（防停帧冻结）
+constexpr UINT_PTR kTooltipTimerId = 4;        // 悬停提示一次性定时器（停帧模式下到期踢帧）
 
 // 事件驱动消息（WinEvent 回调/注册表监听线程 → 主窗口）
 constexpr UINT kMsgRefresh = WM_APP + 1;   // 窗口集合/托盘状态可能变化，合并刷新
@@ -223,7 +223,6 @@ struct AppState {
     ULONGLONG hoverSince = 0;
 
     std::vector<PendingLaunch> pendingLaunches;
-    int frameCounter = 0;
     int frameIntervalMs = kFrameIntervalMs;            // 当前定时器周期（0=停止）
     ULONGLONG lastPollTick = 0;                        // 上次全量轮询时刻
     bool refreshArmed = false;                         // 事件合并定时器已挂起
@@ -242,7 +241,7 @@ struct AppState {
     MenuEntry menu[512];
     int menuCount = 0;
 
-    std::string lastSignature;   // 内容签名，状态无变化时跳过重绘
+    uint64_t lastSignature = 0;  // 内容签名（FNV-1a），状态无变化时跳过重绘
 
     ULONGLONG taskbarShowUntil = 0;  // 托盘图标触发期间：任务栏临时可见的截止时刻
 };
@@ -1117,10 +1116,19 @@ void ForceForegroundWindow(HWND hwnd) {
     }
 }
 
+RECT g_primaryWorkArea{};  // 主屏工作区缓存：鼠标移动热路径（LL 钩子/每帧）零系统调用
+
+void RefreshPrimaryWorkArea() {
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &g_primaryWorkArea, 0);
+}
+
 RECT PrimaryWorkArea() {
-    RECT rc{};
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &rc, 0);
-    return rc;
+    // 惰性兜底：首次调用或异常失效时重查；正常由启动、SPI_SETWORKAREA
+    // 之后、WM_DPICHANGED/WM_DISPLAYCHANGE 与 DoPoll 保底刷新
+    if (g_primaryWorkArea.right <= g_primaryWorkArea.left) {
+        RefreshPrimaryWorkArea();
+    }
+    return g_primaryWorkArea;
 }
 
 // ============================== 任务栏控制 ==============================
@@ -1156,6 +1164,7 @@ void HideTaskbar() {
     // 注意不能带 SPIF_SENDCHANGE：广播 WM_SETTINGCHANGE 后 explorer
     // 会按任务栏占位重算工作区，把刚设置的全屏值覆盖回去
     SystemParametersInfoW(SPI_SETWORKAREA, 0, const_cast<RECT*>(&full), 0);
+    RefreshPrimaryWorkArea();  // 工作区已改为全屏，同步缓存
 }
 
 void ShowTaskbar() {
@@ -1202,6 +1211,7 @@ void EnsureTaskbarHidden(AppState& s) {
         const RECT full = VirtualScreenRect();
         SystemParametersInfoW(SPI_SETWORKAREA, 0,
                               const_cast<RECT*>(&full), 0);
+        RefreshPrimaryWorkArea();  // 工作区已改为全屏，同步缓存
         RepositionDock(s, true);  // 任务栏隐藏，dock 重新贴底
     }
 }
@@ -1373,11 +1383,14 @@ bool InDockStrip(POINT pt) {
 // 2px 高的屏幕下缘）。窗口矩形与屏幕底边之间有间隙/透明区，触发条位于
 // 其下——光标在这些区域（含渲染区下方边缘）都属于“在 Dock 上”
 bool PointInDockOrStrip(POINT pt) {
+    // 廉价早退：可命中区域的最高点 = 展开态窗口顶沿（底边-gap-winH）。
+    // 只用缓存工作区 + 纯算术，屏幕中上部的光标位置零系统调用直接返回；
+    // 收起态窗口顶沿更低、触发条贴屏幕底缘，均不高于该线。
+    const RECT wa = PrimaryWorkArea();
+    const int gap = MulDiv(g_state.bottomGapBase, g_state.dpi, 96);
+    if (pt.y < wa.bottom - gap - g_state.winH) return false;
+    const int bottom = wa.bottom;
     RECT wr{};
-    const int bottom = PrimaryWorkArea().bottom;
-    // 水平在 Dock 窗口范围内时，从窗口顶部一直到屏幕下边缘都算有效交互区，
-    // 包含窗口底部的透明边距以及 Dock 与屏幕下边缘之间的空隙。
-    // 同样用 <= bottom，把最底边一行也纳入。
     if (GetWindowRect(g_state.hwnd, &wr) && pt.x >= wr.left &&
         pt.x < wr.right && pt.y >= wr.top && pt.y <= bottom) {
         return true;
@@ -1413,6 +1426,8 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
                     if (topExit || leftExit || rightExit) {
                         g_state.hideRequested = true;
                         g_state.wasOnDock = false;  // 收起已触发；重进再置位
+                        // 空闲已停帧：收起动画从这里拿到第一帧
+                        SetFrameCadence(g_state, true);
                     }
                 }
             }
@@ -1836,20 +1851,29 @@ bool RefreshItems(AppState& s) {
     return changed;
 }
 
-// 内容签名：比较后不变则跳过重绘
-std::string MakeSignature(AppState& s) {
-    std::string sig;
-    sig.reserve(s.items.size() * 48 + 16);
-    char tmp[80] = {};
+// 内容签名（FNV-1a 64）：比较后不变则跳过重绘。零分配，可每帧调用；
+// 条目 key、固定/窗口/托盘标记、数量与固定数全部混入，任何内容变化
+// 都会改变签名。
+uint64_t MakeSignature(const AppState& s) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const void* data, size_t bytes) {
+        const auto* p = static_cast<const unsigned char*>(data);
+        for (size_t i = 0; i < bytes; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ull;
+        }
+    };
     for (const auto& it : s.items) {
-        for (wchar_t ch : it.key) sig.push_back(static_cast<char>(ch & 0xFFu));
-        snprintf(tmp, sizeof(tmp), "|%d%d%d;", it.pinned ? 1 : 0,
-                 it.hasWindow ? 1 : 0, it.trayMarked ? 1 : 0);
-        sig += tmp;
+        mix(it.key.data(), it.key.size() * sizeof(wchar_t));
+        const unsigned char flags =
+            static_cast<unsigned char>((it.pinned ? 1 : 0) |
+                                       (it.hasWindow ? 2 : 0) |
+                                       (it.trayMarked ? 4 : 0));
+        mix(&flags, 1);
     }
-    snprintf(tmp, sizeof(tmp), "n=%zu,pin=%zu", s.items.size(), s.pinCount);
-    sig += tmp;
-    return sig;
+    const size_t counts[2] = {s.items.size(), s.pinCount};
+    mix(counts, sizeof(counts));
+    return h;
 }
 
 // ============================== 绘图缓冲 ==============================
@@ -2182,6 +2206,10 @@ bool UpdateLayoutOneFrame(AppState& s) {
         s.hoverIndex = hoverIdx;
         s.hoverSince = GetTickCount64();
         s.needsRedraw = true;
+        // 悬停名称提示是时间驱动（480ms 后需要一帧绘制）。空闲已停帧，
+        // 用一次性定时器到期踢帧，替代“悬停期间持续跑帧”。
+        SetTimer(s.hwnd, kTooltipTimerId,
+                 static_cast<UINT>(kTooltipDelayMs), nullptr);
     }
 
     // 一次性布局自检日志（排查显示问题时对账：窗口宽 ↔ 首末槽位）
@@ -2193,7 +2221,10 @@ bool UpdateLayoutOneFrame(AppState& s) {
              s.geoms.front().icon.X, s.geoms.back().cx);
     }
 
-    return animLeft || s.mouseInside;
+    // 只返回槽位缓动是否仍在进行。悬停状态不再让每帧持续跑（空闲零
+    // 唤醒的关键）：悬停提示由 kTooltipTimerId 踢帧，悬停态变化本身
+    // 由鼠标事件踢帧。
+    return animLeft;
 }
 
 // ============================== 绘制 ==============================
@@ -2482,6 +2513,7 @@ void LaunchItem(AppState& s, size_t idx) {
          item.launchPath.c_str());
     s.pendingLaunches.push_back(PendingLaunch{item.key, GetTickCount64()});
     s.needsRedraw = true;
+    SetFrameCadence(s, true);  // 空闲已停帧：启动弹跳动画需要帧驱动
 }
 
 // 按 exe 镜像路径（归一化小写 key）匹配该应用的全部存活 pid
@@ -2982,6 +3014,7 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
 }
 
 void ToggleFocusOrLaunch(AppState& s, size_t idx) {
+    SetFrameCadence(s, true);  // 空闲已停帧：点击反馈（圆点/悬停态）需要帧
     if (idx >= s.items.size()) return;
     DockItem& item = s.items[idx];
 
@@ -3302,6 +3335,9 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
         default:
             break;
     }
+    // 空闲已停帧：菜单动作（固定/隐藏/关闭/自动收起切换）可能改变
+    // 布局或收起态，踢一帧完成重绘与后续动画
+    SetFrameCadence(s, true);
 }
 
 void ShowBlankContextMenu(AppState& s) {
@@ -3334,17 +3370,24 @@ void ShowBlankContextMenu(AppState& s) {
         Logf(L"用户请求退出");
         DestroyWindow(s.hwnd);
     }
+    // 空闲已停帧：菜单关闭/自动收起切换后的展开-收起动画需要帧驱动
+    SetFrameCadence(s, true);
 }
 
 // ============================== 主循环一帧 ==============================
 
-// 自适应定时器节奏：动画/悬停/启动弹跳期间 15ms；空闲时自动收起开启
-// 保持 100ms 节拍（防“停帧冻结”，动画/收起/展开永远有帧驱动），
-// 自动收起关闭时彻底停帧（零唤醒）
+// 收起目标偏移：0=展开；winH=完全滑出屏幕底（菜单打开期间保持展开）
+float CollapseTargetOf(const AppState& s) {
+    return (s.autoCollapse && s.hideRequested && !s.menuOpen)
+               ? static_cast<float>(s.winH)
+               : 0.f;
+}
+
+// 自适应定时器节奏：动画/启动弹跳/悬停期间 15ms；空闲彻底停帧（零唤醒）。
+// 帧驱动由事件路径负责重启：LL 钩子（进出场）、窗口鼠标消息、点击/启动、
+// 菜单动作、悬停提示定时器，另有 DoPoll 安全网兜底。
 void SetFrameCadence(AppState& s, bool fast) {
-    const UINT want =
-        fast ? kFrameIntervalMs
-             : (s.autoCollapse ? kIdleFrameMs : 0);  // 0 = 停止
+    const UINT want = fast ? kFrameIntervalMs : 0;  // 0 = 停止
     if (s.frameIntervalMs == static_cast<int>(want)) return;
     s.frameIntervalMs = static_cast<int>(want);
     if (want == 0) {
@@ -3362,20 +3405,24 @@ void DoPoll(AppState& s) {
     EnsureTaskbarHidden(s);        // explorer 重启重建任务栏后再次隐藏
     RefreshSuiteWindowCache();     // 组件可能重启/重建窗口，刷新自愈缓存
     HealMinimizedSuiteWindows();   // 保底（正常由 WinEvent 即时触发）
-    if (s.needsRedraw) DrawAndPresent(s);  // 无帧定时器时也立即重绘
+    RefreshPrimaryWorkArea();      // 保底刷新工作区缓存（分辨率/任务栏变化）
+    // 停帧安全网：收起偏移与目标不一致说明事件路径漏踢帧，重启帧驱动
+    if (s.collapseOffset != CollapseTargetOf(s)) SetFrameCadence(s, true);
+    if (s.needsRedraw) {
+        const bool animating =
+            UpdateLayoutOneFrame(s);  // 帧已停时几何缓存先对齐再画
+        DrawAndPresent(s);
+        if (animating) SetFrameCadence(s, true);  // 余下缓动交给帧驱动
+    }
 }
 
 void FrameTick(AppState& s) {
-    s.frameCounter++;
     HealMinimizedSuiteWindows();  // 保底（事件路径之外的兜底检查）
 
     // 自动收起动画：收起 = 窗口向下滑出屏幕底边，展开 = 从屏幕底边升起
     // （缓动收敛；菜单打开期间保持展开以便操作）
     {
-        const float target =
-            (s.autoCollapse && s.hideRequested && !s.menuOpen)
-                ? static_cast<float>(s.winH)
-                : 0.f;
+        const float target = CollapseTargetOf(s);
         const float cur = s.collapseOffset;
         const float next = cur + (target - cur) * 0.22f;
         s.collapseOffset =
@@ -3385,7 +3432,7 @@ void FrameTick(AppState& s) {
         s.collapseOffset != 0.f && s.collapseOffset != static_cast<float>(s.winH);
 
     const bool animating = UpdateLayoutOneFrame(s);
-    const std::string sig = MakeSignature(s);
+    const uint64_t sig = MakeSignature(s);
     const bool structureChanged = sig != s.lastSignature;
     if (structureChanged) s.lastSignature = sig;
 
@@ -3396,9 +3443,9 @@ void FrameTick(AppState& s) {
         DrawAndPresent(s);
     }
 
-    // 空闲即停帧（自动收起关闭时）；开启时保 100ms 节拍防冻结
-    SetFrameCadence(s, animating || collapseAnimating || s.mouseOverDock ||
-                          s.mouseInside || !s.pendingLaunches.empty());
+    // 动画/弹跳收敛后即停帧（零唤醒）；状态翻转由事件路径踢帧重启
+    SetFrameCadence(s, animating || collapseAnimating ||
+                           !s.pendingLaunches.empty());
 }
 
 // ============================== 窗口过程 ==============================
@@ -3452,6 +3499,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             s->mouseY = -100000.f;
             s->hoverIndex = static_cast<size_t>(-1);
             s->needsRedraw = true;
+            SetFrameCadence(*s, true);  // 空闲已停帧：离开也需要一帧完成擦除
             return 0;
 
         case WM_LBUTTONDOWN: {
@@ -3501,7 +3549,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (PinPathIfNew(*s, path)) ++added;
             }
             DragFinish(drop);
-            if (added > 0) s->needsRedraw = true;
+            if (added > 0) {
+                s->needsRedraw = true;
+                SetFrameCadence(*s, true);  // 空闲已停帧：新固定项需要重摆一帧
+            }
             return 0;
         }
 
@@ -3518,6 +3569,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 if (!path.empty() && PinPathIfNew(*s, path)) {
                     Logf(L"启动台拖入固定：%ls", path.c_str());
+                    SetFrameCadence(*s, true);  // 空闲已停帧：新固定项需要重摆一帧
                     return TRUE;
                 }
             }
@@ -3534,6 +3586,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 DoPoll(*s);
             } else if (wParam == kSafetyTimerId) {
                 DoPoll(*s);  // 事件失效保底（1 次/分钟）
+            } else if (wParam == kTooltipTimerId) {
+                // 悬停名称提示到期：踢一帧完成绘制
+                KillTimer(hwnd, kTooltipTimerId);
+                SetFrameCadence(*s, true);
             }
             return 0;
 
@@ -3584,17 +3640,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             s->scale = static_cast<float>(s->dpi) / 96.0f;
             delete s->uiFont;
             s->uiFont = nullptr;
+            RefreshPrimaryWorkArea();  // DPI 变化常伴随工作区物理尺寸变化
             EnsureWindowSize(*s);
             RepositionDock(*s, true);
             s->needsRedraw = true;
+            UpdateLayoutOneFrame(*s);  // 几何缓存与新尺寸对齐后再画
             DrawAndPresent(*s);
             return 0;
         }
 
         case WM_DISPLAYCHANGE:
+            RefreshPrimaryWorkArea();  // 分辨率变化 → 工作区变化
             EnsureWindowSize(*s);
             RepositionDock(*s, true);
             s->needsRedraw = true;
+            UpdateLayoutOneFrame(*s);
+            DrawAndPresent(*s);  // 空闲可能已停帧，直接完成重绘
             return 0;
 
         case WM_DESTROY:
@@ -3625,6 +3686,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     }
 
     EnableDpiAwareness();
+    RefreshPrimaryWorkArea();  // DPI 感知就绪后建立工作区缓存（后续热路径零系统调用）
 
     // Shell API（SHGetFileInfo 解析 .lnk / jumbo 图标）需要 STA COM
     HRESULT comInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);

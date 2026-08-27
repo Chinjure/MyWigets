@@ -1,7 +1,7 @@
 // DesktopClock - 类 macOS 桌面指针时钟
 //
 // 特性：
-//   1. 圆形指针式时钟，GDI+ 抗锯齿绘制，秒针每 50ms 按毫秒角度更新
+//   1. 圆形指针式时钟，GDI+ 抗锯齿绘制，秒针每秒跳秒更新（1Hz，低功耗）
 //   2. 分层窗口(WS_EX_LAYERED)实现逐像素透明
 //   3. WS_EX_NOACTIVATE + HWND_BOTTOM：始终停留在桌面层，不覆盖任何普通窗口，
 //      点击/拖动不会抢焦点，也不会出现在任务栏和 Alt-Tab 中
@@ -42,7 +42,7 @@ constexpr wchar_t kRegPath[] = L"Software\\DesktopClock";
 constexpr int kBaseSize = 220;          // 96 DPI 下的窗口边长
 constexpr int kDefaultMargin = 32;      // 默认距离工作区右上角的边距
 constexpr UINT kDrawTimerId = 1;
-constexpr UINT kDrawIntervalMs = 50;    // 20 fps，秒针平滑
+constexpr UINT kDrawIntervalMs = 1000;  // 1 Hz，秒针跳秒（低功耗：每秒仅重绘一次）
 
 constexpr int kMenuExit = 1001;
 constexpr float kPi = 3.14159265358979323846f;
@@ -341,11 +341,10 @@ void DrawClockFace(AppState& s) {
                      &hourNumberFormat, &hourNumberBrush);
     }
 
-    // ---- 指针角度：包含毫秒/秒/分钟分量，实现连续拨动 ----
+    // ---- 指针角度：秒针跳秒（吸附整秒刻度），分/时针含秒分量平滑推进 ----
     SYSTEMTIME st{};
     GetLocalTime(&st);
-    const float secondOfMinute = static_cast<float>(st.wSecond) +
-                                 static_cast<float>(st.wMilliseconds) / 1000.0f;
+    const float secondOfMinute = static_cast<float>(st.wSecond);
     const float minuteOfHour = static_cast<float>(st.wMinute) + secondOfMinute / 60.0f;
     const float hourOfDay = static_cast<float>(st.wHour % 12) + minuteOfHour / 60.0f;
 

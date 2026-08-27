@@ -122,9 +122,10 @@ constexpr int kMaxTargetRetry = 5;
 constexpr UINT_PTR kTabRefreshDebounceTimerId = 3;
 constexpr UINT kTabRefreshDebounceMs = 100;
 // 低频兜底自检（一次性，每次刷新后重置）：事件驱动正常时基本不触发，
-// 防止窗口事件丢失导致标签过期；无目标时停用（零轮询）
+// 防止窗口事件丢失导致标签过期；无目标时停用（零轮询）。
+// 10s 是功耗与兜底时延的折中（EnumWindows 全量枚举，频率越低越省电）
 constexpr UINT_PTR kSlowRefreshTimerId = 4;
-constexpr UINT kSlowRefreshMs = 5000;
+constexpr UINT kSlowRefreshMs = 10000;
 // 右键新建窗口后抢前台的失败重试次数（随挂起态短轮询触发，约每 200ms 一次）
 constexpr int kMaxPendingFocusAttempts = 5;
 
@@ -137,9 +138,11 @@ constexpr int kChromeSyncPort = 9786;
 constexpr UINT kChromeSyncMsg = WM_APP + 10;
 // 扩展连接/断开状态通知（wParam = 1 连接 / 0 断开）
 constexpr UINT kChromeSyncStateMsg = WM_APP + 11;
-// 客户端 socket 接收超时：空闲时发 ping 探活，连续超时则断开
+// 客户端 socket 接收超时：空闲时发 ping 探活，连续超时则断开。
+// 阈值必须大于扩展心跳间隔（60s）：4 × 25s = 100s 才判失联，
+// 扩展每 60s ping 一次时不会误断，同时把失联检测从 50s 放宽到 100s
 constexpr int kChromeSyncRecvTimeoutMs = 25000;
-constexpr int kChromeSyncMaxIdleTimeouts = 2;
+constexpr int kChromeSyncMaxIdleTimeouts = 4;
 // 握手阶段读取超时（5s）与请求头上限（8KB）
 constexpr int kChromeSyncHandshakeTimeoutMs = 5000;
 constexpr size_t kChromeSyncMaxHeaderBytes = 8192;
@@ -1449,7 +1452,7 @@ bool RefreshTabs(AppState& s) {
 
     // 定时器状态维护：
     // - 挂起态（右键新建窗口待插入 / 抢前台重试）保持 200ms 短轮询，结束即停
-    // - 有目标时保持 5s 低频兜底自检（一次性，每次刷新重置，
+    // - 有目标时保持 10s 低频兜底自检（一次性，每次刷新重置，
     //   事件驱动正常时基本不触发，仅防窗口事件丢失）；无目标时零轮询
     if (s.insertPending) {
         // 新窗口长时间未出现（启动失败等）：超时放弃，避免短轮询常驻
@@ -2601,7 +2604,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         s->scale = static_cast<float>(s->dpi) / 96.0f;
         InstallVolumeHook(hwnd); // 常驻全局钩子：显式点击/Alt+Tab 检测 + 面板外点击收起
         // 标签刷新不设常驻定时器：WinEvent 事件驱动（见 WinEventProc），
-        // 仅挂起态（新建窗口/抢前台）启用 200ms 短轮询、静止时 5s 低频兜底
+        // 仅挂起态（新建窗口/抢前台）启用 200ms 短轮询、静止时 10s 低频兜底
         ChromeSyncStart(hwnd);   // Chrome 标签同步服务端（扩展连接用）
         return 0;
     }

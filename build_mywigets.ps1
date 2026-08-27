@@ -51,7 +51,7 @@ if ($Configuration -eq 'Release') {
     $optim = '/Od /MTd /Zi'
 }
 
-$clLine = "cl /nologo /std:c++17 /EHsc $optim /W4 /permissive- /utf-8 $defs /Fe:`"$exe`" `"$src`" `"$res`" /link /SUBSYSTEM:WINDOWS user32.lib advapi32.lib shell32.lib"
+$clLine = "cl /nologo /std:c++17 /EHsc $optim /W4 /permissive- /utf-8 $defs /Fe:`"$exe`" `"$src`" `"$res`" /link /SUBSYSTEM:WINDOWS user32.lib advapi32.lib shell32.lib gdi32.lib"
 
 $bat = Join-Path $env:TEMP 'mywigets_build.bat'
 $lines = @('@echo off', 'setlocal')
