@@ -113,6 +113,7 @@ constexpr int kMenuBaseId = 4000;
 constexpr int kMenuExit = 1001;
 constexpr int kMenuToggleAutoCollapse = 1002;  // 空白区右键：自动收起开关
 constexpr int kDockStripHeightLogical = 2;     // 展开触发条高度（逻辑像素，与 Dock 同宽）
+constexpr UINT kIdleFrameMs = 100;             // 自动收起开启时的空闲帧节拍（防停帧冻结）
 
 // 事件驱动消息（WinEvent 回调/注册表监听线程 → 主窗口）
 constexpr UINT kMsgRefresh = WM_APP + 1;   // 窗口集合/托盘状态可能变化，合并刷新
@@ -232,6 +233,8 @@ struct AppState {
     bool hideRequested = false;   // 收起目标态（光标离开 Dock / 触碰下缘触发条）
     float collapseOffset = 0;     // 当前收起偏移（0=展开，winH=完全滑出屏幕底）
     bool menuOpen = false;        // 右键菜单打开期间不收起
+    bool mouseOverDock = false;   // 悬停真值（LL 钩子按光标物理位置维护）
+    bool wasOnDock = false;       // 钩子：上一拍光标是否在有效交互区（状态迁移）
     Font* uiFont = nullptr;
 
     MenuEntry menu[512];
@@ -1356,15 +1359,52 @@ bool InDockStrip(POINT pt) {
     return pt.x >= g_state.winX && pt.x < g_state.winX + g_state.winW;
 }
 
+// 点是否位于 Dock 有效交互区 = 窗口矩形 ∪ 底部触发条（与 Dock 同宽、
+// 2px 高的屏幕下缘）。窗口矩形与屏幕底边之间有间隙/透明区，触发条位于
+// 其下——光标在这些区域（含渲染区下方边缘）都属于“在 Dock 上”
+bool PointInDockOrStrip(POINT pt) {
+    RECT wr{};
+    if (GetWindowRect(g_state.hwnd, &wr) && pt.x >= wr.left &&
+        pt.x < wr.right && pt.y >= wr.top && pt.y < wr.bottom) {
+        return true;
+    }
+    return InDockStrip(pt);
+}
+
+// 收起方向：上方/左侧/右侧离开才收起；底部（空隙/触发条）永不收起。
+// wasOnDock 只在收起触发时复位（环带中间区域不复位），缓慢离开一样触发。
 LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION) {
         auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
         if (wParam == WM_MOUSEMOVE) {
-            // 自动收起：收起态下光标触碰屏幕下缘触发条（与 Dock 同宽 2px 高）
-            // → 请求展开；展开态光标也不会因贴底而误切（无状态变化）
-            if (g_state.autoCollapse && g_state.hideRequested &&
-                InDockStrip(ms->pt)) {
-                g_state.hideRequested = false;
+            // 单一输入路径：光标物理位置 → Dock 有效交互区，悬停/收起/展开
+            // 全部从这里驱动（事件驱动，非轮询）。
+            const bool onDock = PointInDockOrStrip(ms->pt);
+            g_state.mouseOverDock = onDock;
+            if (onDock) {
+                g_state.wasOnDock = true;
+                if (g_state.hideRequested) {
+                    // 触碰触发条 / 回到 Dock：请求展开并恢复快帧
+                    g_state.hideRequested = false;
+                    if (g_state.frameIntervalMs !=
+                        static_cast<int>(kFrameIntervalMs)) {
+                        g_state.frameIntervalMs =
+                            static_cast<int>(kFrameIntervalMs);
+                        SetTimer(g_state.hwnd, kFrameTimerId,
+                                 kFrameIntervalMs, nullptr);
+                    }
+                }
+            } else if (g_state.wasOnDock) {
+                RECT wr{};
+                if (GetWindowRect(g_state.hwnd, &wr)) {
+                    const bool topExit = ms->pt.y < wr.top;
+                    const bool leftExit = ms->pt.x < wr.left;
+                    const bool rightExit = ms->pt.x >= wr.right;
+                    if (topExit || leftExit || rightExit) {
+                        g_state.hideRequested = true;
+                        g_state.wasOnDock = false;  // 收起已触发；重进再置位
+                    }
+                }
             }
         } else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP) {
             if (InCornerZone(ms->pt, true)) {
@@ -1822,7 +1862,7 @@ void PresentSurface(AppState& s) {
 
     // ULW 同时应用位置与尺寸：悬停放大的展宽/收窄和底部居中都在这一步完成，
     // 不需要 SetWindowPos（全透明像素自动点击穿透，多出的缓冲区不参与呈现）
-    POINT ptDst{s.winX, s.winY + static_cast<int>(s.collapseOffset + 0.5f)};
+    POINT ptDst{s.winX, s.winY};
     POINT ptSrc{0, 0};
     SIZE size{presentW, s.winH};
     BLENDFUNCTION blend{};
@@ -1875,11 +1915,15 @@ SIZE DesiredWindowSize(AppState& s) {
 }
 
 // 依据当前呈现宽度计算窗口应处位置（底部对齐、水平居中）
+// 收起偏移并入 winY：ULW 呈现、SetWindowPos、GetWindowRect、命中检测
+// 全部使用同一位置源，避免"ULW 展示收起位、SetWindowPos 拉回展开位"的
+// 打架（此前导致窗口矩形跳变、几何事件风暴与展开不稳定）
 void UpdateDockPosition(AppState& s) {
     RECT wa = PrimaryWorkArea();
     const int gap = MulDiv(s.bottomGapBase, s.dpi, 96);
     s.winX = wa.left + ((wa.right - wa.left) - s.winW) / 2;
-    s.winY = wa.bottom - gap - s.winH;
+    s.winY = wa.bottom - gap - s.winH +
+             static_cast<int>(s.collapseOffset + 0.5f);
 }
 
 void RepositionDock(AppState& s, bool forceZOrder) {
@@ -1966,11 +2010,12 @@ bool UpdateLayoutOneFrame(AppState& s) {
     }
     const float sigma = kMagnifySigma * k;
 
-    // ---- 目标缩放（鼠标悬停生效，高斯衰减影响邻近图标）----
+    // ---- 目标缩放（悬停生效，悬停真值由 LL 钩子按光标物理位置维护，
+    //     窗口事件在边缘/静止场景不可靠）----
     float activeAny = false;
     for (size_t i = 0; i < n; ++i) {
         float target = 1.0f;
-        if (s.mouseInside && s.prevCenters.size() == n) {
+        if ((s.mouseOverDock || s.mouseInside) && s.prevCenters.size() == n) {
             const float d = s.mouseX - s.prevCenters[i];
             const float f = std::exp(-(d * d) / (2.f * sigma * sigma));
             target = 1.0f + (kMaxScale - 1.0f) * f;
@@ -3082,10 +3127,13 @@ void ShowBlankContextMenu(AppState& s) {
 
 // ============================== 主循环一帧 ==============================
 
-// 自适应定时器节奏：动画/悬停/启动弹跳期间 15ms（保流畅），空闲停止定时器
-// （零唤醒；重新活动由 WM_MOUSEMOVE / WinEvent 触发）
+// 自适应定时器节奏：动画/悬停/启动弹跳期间 15ms；空闲时自动收起开启
+// 保持 100ms 节拍（防“停帧冻结”，动画/收起/展开永远有帧驱动），
+// 自动收起关闭时彻底停帧（零唤醒）
 void SetFrameCadence(AppState& s, bool fast) {
-    const UINT want = fast ? kFrameIntervalMs : 0;  // 0 = 停止
+    const UINT want =
+        fast ? kFrameIntervalMs
+             : (s.autoCollapse ? kIdleFrameMs : 0);  // 0 = 停止
     if (s.frameIntervalMs == static_cast<int>(want)) return;
     s.frameIntervalMs = static_cast<int>(want);
     if (want == 0) {
@@ -3137,9 +3185,9 @@ void FrameTick(AppState& s) {
         DrawAndPresent(s);
     }
 
-    // 空闲即停帧：动画/收起动画/悬停/弹跳 → 快帧，全停 → 停止定时器
-    SetFrameCadence(s, animating || collapseAnimating || s.mouseInside ||
-                          !s.pendingLaunches.empty());
+    // 空闲即停帧（自动收起关闭时）；开启时保 100ms 节拍防冻结
+    SetFrameCadence(s, animating || collapseAnimating || s.mouseOverDock ||
+                          s.mouseInside || !s.pendingLaunches.empty());
 }
 
 // ============================== 窗口过程 ==============================
@@ -3185,14 +3233,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_MOUSELEAVE:
+            // 悬停/收起状态由 LL 钩子按光标物理位置驱动（ShowDesktopHookProc），
+            // 这里只复位窗口侧悬停数据；几何变化引发的假 leave 不影响任何状态
             s->trackingMouse = false;
             s->mouseInside = false;
             s->mouseX = -100000.f;
             s->mouseY = -100000.f;
             s->hoverIndex = static_cast<size_t>(-1);
             s->needsRedraw = true;
-            // 自动收起：光标离开 Dock 栏 → 滑出屏幕底边（触发条触碰可再升起）
-            if (s->autoCollapse) s->hideRequested = true;
             return 0;
 
         case WM_LBUTTONDOWN: {
