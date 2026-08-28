@@ -2279,8 +2279,14 @@ bool TryDropToDock(AppState& s) {
     cds.dwData = kDesktopDockPinMagic;
     cds.cbData = static_cast<DWORD>((path.size() + 1) * sizeof(wchar_t));
     cds.lpData = const_cast<wchar_t*>(path.c_str());
-    SendMessageW(dock, WM_COPYDATA, reinterpret_cast<WPARAM>(s.hwnd),
-                 reinterpret_cast<LPARAM>(&cds));
+    // 限时同步发送：本线程挂着 WH_MOUSE_LL 钩子（WheelLowLevelMouseProc），
+    // 若 Dock 线程忙碌（刷新/图标提取/模态菜单）而无限制地阻塞在
+    // SendMessageW 里，低层钩子回调无法返回，会拖死全局鼠标输入。
+    // 超时后放弃本次固定（用户可重试），绝不阻塞输入管线。
+    DWORD_PTR result = 0;
+    SendMessageTimeoutW(dock, WM_COPYDATA, reinterpret_cast<WPARAM>(s.hwnd),
+                        reinterpret_cast<LPARAM>(&cds),
+                        SMTO_ABORTIFHUNG | SMTO_BLOCK, 1500, &result);
     return true;
 }
 
@@ -2525,7 +2531,11 @@ void OnLeftButtonUp(AppState& s, WPARAM wParam, LPARAM lParam) {
             DrawLauncher(s);
         } else {
             // 拖动结束：先判断是否落在 Dock 栏（固定为 Dock 常驻应用），
-            // 不是则按页内排序处理
+            // 不是则按页内排序处理。
+            // 注意：TryDropToDock 内会向 Dock 线程同步发送 WM_COPYDATA，
+            // 本线程还挂着 WH_MOUSE_LL 钩子（WheelLowLevelMouseProc）——
+            // 发送必须限时（见 TryDropToDock），否则本线程阻塞在低层钩子
+            // 回调里，全局鼠标输入会被拖死。
             if (TryDropToDock(s)) {
                 DrawLauncher(s);
                 ReleaseCapture();

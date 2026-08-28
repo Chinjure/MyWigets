@@ -1392,6 +1392,7 @@ constexpr int kShowDesktopHLogical = 48;  // 隐形按钮高（逻辑像素，�
 
 HHOOK g_showDesktopHook = nullptr;
 bool g_hookLeftDownOnDock = false;         // 低层钩子吞掉过 Dock 左键按下：抬起也须吞掉
+bool g_hookMiddleDownOnDock = false;       // 低层钩子吞掉过 Dock 中键按下：抬起也须吞掉（配对防孤儿事件）
 bool g_hookLastOnDock = false;             // 低层钩子线程本地：上次“在 Dock”状态
 DWORD g_hookThreadId = 0;                  // WH_MOUSE_LL 钩子专用线程 ID
 std::thread g_hookThread;                  // WH_MOUSE_LL 钩子专用线程
@@ -1570,6 +1571,11 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
         // 右键菜单（TrackPopupMenu）打开期间，低层钩子必须完全放行鼠标事件，
         // 否则菜单项一旦落在 Dock 命中区内就会被 Dock 吞掉，导致菜单点了没反应。
         if (g_state.menuOpen) {
+            // 放行同时维护配对状态：菜单期到达的“抬起”，其“按下”可能早已
+            // 被吞（或反之）——此时清掉配对标志，否则菜单关闭后残留标志会
+            // 吞掉下一次无关的抬起，制造孤儿按键（下方应用点不动）。
+            if (wParam == WM_LBUTTONUP) g_hookLeftDownOnDock = false;
+            else if (wParam == WM_MBUTTONUP) g_hookMiddleDownOnDock = false;
             return CallNextHookEx(nullptr, code, wParam, lParam);
         }
 
@@ -1579,14 +1585,20 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
                 g_hookLastOnDock = onDock;
                 PostMessageW(g_state.hwnd, kMsgHookMouse, onDock ? 1 : 0, 0);
             }
-        } else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP) {
-            if (wParam == WM_LBUTTONDOWN && InCornerZone(ms->pt, true)) {
+        } else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP ||
+                   wParam == WM_LBUTTONDBLCLK) {
+            // 双击的第二拍系统以 WM_LBUTTONDBLCLK 到达，语义等同“按下”：
+            // 必须与按下同路径处理并成对吞掉，否则 DBLCLK 及其后续抬起会
+            // 作为无伴生按下的孤儿序列穿透到 Dock 下方窗口。
+            const bool isDown =
+                wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONDBLCLK;
+            if (isDown && InCornerZone(ms->pt, true)) {
                 // 左下角：仿 Windows 开始按钮 —— 触发 Win 键（打开开始菜单）
                 PostMessageW(g_state.hwnd, kMsgHookClick, kHookClickStart, 0);
                 g_hookLeftDownOnDock = true;
                 return 1;  // 吞掉：点击不穿透到下方窗口
             }
-            if (wParam == WM_LBUTTONDOWN && InCornerZone(ms->pt, false)) {
+            if (isDown && InCornerZone(ms->pt, false)) {
                 // 右下角：显示桌面（再点恢复）
                 PostMessageW(g_state.hwnd, kMsgHookClick,
                              kHookClickShowDesktop, 0);
@@ -1595,7 +1607,7 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
             }
 
             // 只采集 Dock/透明底部空隙/贴底边缘的点击，动作由 UI 线程执行。
-            if (wParam == WM_LBUTTONDOWN && PointInDockOrStrip(ms->pt)) {
+            if (isDown && PointInDockOrStrip(ms->pt)) {
                 float mx = static_cast<float>(ms->pt.x - g_state.winX);
                 float my = static_cast<float>(ms->pt.y - g_state.winY);
                 // 空隙处于窗口矩形下方时，按最近有效边缘处理
@@ -1611,7 +1623,7 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
 
             // 未在上面 return 的按下 = 不是 Dock/角部消费的按下：
             // 清除可能残留的旧“钩子吞掉按下”状态，避免误吞后续普通抬起。
-            if (wParam == WM_LBUTTONDOWN) {
+            if (isDown) {
                 g_hookLeftDownOnDock = false;
             }
 
@@ -1622,18 +1634,40 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
                 g_hookLeftDownOnDock = false;
                 return 1;
             }
-        } else if (wParam == WM_MBUTTONUP && PointInDockOrStrip(ms->pt)) {
-            // 与窗口内中键一致：底部空隙/贴边也能中键关闭，并立即隐藏圆点。
-            // 同样只采集，投递到 UI 线程后执行（避免钩子内做窗口管理）。
-            float mx = static_cast<float>(ms->pt.x - g_state.winX);
-            float my = static_cast<float>(ms->pt.y - g_state.winY);
-            if (my >= static_cast<float>(g_state.winH)) {
-                my = static_cast<float>(g_state.winH) - 1.f;
+        } else if (wParam == WM_MBUTTONDOWN || wParam == WM_MBUTTONUP) {
+            // 中键必须成对处理：早期实现只吞 Dock 区内“抬起”、放行“按下”，
+            // 按下会穿透到 Dock 下方窗口，而该应用随后永远等不到抬起
+            // （进入自动滚动/中键拖拽捕获态，吞掉其后全部鼠标输入，
+            // 即“Dock 外界面点不动、键盘正常”的元凶）。
+            // 现在：按下落在 Dock 有效区同样吞掉，抬起按配对吞掉并投递关闭。
+            if (wParam == WM_MBUTTONDOWN) {
+                if (PointInDockOrStrip(ms->pt)) {
+                    g_hookMiddleDownOnDock = true;
+                    return 1;
+                }
+                // 按下发生在 Dock 之外：清除残留配对标志，绝不让它吞掉
+                // 下方应用自己的抬起（孤儿抬键同样会破坏窗口按钮状态）。
+                g_hookMiddleDownOnDock = false;
             }
-            PostMessageW(
-                g_state.hwnd, kMsgHookClick, kHookClickDockMiddle,
-                MAKELPARAM(static_cast<short>(mx), static_cast<short>(my)));
-            return 1;
+            if (wParam == WM_MBUTTONUP && g_hookMiddleDownOnDock) {
+                g_hookMiddleDownOnDock = false;
+                // 与窗口内中键一致：底部空隙/贴边也能中键关闭，并立即隐藏圆点。
+                // 同样只采集，投递到 UI 线程后执行（避免钩子内做窗口管理）。
+                if (PointInDockOrStrip(ms->pt)) {
+                    float mx = static_cast<float>(ms->pt.x - g_state.winX);
+                    float my = static_cast<float>(ms->pt.y - g_state.winY);
+                    if (my >= static_cast<float>(g_state.winH)) {
+                        my = static_cast<float>(g_state.winH) - 1.f;
+                    }
+                    PostMessageW(
+                        g_state.hwnd, kMsgHookClick, kHookClickDockMiddle,
+                        MAKELPARAM(static_cast<short>(mx),
+                                   static_cast<short>(my)));
+                }
+                return 1;
+            }
+            // 按下未被吞（发生在 Dock 之外）：抬起也放行 —— 绝不吞掉
+            // 无关窗口的抬起，避免破坏其按钮配对状态。
         }
     }
     return CallNextHookEx(nullptr, code, wParam, lParam);
@@ -1668,7 +1702,8 @@ void InstallShowDesktopHook() {
 }
 
 void UninstallShowDesktopHook() {
-    g_hookLeftDownOnDock = false;  // 卸载即清空配对状态，避免重装后残留
+    g_hookLeftDownOnDock = false;    // 卸载即清空配对状态，避免重装后残留
+    g_hookMiddleDownOnDock = false;  // （中键配对同样清理）
     if (g_hookThreadId) {
         PostThreadMessageW(g_hookThreadId, WM_QUIT, 0, 0);
     }
@@ -3998,6 +4033,7 @@ void ResetDockGlobalsForRestart() {
     g_suiteWindows.clear();
     g_hookLastOnDock = false;
     g_hookLeftDownOnDock = false;
+    g_hookMiddleDownOnDock = false;
     g_skipTrayTriggerOnce = false;
 }
 
