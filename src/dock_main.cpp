@@ -3,8 +3,9 @@
 // 功能：
 //   1. 屏幕底部居中的一条毛玻璃质感底栏（GDI+ 逐像素透明 + 圆角），
 //      悬停时图标以 macOS 风格放大（高斯衰减影响邻近图标，弹性动画）
-//   2. 左侧为「固定」应用：支持拖入 .exe/.lnk 固定、右键取消固定，
-//      顺序持久化到注册表 HKCU\Software\DesktopSuite\Dock
+//   2. 左侧为「固定」应用：支持拖入 .exe/.lnk 固定、右键取消固定；
+//      固定区图标支持按住拖动重排（行内留出插入空位 + 落位幽灵，
+//      松手后按插入位更新顺序），顺序持久化到注册表 HKCU\Software\DesktopSuite\Dock
 //   3. 右侧（分隔线之后）为「正在运行」的应用：
 //      - 顶层窗口按进程 exe 分组（UWP 窗口穿透 ApplicationFrameHost 取真实宿主）
 //   4. 特别要求：托盘图标中的第三方应用视同打开状态 ——
@@ -116,6 +117,7 @@ constexpr ULONGLONG kRunningPathsCacheMs = 3000;  // 运行路径/托盘注册�
 constexpr ULONGLONG kTooltipDelayMs = 480;     // 悬停出提示延迟
 constexpr ULONGLONG kLaunchBounceMs = 3600;    // 启动弹跳超时
 constexpr ULONGLONG kTrayTriggerWindowMs = 2200;  // 托盘图标触发：UIA 重试窗口
+constexpr float kDragThreshold = 6.0f;         // 固定区图标：按压→拖拽的距离阈值（逻辑像素）
 constexpr int kMenuBaseId = 4000;
 constexpr int kMenuExit = 1001;
 constexpr int kMenuToggleAutoCollapse = 1002;  // 空白区右键：自动收起开关
@@ -128,6 +130,11 @@ constexpr UINT kMsgHeal = WM_APP + 2;      // 套件组件被最小化，立即�
 constexpr UINT kMsgTriggerDone = WM_APP + 3;  // 托盘触发完成（worker → 主窗口收尾）
 constexpr UINT kMsgHookClick = WM_APP + 4; // 低层鼠标钩子采集的点击 → 主窗口线程执行
 constexpr UINT kMsgHookMouse = WM_APP + 5; // 低层鼠标钩子：进入/离开 Dock 状态切换 → 主窗口线程
+constexpr UINT kMsgDockDrag = WM_APP + 6;  // 低层鼠标钩子：固定区拖拽重排的移动/松手
+
+// 固定区拖拽重排消息子类型（wParam）
+constexpr WPARAM kDockDragMove = 1;  // 按下后仍在按住 → 移动（UI 自行读取物理光标）
+constexpr WPARAM kDockDragUp = 2;    // 松手（lParam = 屏幕物理坐标，UI 转客户坐标）
 
 // 低层鼠标钩子采集的点击类型（wParam）
 constexpr WPARAM kHookClickDockLeft = 1;      // Dock 图标左键（切换/打开）
@@ -213,6 +220,14 @@ struct PendingLaunch {
     ULONGLONG startTick = 0;
 };
 
+// 固定区图标：点击还是拖拽重排？按压 → 超过阈值进入拖拽 → 松手执行其一。
+// 拖拽期间：行内剔除被拖槽、插入位留空位槽、绘制落位幽灵，松手后重排持久化。
+enum class DockDragPhase {
+    None,
+    Pressed,   // 已按下未超阈值（松手 = 正常点击）
+    Dragging,  // 超过阈值（松手 = 重排）
+};
+
 struct GeomSlot {
     RectF hit{};   // 命中区（整列高度）
     RectF icon{};  // 图标本帧实际绘制矩形（未含弹跳偏移）
@@ -273,6 +288,16 @@ struct AppState {
     bool mouseOverDock = false;   // 悬停真值（LL 钩子按光标物理位置维护）
     bool wasOnDock = false;       // 钩子：上一拍光标是否在有效交互区（状态迁移）
     Font* uiFont = nullptr;
+
+    // ---- 固定区拖拽重排状态 ----
+    DockDragPhase dragPhase = DockDragPhase::None;
+    std::wstring dragKey;      // 被拖固定项 key（归一化路径；状态以 key 为准，防刷新改序）
+    int dragPressIdx = -1;     // 按下时命中槽位（items 下标）
+    POINT dragPressPt{};       // 按下点（屏幕坐标：不受悬停放大导致的窗口位移影响）
+    float dragCursorX = 0.f;   // 拖拽中最新光标 x（客户坐标，仅日志/调试用）
+    int dragInsertPos = -1;    // 目标插入位（“删除被拖项后”的可见固定槽序号 0..pinCount）
+    RectF dragGhostRect{};     // 本帧空位幽灵槽（行内布局计算；空闲时为 0 尺寸）
+    bool leftBtnDown = false;  // 钩子缺失回退路径：窗口自身左键消息记录的按住态
 
     MenuEntry menu[512];
     int menuCount = 0;
@@ -1395,6 +1420,10 @@ constexpr int kShowDesktopHLogical = 48;  // 隐形按钮高（逻辑像素，�
 HHOOK g_showDesktopHook = nullptr;
 bool g_hookLeftDownOnDock = false;         // 低层钩子吞掉过 Dock 左键按下：抬起也须吞掉
 bool g_hookMiddleDownOnDock = false;       // 低层钩子吞掉过 Dock 中键按下：抬起也须吞掉（配对防孤儿事件）
+bool g_hookPressOnDock = false;            // 左键在 Dock 上按下且未抬起（固定区拖拽重排的按钮态跟踪）
+bool g_hookLeftDownGlobal = false;         // 全局左键按住态：LL 事件流直接记录。
+                                           // 不用 GetAsyncKeyState —— 注入事件/输入隔离下
+                                           // 该查询可能恒为 0（实测），拖拽推进会被漏掉。
 bool g_hookLastOnDock = false;             // 低层钩子线程本地：上次“在 Dock”状态
 DWORD g_hookThreadId = 0;                  // WH_MOUSE_LL 钩子专用线程 ID
 std::thread g_hookThread;                  // WH_MOUSE_LL 钩子专用线程
@@ -1529,6 +1558,10 @@ int HitIndexAt(AppState& s, float x, float y);
 void ToggleFocusOrLaunch(AppState& s, size_t idx);
 void SetFrameCadence(AppState& s, bool fast);
 void RequestCloseByIndex(AppState& s, size_t idx);  // 中键关闭 + 立即隐藏圆点
+size_t FindItemByKey(AppState& s, const std::wstring& key);          // 按 key 定位条目
+void BeginDockPress(AppState& s, size_t idx, POINT pt);              // 固定区按下
+void ProcessDockDragMove(AppState& s);                               // 拖拽推进
+void ProcessDockDragUp(AppState& s, POINT client);                   // 松手收尾
 
 // 展开触发条：与 Dock 栏同宽（含当前呈现宽度）、高 2px（随 DPI）的
 // 屏幕下边缘区域；光标触碰即从收起状态升起
@@ -1593,6 +1626,14 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION) {
         auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
 
+        // 全局左键状态：LL 钩子事件流直接记录（注入事件同样可见）。
+        // 置于 menuOpen 分支之前 —— 菜单期间放行的事件也参与状态维护。
+        if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONDBLCLK) {
+            g_hookLeftDownGlobal = true;
+        } else if (wParam == WM_LBUTTONUP) {
+            g_hookLeftDownGlobal = false;
+        }
+
         // 右键菜单（TrackPopupMenu）打开期间，低层钩子必须完全放行鼠标事件，
         // 否则菜单项一旦落在 Dock 命中区内就会被 Dock 吞掉，导致菜单点了没反应。
         if (g_state.menuOpen) {
@@ -1601,6 +1642,7 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
             // 吞掉下一次无关的抬起，制造孤儿按键（下方应用点不动）。
             if (wParam == WM_LBUTTONUP) g_hookLeftDownOnDock = false;
             else if (wParam == WM_MBUTTONUP) g_hookMiddleDownOnDock = false;
+            g_hookPressOnDock = false;  // 菜单期一律视为非拖拽
             return CallNextHookEx(nullptr, code, wParam, lParam);
         }
 
@@ -1618,6 +1660,12 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
                 // 失败、收起永不触发。
                 PostMessageW(g_state.hwnd, kMsgHookMouse, onDock ? 1 : 0,
                              MAKELPARAM(pt.x, pt.y));
+            }
+            // 固定区拖拽重排：左键在 Dock 按下且仍在按住 → 持续投递“移动”，
+            // UI 线程据此推进拖拽（阈值判定/重排/幽灵）。坐标由 UI 每帧读取
+            // 物理光标自愈，这里只做还在拖的踢帧信令。
+            if (g_hookPressOnDock && g_hookLeftDownGlobal) {
+                PostMessageW(g_state.hwnd, kMsgDockDrag, kDockDragMove, 0);
             }
         } else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP ||
                    wParam == WM_LBUTTONDBLCLK) {
@@ -1652,6 +1700,7 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
                     g_state.hwnd, kMsgHookClick, kHookClickDockLeft,
                     MAKELPARAM(static_cast<short>(mx), static_cast<short>(my)));
                 g_hookLeftDownOnDock = true;
+                g_hookPressOnDock = true;  // 进入拖拽重排的按钮态跟踪
                 return 1;
             }
 
@@ -1659,6 +1708,7 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
             // 清除可能残留的旧“钩子吞掉按下”状态，避免误吞后续普通抬起。
             if (isDown) {
                 g_hookLeftDownOnDock = false;
+                g_hookPressOnDock = false;
             }
 
             // 如果按下是被上面吞掉的（Dock/角部），对应的抬起也要吞掉，
@@ -1666,6 +1716,14 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
             // 造成鼠标按钮状态错乱、点击失效。
             if (wParam == WM_LBUTTONUP && g_hookLeftDownOnDock) {
                 g_hookLeftDownOnDock = false;
+                if (g_hookPressOnDock) {
+                    g_hookPressOnDock = false;
+                    // 松手：投递拖拽结束（lParam = 屏幕物理坐标，UI 转客户坐标）。
+                    // 即使松手时已离开 Dock（拖出取消/移出重排），也照常投递，
+                    // 由 UI 按松手点位置决定“重排 / 取消”。
+                    PostMessageW(g_state.hwnd, kMsgDockDrag, kDockDragUp,
+                                 MAKELPARAM(pt.x, pt.y));
+                }
                 return 1;
             }
         } else if (wParam == WM_MBUTTONDOWN || wParam == WM_MBUTTONUP) {
@@ -1712,6 +1770,9 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
 // 鼠标钩子线程总能及时返回，键盘/鼠标不会整体失去响应。
 DWORD WINAPI ShowDesktopHookThreadProc(LPVOID) {
     g_hookThreadId = GetCurrentThreadId();
+    g_hookLastOnDock = false;
+    g_hookPressOnDock = false;   // 钩子线程本地按钮态：开启即复位
+    g_hookLeftDownGlobal = false;
     g_showDesktopHook = SetWindowsHookExW(
         WH_MOUSE_LL, ShowDesktopHookProc, GetModuleHandleW(nullptr), 0);
     if (!g_showDesktopHook) {
@@ -1738,6 +1799,8 @@ void InstallShowDesktopHook() {
 void UninstallShowDesktopHook() {
     g_hookLeftDownOnDock = false;    // 卸载即清空配对状态，避免重装后残留
     g_hookMiddleDownOnDock = false;  // （中键配对同样清理）
+    g_hookPressOnDock = false;       // 拖拽按钮态同样清理
+    g_hookLeftDownGlobal = false;
     if (g_hookThreadId) {
         PostThreadMessageW(g_hookThreadId, WM_QUIT, 0, 0);
     }
@@ -2391,11 +2454,63 @@ bool UpdateLayoutOneFrame(AppState& s) {
     // ---- 窗口宽度实时贴合内容：静止时精确包住图标，悬停随放大展宽 ----
     const size_t pinN = s.pinCount;
     const bool withSep = pinN > 0 && pinN < n;
+
+    // ---- 拖拽插入位：按光标 x 与各可见固定槽中心（跳过被拖项）的关系计算。
+    // 使用“上一帧”几何（此时尚无空位）：避免“空位移动 → 中心移动 →
+    // 插入位再变”的连锁振荡；2px 滞后带防边界抖动。
+    if (s.dragPhase == DockDragPhase::Dragging) {
+        const float mx = s.mouseX;  // 物理光标客户坐标（本函数顶部每帧自愈）
+        int pos = 0, vis = 0;
+        for (size_t i = 0; i < pinN; ++i) {
+            if (s.items[i].key == s.dragKey) continue;
+            const GeomSlot& gm = s.geoms[i];
+            if (mx > gm.cx + 2.f * k) pos = vis + 1;
+            ++vis;
+        }
+        if (pos != s.dragInsertPos) {
+            s.dragInsertPos = pos;
+            s.needsRedraw = true;  // 插入位变化 → 幽灵移槽需要一帧
+        }
+    }
+
+    // ---- 拖拽重排：行内剔除被拖项，在插入位留出等宽空位槽 ----
+    // 空位槽宽度 = 被拖项槽宽 → 总内容宽度不变，窗口不随拖动伸缩/跳动。
+    const bool reordering =
+        s.dragPhase == DockDragPhase::Dragging && !s.dragKey.empty();
+    const float half0 = kIconGapHalf * k;
+    float dSlotW = 0.f;      // 空位槽总宽（图标 + 两侧半隙）
+    float dIconW = 0.f;      // 空位槽内图标边长（随被拖项当前缩放）
+    int gapAtItem = -1;      // 在其槽前插入空位的 items 下标（-1 = 无 / 末尾）
+    bool gapAtEnd = false;   // 空位在固定区末尾（分隔线之前）
+    s.dragGhostRect = RectF();
+    if (reordering) {
+        const size_t di = FindItemByKey(s, s.dragKey);
+        dIconW = kIconSize * k *
+                 (di != static_cast<size_t>(-1) ? s.items[di].scaleAnim
+                                                : 1.0f);
+        dSlotW = dIconW + half0 * 2.f;
+        // 空位插在“可见固定槽序号 == dragInsertPos”的槽位之前；
+        // 序号已剔除被拖项（被拖项自身不占可见槽）。
+        int vis = 0;
+        for (size_t i = 0; i < pinN; ++i) {
+            if (s.items[i].key == s.dragKey) continue;
+            if (vis == s.dragInsertPos) {
+                gapAtItem = static_cast<int>(i);
+                break;
+            }
+            ++vis;
+        }
+        if (gapAtItem < 0) gapAtEnd = true;  // 插入位在固定区末尾
+    }
+
     float used = kBarPadX * k * 2.f;
     for (size_t i = 0; i < n; ++i) {
+        if (reordering && s.items[i].key == s.dragKey) continue;
         used += kIconSize * k * s.items[i].scaleAnim +
                 kIconGapHalf * 2.f * k;
+        if (static_cast<int>(i) == gapAtItem) used += dSlotW;
     }
+    if (reordering && gapAtEnd) used += dSlotW;
     if (withSep) used += kSepGap * k;
 
     {
@@ -2424,8 +2539,25 @@ bool UpdateLayoutOneFrame(AppState& s) {
 
     for (size_t i = 0; i < n; ++i) {
         const DockItem& it = s.items[i];
+        const bool dragged = reordering && it.key == s.dragKey;
+        if (dragged) {
+            // 被拖项行内剔除（宽度由插入位空位槽补回，见 used 计算）：
+            // 几何置空 → 不可命中、不参与高斯放大，本帧也不绘制。
+            GeomSlot& gm = s.geoms[i];
+            gm.hit = RectF();
+            gm.icon = RectF();
+            gm.cx = -1e6f;
+            s.prevCenters[i] = gm.cx;
+            continue;
+        }
         const float half = kIconGapHalf * k;
         const float w = kIconSize * k * it.scaleAnim;
+        if (static_cast<int>(i) == gapAtItem) {
+            // 插入位：先落幽灵槽（等宽空位），后续图标整体右移留出空间
+            s.dragGhostRect =
+                RectF(x + half0, iconBottom - dIconW, dIconW, dIconW);
+            x += dSlotW;
+        }
         x += half;  // 前导半隙：与 used 的每槽 2*half 口径一致，
                     // 缺了会把每槽 6px 全部累积成右端空隙
         const float left = x;
@@ -2440,9 +2572,22 @@ bool UpdateLayoutOneFrame(AppState& s) {
         x = left + w + half;
 
         if (withSep && i + 1 == pinN) {
+            if (reordering && gapAtEnd) {
+                // 空位在固定区末尾：分隔线与运行区整体右移，幽灵槽落在
+                // 分隔线左侧（与“固定区末尾”的直觉一致）
+                s.dragGhostRect =
+                    RectF(x + half0, iconBottom - dIconW, dIconW, dIconW);
+                x += dSlotW;
+            }
             s.separatorX = x + kSepGap * k * 0.5f;
             x += kSepGap * k;
         }
+    }
+    if (reordering && gapAtEnd && !withSep) {
+        // 无分隔线（只有固定区）：空位槽直接追加在行尾
+        s.dragGhostRect =
+            RectF(x + half0, iconBottom - dIconW, dIconW, dIconW);
+        x += dSlotW;
     }
 
     // ---- 悬停命中（含悬停时间戳维护）----
@@ -2584,8 +2729,11 @@ void DrawFrame(Graphics& g, AppState& s) {
     }
 
     // 第 2 层：图标（底端对齐 + 启动弹跳偏移）
+    const bool reordering =
+        s.dragPhase == DockDragPhase::Dragging && !s.dragKey.empty();
     for (size_t i = 0; i < n; ++i) {
         const DockItem& it = s.items[i];
+        if (reordering && it.key == s.dragKey) continue;  // 被拖项由落位幽灵绘制
         const GeomSlot& gm = s.geoms[i];
         const float dy = BounceOffsetFor(s, it.key);
         RectF box = gm.icon;
@@ -2616,8 +2764,29 @@ void DrawFrame(Graphics& g, AppState& s) {
         }
     }
 
+    // 第 3.5 层：拖拽重排的空位幽灵（图标 + 白圈高亮，落在插入位空槽内）
+    if (reordering) {
+        const size_t di = FindItemByKey(s, s.dragKey);
+        if (di != static_cast<size_t>(-1) && s.dragGhostRect.Width > 0.1f) {
+            const RectF& gr = s.dragGhostRect;
+            const DockItem& dit = s.items[di];
+            GraphicsPath gp;
+            AddRoundRect(gp, gr, 9.f * k);
+            SolidBrush fill(Color(66, 255, 255, 255));
+            g.FillPath(&fill, &gp);
+            if (dit.icon) {
+                g.DrawImage(dit.icon, gr, 0.f, 0.f,
+                            static_cast<REAL>(dit.icon->GetWidth()),
+                            static_cast<REAL>(dit.icon->GetHeight()),
+                            UnitPixel, nullptr);
+            }
+            Pen ring(Color(200, 255, 255, 255), 1.5f * k);
+            g.DrawPath(&ring, &gp);
+        }
+    }
+
     // 第 4 层：悬停名称提示
-    if (s.uiFont && s.hoverIndex < n &&
+    if (s.uiFont && s.hoverIndex < n && !reordering &&
         GetTickCount64() - s.hoverSince > kTooltipDelayMs) {
         const DockItem& it = s.items[s.hoverIndex];
         // 度量缓存：MeasureString 是 GDI+ 高成本操作。以完整显示名为键，
@@ -4044,6 +4213,177 @@ bool PinPathIfNew(AppState& s, const std::wstring& path) {
     return true;
 }
 
+// ============================== 固定区拖拽重排 ==============================
+// 启动台/资源管理器拖入 Dock 固定之后，固定区图标支持按住拖动换位：
+//   按压（Pressed）→ 超过 kDragThreshold 进入拖拽（Dragging）→
+//   布局行内剔除被拖槽、在插入位留空位槽并绘制落位幽灵 →
+//   松手后按插入位重排 s.pins 并立即持久化；未超过阈值 = 普通点击。
+// 只允许拖动固定区（pinned）图标；运行区图标点击保持原有“按下即触发”。
+// 低层钩子只做按钮态采集（kMsgDockDrag 移动/松手信令），全部状态在 UI 线程。
+
+void ApplyDockReorder(AppState& s);  // 按插入位重排 pins + 持久化（定义在下方）
+void ResetDockDrag(AppState& s);     // 收尾清理（定义在下方）
+
+size_t FindItemByKey(AppState& s, const std::wstring& key) {
+    for (size_t i = 0; i < s.items.size(); ++i) {
+        if (s.items[i].key == key) return i;
+    }
+    return static_cast<size_t>(-1);
+}
+
+// 按压：记录按下槽位/坐标，进入 Pressed 态（松手未拖动 = 正常点击）。
+// 注意状态以 dragKey 为准而非下标 —— 拖拽期间后台 poll 可能重建 items。
+void BeginDockPress(AppState& s, size_t idx, POINT pt) {
+    if (idx >= s.items.size()) return;
+    // 按下点转屏幕坐标：悬停放大会让窗口展宽/居中（winX 漂移），客户坐标
+    // 增量会被放大 —— 屏幕坐标与窗口几何无关，阈值判定才稳定。
+    POINT sp = pt;
+    ClientToScreen(s.hwnd, &sp);
+    s.dragPhase = DockDragPhase::Pressed;
+    s.dragPressIdx = static_cast<int>(idx);
+    s.dragKey = s.items[idx].key;
+    s.dragPressPt = sp;
+    s.dragInsertPos = -1;
+    s.dragGhostRect = RectF();
+}
+
+// 拖拽推进：Pressed → 超过阈值进入 Dragging；Dragging 持续踢帧，
+// 插入位/幽灵槽由每帧布局按物理光标自愈（见 UpdateLayoutOneFrame）。
+void ProcessDockDragMove(AppState& s) {
+    if (s.dragPhase == DockDragPhase::None) return;
+    if (s.dragPhase == DockDragPhase::Pressed) {
+        POINT cp{};
+        GetCursorPos(&cp);
+        const float dx = static_cast<float>(cp.x - s.dragPressPt.x);
+        const float dy = static_cast<float>(cp.y - s.dragPressPt.y);
+        const float thr = kDragThreshold * s.scale;
+        if (dx * dx + dy * dy < thr * thr) return;  // 未达阈值：仍是点击预备
+        s.dragPhase = DockDragPhase::Dragging;
+        Logf(L"固定区重排：开始拖动 %ls", s.dragKey.c_str());
+    }
+    s.needsRedraw = true;
+    SetFrameCadence(s, true);  // Dragging 期间帧驱动持续运行（见 FrameTick）
+}
+
+// 可见固定槽 → s.pins 下标映射：解析失败/被屏蔽的 pin 不占可视槽。
+// （按名称并入运行组的边缘情况会缺项，此时该固定项不可重排——见 ApplyDockReorder）
+std::vector<size_t> ShownPinIndexList(AppState& s) {
+    std::vector<size_t> out;
+    for (size_t p = 0; p < s.pins.size(); ++p) {
+        const std::wstring dk = DescribePin(s.pins[p]).key;
+        if (dk.empty() || BasenameBlocked(dk)) continue;
+        for (size_t i = 0; i < s.pinCount; ++i) {
+            if (s.items[i].key == dk) {
+                out.push_back(p);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+// 松手收尾：拖拽 → 重排并持久化（松手点在 Dock 窗口外 = 取消）；
+// 未拖动（Pressed）→ 按原语义执行点击（切换/打开/最小化）。
+void ProcessDockDragUp(AppState& s, POINT client) {
+    if (s.dragPhase == DockDragPhase::None) return;
+    if (s.dragPhase == DockDragPhase::Dragging) {
+        const bool inWin = client.y >= 0 && client.y <= s.winH + 2 &&
+                           client.x >= 0 && client.x <= s.winW + 2;
+        if (inWin) {
+            ApplyDockReorder(s);
+        } else {
+            Logf(L"固定区重排：拖出 Dock 后松手，取消 %ls", s.dragKey.c_str());
+        }
+    } else {
+        // 未超过阈值：普通点击（固定区点击从“按下即触发”延迟到松手，
+        // 语义不变；期间 poll 可能重建 items，按 key 反查最新下标）
+        const size_t idx = FindItemByKey(s, s.dragKey);
+        if (idx != static_cast<size_t>(-1)) {
+            ToggleFocusOrLaunch(s, idx);
+        }
+    }
+    ResetDockDrag(s);
+}
+
+void ResetDockDrag(AppState& s) {
+    const bool wasDragging = s.dragPhase == DockDragPhase::Dragging;
+    s.dragPhase = DockDragPhase::None;
+    s.dragKey.clear();
+    s.dragPressIdx = -1;
+    s.dragPressPt = POINT{};
+    s.dragCursorX = 0.f;
+    s.dragInsertPos = -1;
+    s.dragGhostRect = RectF();
+    s.needsRedraw = true;
+    SetFrameCadence(s, true);
+    // 拖拽期间抑制收起（离开事件被 kMsgHookMouse 跳过）；结束时按光标
+    // 当前位置补判定：人已不在 Dock 则正常收起。
+    if (wasDragging) {
+        POINT cp{};
+        GetCursorPos(&cp);
+        if (!PointInDockOrStrip(cp)) {
+            s.hideRequested = true;
+            s.wasOnDock = false;
+        }
+    }
+}
+
+// 按插入位重排 s.pins：s.dragInsertPos 为“删除被拖项后”的可见固定槽序号
+// （0..可见固定槽数；等于槽数 = 追加到固定区末尾）。
+// 同步重排 orderMap：RefreshItems 按 ordinal 稳定排序，固定区必须随新序走。
+void ApplyDockReorder(AppState& s) {
+    if (s.dragKey.empty()) return;
+    size_t src = static_cast<size_t>(-1);
+    for (size_t p = 0; p < s.pins.size(); ++p) {
+        if (DescribePin(s.pins[p]).key == s.dragKey) {
+            src = p;
+            break;
+        }
+    }
+    if (src == static_cast<size_t>(-1)) {
+        Logf(L"固定区重排：未找到对应固定项（名称合并等边缘情况），放弃 %ls",
+             s.dragKey.c_str());
+        return;
+    }
+    const std::vector<size_t> shown = ShownPinIndexList(s);
+    int srcSlot = -1;
+    for (size_t j = 0; j < shown.size(); ++j) {
+        if (shown[j] == src) {
+            srcSlot = static_cast<int>(j);
+            break;
+        }
+    }
+    int destSlot = s.dragInsertPos;
+    if (destSlot < 0) destSlot = srcSlot;
+    if (destSlot == srcSlot) return;  // 原位放下：顺序无变化
+
+    // 目标锚点（删除 src 后的 pins 下标）：插入到 shown[destSlot] 之前；
+    // destSlot == shown.size() 时追加到末尾。
+    size_t insertAt = s.pins.size() - 1;
+    if (destSlot < static_cast<int>(shown.size())) {
+        size_t anchor = shown[static_cast<size_t>(destSlot)];
+        if (anchor > src) --anchor;  // 先删 src，锚点下标整体前移一位
+        insertAt = anchor;
+    }
+
+    const std::wstring moved = s.pins[src];
+    s.pins.erase(s.pins.begin() + static_cast<long>(src));
+    s.pins.insert(s.pins.begin() + static_cast<long>(insertAt), moved);
+
+    // orderMap 重编：固定区按键位序（与运行区序号可重叠——排序时固定区优先，
+    // 但运行组内部相对序不受影响）
+    for (size_t j = 0; j < s.pins.size(); ++j) {
+        const std::wstring dk = DescribePin(s.pins[j]).key;
+        if (!dk.empty()) s.orderMap[dk] = j;
+    }
+    SaveConfig(s);
+    RefreshItems(s);
+    EnsureWindowSize(s);
+    RepositionDock(s, true);
+    Logf(L"固定区重排：%ls → 槽位 %d（共 %zu 项）", s.dragKey.c_str(),
+         destSlot, s.pins.size());
+}
+
 // ============================== 右键菜单 ==============================
 
 void ResetMenuEntries(AppState& s) {
@@ -4248,9 +4588,10 @@ void ShowBlankContextMenu(AppState& s) {
 
 // ============================== 主循环一帧 ==============================
 
-// 收起目标偏移：0=展开；winH=完全滑出屏幕底（菜单打开期间保持展开）
+// 收起目标偏移：0=展开；winH=完全滑出屏幕底（菜单打开/拖拽重排期间保持展开）
 float CollapseTargetOf(const AppState& s) {
-    return (s.autoCollapse && s.hideRequested && !s.menuOpen)
+    return (s.autoCollapse && s.hideRequested && !s.menuOpen &&
+            s.dragPhase == DockDragPhase::None)
                ? static_cast<float>(s.winH)
                : 0.f;
 }
@@ -4315,9 +4656,11 @@ void FrameTick(AppState& s) {
         DrawAndPresent(s);
     }
 
-    // 动画/弹跳收敛后即停帧（零唤醒）；状态翻转由事件路径踢帧重启
+    // 动画/弹跳收敛后即停帧（零唤醒）；状态翻转由事件路径踢帧重启。
+    // 拖拽重排期间帧驱动必须持续：插入位/幽灵槽随光标实时更新。
     SetFrameCadence(s, animating || collapseAnimating ||
-                           !s.pendingLaunches.empty());
+                           !s.pendingLaunches.empty() ||
+                           s.dragPhase == DockDragPhase::Dragging);
 }
 
 // ============================== 窗口过程 ==============================
@@ -4359,6 +4702,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             s->mouseInside = true;
             SetFrameCadence(*s, true);  // 进入 Dock：立即切回动画帧（放大不卡顿）
             s->needsRedraw = true;
+            // 钩子未安装的回退路径：窗口自身消息接手拖拽推进
+            // （钩子路径由低层钩子投递 kMsgDockDrag）
+            if (g_showDesktopHook == nullptr &&
+                s->dragPhase != DockDragPhase::None && s->leftBtnDown) {
+                ProcessDockDragMove(*s);
+            }
             return 0;
         }
 
@@ -4376,10 +4725,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_LBUTTONDOWN: {
             POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            s->leftBtnDown = true;  // 回退路径：窗口消息记录的按住态
             const int idx = HitIndexAt(*s, static_cast<float>(pt.x),
                                            static_cast<float>(pt.y));
             if (idx >= 0) {
-                ToggleFocusOrLaunch(*s, static_cast<size_t>(idx));
+                if (s->items[idx].pinned) {
+                    // 固定区：与钩子路径一致 —— 按压预备，松手再区分点击/拖拽
+                    BeginDockPress(*s, static_cast<size_t>(idx), pt);
+                } else {
+                    ToggleFocusOrLaunch(*s, static_cast<size_t>(idx));
+                }
+            }
+            return 0;
+        }
+
+        case WM_LBUTTONUP: {
+            // 钩子未安装的回退路径：窗口自己收到按下/抬起
+            s->leftBtnDown = false;
+            if (s->dragPhase != DockDragPhase::None) {
+                POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+                ProcessDockDragUp(*s, pt);
             }
             return 0;
         }
@@ -4396,6 +4761,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_RBUTTONUP: {
+            // 右键菜单打开期间低层钩子放行全部事件并清除按钮态，拖拽中的
+            // 左键松手不会被投递 —— 打开菜单前先取消未完成的拖拽，防止
+            // 拖拽态永久悬挂（后续固定区点击全部被当作按压预备）。
+            if (s->dragPhase != DockDragPhase::None) ResetDockDrag(*s);
             POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             const int idx = HitIndexAt(*s, static_cast<float>(pt.x),
                                            static_cast<float>(pt.y));
@@ -4444,10 +4813,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         //     “还在有效区”，导致光标远走后 Dock 停留在展开态。
                         const bool stillInZone = PointInDockOrStrip(cp);
                         if (topExit || leftExit || rightExit || !stillInZone) {
-                            s->hideRequested = true;
-                            s->wasOnDock = false;
-                            s->needsRedraw = true;
-                            SetFrameCadence(*s, true);
+                            // 拖拽重排期间不随光标离开收起（否则窗口滑出屏幕、
+                            // 幽灵消失）；拖拽结束的松手点由 ResetDockDrag 补判定。
+                            if (s->dragPhase == DockDragPhase::None) {
+                                s->hideRequested = true;
+                                s->wasOnDock = false;
+                                s->needsRedraw = true;
+                                SetFrameCadence(*s, true);
+                            }
                         }
                     }
                 }
@@ -4467,7 +4840,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                            static_cast<float>(pt.y));
                 if (idx >= 0) {
                     if (wParam == kHookClickDockLeft) {
-                        ToggleFocusOrLaunch(*s, static_cast<size_t>(idx));
+                        if (s->items[idx].pinned) {
+                            // 固定区：进入按压预备态，松手再区分点击/拖拽重排
+                            BeginDockPress(*s, static_cast<size_t>(idx), pt);
+                        } else {
+                            ToggleFocusOrLaunch(*s, static_cast<size_t>(idx));
+                        }
                     } else {
                         RequestCloseByIndex(*s, static_cast<size_t>(idx));
                     }
@@ -4480,6 +4858,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // 与 Dock 交互后立即自愈工作区：开始菜单/显示桌面等操作可能让
             // explorer 把工作区改回“任务栏占位”，导致 Dock 跳到任务栏上方。
             EnsureTaskbarHidden(*s);
+            return 0;
+        }
+
+        // 固定区拖拽重排（低层钩子按钮态采集 → UI 线程执行）：
+        //   Move：推进拖拽（阈值判定/重排/幽灵由帧布局自愈）
+        //   Up：收尾 —— 拖拽则重排持久化，未拖拽则执行点击
+        case kMsgDockDrag: {
+            if (wParam == kDockDragMove) {
+                ProcessDockDragMove(*s);
+            } else if (wParam == kDockDragUp) {
+                POINT cp{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+                RECT wr{};
+                if (GetWindowRect(hwnd, &wr)) {
+                    cp.x -= wr.left;  // 屏幕物理坐标 → 客户坐标（松手点判定用）
+                    cp.y -= wr.top;
+                }
+                ProcessDockDragUp(*s, cp);
+            }
             return 0;
         }
 
