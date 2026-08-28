@@ -12,7 +12,10 @@
 //   4. 顶栏右侧提供 Chrome 浏览器风格的 最小化 / 最大化 / 关闭 三个按钮，
 //      用于控制当前聚焦窗口；双击顶栏空白处最大化/还原当前聚焦窗口；
 //      按住顶栏空白处拖动可移动当前聚焦窗口（等同标题栏拖动）
-//   5. 高度等于 Chrome 浏览器标签栏的高度（约 40px，随 DPI 缩放）
+//   5. 最小化键左侧提供 Win11 风格任务栏时钟：时间/日期两行显示
+//      （跟随系统区域格式与"显示秒"设置），悬停有药丸高亮，
+//      点击打开/收起系统"日期和时间"日历浮出窗口
+//   6. 高度等于 Chrome 浏览器标签栏的高度（约 40px，随 DPI 缩放）
 
 #ifndef UNICODE
 #define UNICODE
@@ -94,6 +97,11 @@ constexpr int kBaseTabHeight = 40;
 constexpr int kButtonWidthBase = 46;
 constexpr int kButtonGap = 4;
 
+// Win11 风格任务栏时钟区域（时间/日期两行），位于最小化按钮左侧
+constexpr int kClockWidthBase = 112;   // 时钟区域宽度（96 DPI 基准，随 DPI 缩放）
+constexpr UINT_PTR kClockTimerId = 5;  // 时钟刷新定时器：每秒检查文本变化
+constexpr UINT kClockTickMs = 1000;    // 与任务栏时钟一致；文本未变化不重绘
+
 // Chrome 风格标签的视觉留白（相对 96 DPI，绘制时乘 scale）
 constexpr float kTabTopInset = 5.0f;        // 活动标签顶部留白，底部贴住标签栏
 constexpr float kTabDividerInset = 8.0f;    // 未激活标签之间竖线的上下留白
@@ -156,6 +164,7 @@ enum ButtonHit {
     kHitMaximize = 1,
     kHitClose = 2,
     kHitTab = 6,        // Chrome 风格标签区域
+    kHitClock = 7,      // 最小化键左侧的 Win11 风格时钟（时间/日期）
 };
 
 struct TabInfo {
@@ -193,6 +202,11 @@ struct AppState {
     int hoverButton = kHitNone;          // 当前悬停的按钮
     int hoverTab = -1;                   // 当前悬停的 Chrome 标签索引
     bool trackingMouse = false;
+
+    // Win11 风格任务栏时钟（显示在最小化键左侧：时间在上、日期在下两行）
+    std::wstring clockTimeText;          // 当前时间文本（如 "21:45"）
+    std::wstring clockDateText;          // 当前日期文本（如 "2026/8/28"）
+    bool clockShowSeconds = false;       // 是否显示秒（跟随系统"显示秒"设置）
 
     // 按住空白处拖动（等同标题栏拖动，移动当前目标窗口）
     bool dragWindow = false;             // 正在拖动（按下空白处）
@@ -361,6 +375,110 @@ void ComputeButtonRects(AppState& s,
     minRect.Y = top;
     minRect.Width = bw;
     minRect.Height = h;
+}
+
+// 计算 Win11 风格时钟区域：紧贴最小化按钮左侧
+// （布局从右往左：关闭 | 最大化 | 最小化 | 时钟 | 标签）
+void ComputeClockRect(AppState& s, RectF& clockR) {
+    const float k = s.scale;
+    RectF minR, maxR, closeR;
+    ComputeButtonRects(s, minR, maxR, closeR);
+    const float gap = kButtonGap * k;
+    clockR.X = minR.X - gap - kClockWidthBase * k;
+    clockR.Y = 0.0f;
+    clockR.Width = kClockWidthBase * k;
+    // BarAreaHeight 定义在下方（此处仅有前置声明），直接按同式展开
+    clockR.Height = static_cast<float>(MulDiv(kBaseTabHeight, s.dpi, 96));
+}
+
+// 读取系统"在系统托盘时钟中显示秒"设置（Windows 设置 > 个性化 > 任务栏），
+// 与任务栏时钟保持一致；读取失败时默认不显示秒（Win11 默认行为）。
+bool ReadShowSecondsSetting() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+            0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    bool enabled = false;
+    DWORD type = 0;
+    DWORD size = 0;
+    if (RegQueryValueExW(key, L"ShowSecondsInSystemClock", nullptr, &type,
+                         nullptr, &size) == ERROR_SUCCESS) {
+        if (type == REG_SZ && size >= 2 && size <= 8) {
+            // 新旧 Windows 均以字符串 "1"/"0" 存储
+            wchar_t buf[4] = {};
+            DWORD bufSize = static_cast<DWORD>(sizeof(buf));
+            if (RegQueryValueExW(key, L"ShowSecondsInSystemClock", nullptr,
+                                 nullptr, reinterpret_cast<BYTE*>(buf),
+                                 &bufSize) == ERROR_SUCCESS) {
+                enabled = buf[0] == L'1';
+            }
+        } else if (type == REG_DWORD && size >= sizeof(DWORD)) {
+            // 兼容个别版本以 DWORD 存储的情况
+            DWORD val = 0;
+            DWORD valSize = static_cast<DWORD>(sizeof(val));
+            if (RegQueryValueExW(key, L"ShowSecondsInSystemClock", nullptr,
+                                 nullptr, reinterpret_cast<BYTE*>(&val),
+                                 &valSize) == ERROR_SUCCESS) {
+                enabled = val != 0;
+            }
+        }
+    }
+    RegCloseKey(key);
+    return enabled;
+}
+
+// 刷新时钟文本：时间/日期按系统区域格式生成；仅当文本变化时返回 true，
+// 供每秒定时器决定是否需要重绘（分钟跳变 / 跨午夜 / 秒显示时无谓重绘）。
+bool UpdateClock(AppState& s) {
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+
+    wchar_t timeBuf[64] = {};
+    wchar_t dateBuf[64] = {};
+    if (s.clockShowSeconds) {
+        // 跟随系统设置显示秒：按用户 12/24 小时制偏好补上 ":ss"
+        DWORD itime = 0;
+        GetLocaleInfoW(LOCALE_USER_DEFAULT, LOCALE_ITIME | LOCALE_RETURN_NUMBER,
+                       reinterpret_cast<LPWSTR>(&itime),
+                       static_cast<int>(sizeof(itime) / sizeof(wchar_t)));
+        const wchar_t* fmt =
+            (itime != 0) ? L"HH:mm:ss" : L"h:mm:ss tt";
+        GetTimeFormatW(LOCALE_USER_DEFAULT, 0, &st, fmt, timeBuf, 64);
+    } else {
+        GetTimeFormatW(LOCALE_USER_DEFAULT, TIME_NOSECONDS, &st, nullptr,
+                       timeBuf, 64);
+    }
+    GetDateFormatW(LOCALE_USER_DEFAULT, DATE_SHORTDATE, &st, nullptr,
+                   dateBuf, 64);
+
+    if (s.clockTimeText == timeBuf && s.clockDateText == dateBuf) {
+        return false;
+    }
+    s.clockTimeText = timeBuf;
+    s.clockDateText = dateBuf;
+    return true;
+}
+
+// 模拟 Win+Alt+D（系统级注册快捷键）：与点击 Win11 任务栏时钟一致，
+// 打开/收起"日期和时间"日历浮出窗口。
+void ToggleCalendarFlyout() {
+    INPUT inputs[6] = {};
+    auto keyEvent = [&inputs](int idx, WORD vk, bool up) {
+        inputs[idx].type = INPUT_KEYBOARD;
+        inputs[idx].ki.wVk = vk;
+        inputs[idx].ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+    };
+    keyEvent(0, VK_LWIN, false);
+    keyEvent(1, VK_MENU, false);
+    keyEvent(2, 'D', false);
+    keyEvent(3, 'D', true);
+    keyEvent(4, VK_MENU, true);
+    keyEvent(5, VK_LWIN, true);
+    SendInput(6, inputs, sizeof(INPUT));
 }
 
 // 全局钩子：用户"显式选择窗口"的信号（鼠标点击 / Alt+Tab），
@@ -656,6 +774,14 @@ ButtonHit HitTestButton(AppState& s, int x, int y) {
     // Chrome 风格标签区域
     if (HitTestTab(s, x, y) >= 0) {
         return kHitTab;
+    }
+
+    // 最小化键左侧的 Win11 风格时钟区域（点击 = 打开系统日历浮出窗口）
+    RectF clockR;
+    ComputeClockRect(s, clockR);
+    if (x >= static_cast<int>(clockR.X) &&
+        x < static_cast<int>(clockR.X + clockR.Width)) {
+        return kHitClock;
     }
 
     RectF minR, maxR, closeR;
@@ -1257,9 +1383,12 @@ void LayoutTabs(AppState& s, std::vector<TabInfo>& tabs,
     VolumeButtonRect(s, volR);
     RectF minR, maxR, closeR;
     ComputeButtonRects(s, minR, maxR, closeR);
+    RectF clockR;
+    ComputeClockRect(s, clockR);
 
     const float left = volR.X + volR.Width + 6.0f * k;
-    const float right = minR.X - 6.0f * k;
+    // 标签区右边界让位给最小化键左侧的时钟区域
+    const float right = clockR.X - 6.0f * k;
     const float available = right - left;
     if (available <= 0.0f) {
         return;
@@ -2206,6 +2335,17 @@ void DrawButtonHover(Graphics& g, const RectF& r, ButtonHit hit, int hover) {
     if (hover != hit) {
         return;
     }
+    if (hit == kHitClock) {
+        // Win11 任务栏时钟：悬停时显示内缩的圆角药丸高亮
+        const float inset = r.Height * 0.08f;
+        RectF pill(r.X + inset, r.Y + inset,
+                   r.Width - inset * 2.0f, r.Height - inset * 2.0f);
+        GraphicsPath path;
+        AddRoundedRectPath(path, pill, pill.Height * 0.28f);
+        SolidBrush bg(Color(50, 255, 255, 255));
+        g.FillPath(&bg, &path);
+        return;
+    }
     Color hoverColor(70, 255, 255, 255);
     if (hit == kHitClose) {
         // Chrome 关闭按钮：红色背景
@@ -2286,6 +2426,41 @@ void DrawVolumeGlyph(Graphics& g, const RectF& r, float scale, const Color& col,
 
     SolidBrush brush(col);
     g.DrawString(&ch, 1, &font, drawR, &sf, &brush);
+}
+
+// Win11 风格任务栏时钟：时间在上、日期在下两行，居中显示于时钟区域。
+// 字体跟随 Win11 任务栏（Segoe UI Variable Text，回退 Segoe UI）。
+void DrawClock(Graphics& g, AppState& s, const RectF& r) {
+    const float k = s.scale;
+
+    // Win11 任务栏字体（Segoe UI Variable Text，回退 Segoe UI）。
+    // GDI+ FontFamily 拷贝赋值是 private，用两个实例 + 指针选择。
+    FontFamily famUiVar(L"Segoe UI Variable Text");
+    FontFamily famUi(L"Segoe UI");
+    const FontFamily* fam = &famUiVar;
+    if (famUiVar.GetLastStatus() != Ok) {
+        fam = &famUi;
+    }
+    Gdiplus::Font font(fam, 12.0f * k, FontStyleRegular, UnitPixel);
+
+    const float half = r.Height * 0.5f;
+    RectF timeR(r.X, r.Y, r.Width, half);
+    RectF dateR(r.X, r.Y + half, r.Width, half);
+
+    StringFormat sf;
+    sf.SetAlignment(StringAlignmentCenter);
+    sf.SetLineAlignment(StringAlignmentCenter);
+    sf.SetFormatFlags(StringFormatFlagsNoWrap);
+
+    SolidBrush textBrush(Color(255, 255, 255, 255));
+    if (!s.clockTimeText.empty()) {
+        g.DrawString(s.clockTimeText.c_str(), -1, &font, timeR, &sf,
+                     &textBrush);
+    }
+    if (!s.clockDateText.empty()) {
+        g.DrawString(s.clockDateText.c_str(), -1, &font, dateR, &sf,
+                     &textBrush);
+    }
 }
 
 // 滑块上的音量百分比文本
@@ -2482,6 +2657,12 @@ void DrawBar(AppState& s) {
         g.Restore(state);
     }
 
+    // ---- 最小化键左侧：Win11 风格任务栏时钟（时间/日期两行）----
+    RectF clockR;
+    ComputeClockRect(s, clockR);
+    DrawButtonHover(g, clockR, kHitClock, s.hoverButton);
+    DrawClock(g, s, clockR);
+
     // ---- 右侧三个 Chrome 风格按钮 ----
 
     const Color glyph(200, 255, 255, 255);
@@ -2620,6 +2801,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // 标签刷新不设常驻定时器：WinEvent 事件驱动（见 WinEventProc），
         // 仅挂起态（新建窗口/抢前台）启用 200ms 短轮询、静止时 10s 低频兜底
         ChromeSyncStart(hwnd);   // Chrome 标签同步服务端（扩展连接用）
+        // Win11 风格时钟：跟随系统"显示秒"设置，每秒检查文本变化
+        s->clockShowSeconds = ReadShowSecondsSetting();
+        UpdateClock(*s);
+        SetTimer(hwnd, kClockTimerId, kClockTickMs, nullptr);
         return 0;
     }
 
@@ -2766,6 +2951,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         switch (hit) {
         case kHitVolume:
             SetVolumeOpen(*s, !s->volumeOpen);
+            break;
+        case kHitClock:
+            // 与 Win11 任务栏时钟一致：点击打开/收起系统日历浮出窗口
+            ToggleCalendarFlyout();
             break;
         case kHitTab:
             if (tabIndex >= 0 && tabIndex < static_cast<int>(s->tabs.size())) {
@@ -2961,6 +3150,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (RefreshTabs(*s)) {
                 DrawBarAndPresent(*s);
             }
+        } else if (wParam == kClockTimerId) {
+            // 时钟：每秒检查一次，仅时间/日期文本变化时重绘
+            if (UpdateClock(*s)) {
+                DrawBarAndPresent(*s);
+            }
         }
         return 0;
 
@@ -2992,6 +3186,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         KillTimer(hwnd, kTargetRetryTimerId);
         KillTimer(hwnd, kTabRefreshDebounceTimerId);
         KillTimer(hwnd, kSlowRefreshTimerId);
+        KillTimer(hwnd, kClockTimerId);
         ChromeSyncStop();  // 先停网络线程（会向本窗口发状态消息，需在窗口销毁前）
         UninstallVolumeHook();
         if (s) {
