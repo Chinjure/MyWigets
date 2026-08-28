@@ -2100,6 +2100,14 @@ LRESULT CALLBACK VolumePanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         }
         return 0;
 
+    case WM_CAPTURECHANGED:
+        // 捕获被系统或其他窗口夺走（如面板被隐藏/销毁）时结束滑块拖动，
+        // 避免残留拖拽状态；捕获此刻已不属于本窗口，无需再 ReleaseCapture。
+        if (s) {
+            s->volumeDragging = false;
+        }
+        return 0;
+
     case WM_DESTROY:
         if (s) {
             s->volumePanelHwnd = nullptr;
@@ -2168,6 +2176,12 @@ void ShowVolumePanel(AppState& s) {
 
 void HideVolumePanel(AppState& s) {
     if (s.volumePanelHwnd) {
+        // 正在拖动滑块时收起：先释放捕获再隐藏，避免捕获留在隐藏窗口上，
+        // 把后续全部鼠标输入都吞进不可见面板（全局点不动、键盘正常）。
+        if (s.volumeDragging) {
+            s.volumeDragging = false;
+            ReleaseCapture();
+        }
         ShowWindow(s.volumePanelHwnd, SW_HIDE);
     }
 }
