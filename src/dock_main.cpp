@@ -17,7 +17,8 @@
 //      即「现在正以托盘形式驻留的第三方程序」。这类程序即使没有任何可见窗口，
 //      也出现在 Dock 运行区并带运行圆点；纯后台静默项可右键隐藏。
 //   5. 点击行为：应用未在前台时 打开该应用的全部主窗口（最小化的一次性恢复），
-//      前台时 最小化全部；纯托盘驻留统一走托盘图标触发（TrayList 方式）或启动；
+//      前台时 最小化全部；托盘驻留应用优先恢复任务栏已有窗口，确实没有
+//      窗口时才走托盘图标触发（TrayList 方式）或启动；
 //      启动时有 macOS 风格弹跳动画直到应用出现；中键关闭该应用全部窗口
 //
 // 日志写入 ..\logs\dock.log
@@ -734,7 +735,11 @@ PinDescriptor DescribePin(const std::wstring& pinPath) {
 
     PinDescriptor d;
     d.launchPath = pinPath;
-    d.name = StripExtension(PathBasename(pinPath));
+    // 显示名与运行区同源：FileDescription → 基名（MakeItemFromKey 同款口径）。
+    // 注意不能用快捷方式文件名 —— 别名/改名会让固定区与运行区名称不一致，
+    // 导致下面 2.5“按名称并入运行组”的兜底合并落空（图标与窗口无法联动）。
+    const std::wstring descPin = ExeDisplayName(pinPath);
+    d.name = !descPin.empty() ? descPin : StripExtension(PathBasename(pinPath));
     const std::wstring lower = ToLower(pinPath);
     const bool isLnk = lower.size() > 4 &&
                        lower.compare(lower.size() - 4, 4, L".lnk") == 0;
@@ -746,8 +751,19 @@ PinDescriptor DescribePin(const std::wstring& pinPath) {
                 t.target = t.workDir + L"\\" + t.target;  // 补相对路径
             }
             d.key = NormalizePath(t.target);
+            // 固定项显示名按“目标 exe”取（与运行区按 exe 取 FileDescription
+            // 完全同源）：应用真名 = 快捷方式别名，两侧永远一致。
+            const std::wstring targetDesc = ExeDisplayName(t.target);
+            if (!targetDesc.empty()) {
+                d.name = targetDesc;
+            } else {
+                const std::wstring targetBase =
+                    StripExtension(PathBasename(t.target));
+                if (!targetBase.empty()) d.name = targetBase;
+            }
         }
-        Logf(L"解析固定项：%ls → %ls", pinPath.c_str(), d.key.c_str());
+        Logf(L"解析固定项：%ls → %ls（名称 %ls）", pinPath.c_str(),
+             d.key.c_str(), d.name.c_str());
     }
     if (d.key.empty()) d.key = NormalizePath(pinPath);
     g_pinDescCache[pinPath] = d;
@@ -2020,8 +2036,12 @@ bool RefreshItems(AppState& s) {
             StripExtension(ToLower(PathBasename(winKey)));
         if (!pinNameLower.empty() && base == pinNameLower) return true;
         const std::wstring desc = ToLower(ExeDisplayName(winKey));
-        return !desc.empty() && !pinNameLower.empty() &&
-               desc.find(pinNameLower) != std::wstring::npos;
+        if (pinNameLower.empty() || desc.empty()) return false;
+        // 双向包含：既允许“运行描述含固定名”（钉钉.lnk → 描述“钉钉”），
+        // 也允许“固定名含运行描述”（zcode-3.10.1-win-x64.exe → 描述 ZCode）。
+        // 原实现只检查 desc.contains(pin)，方向相反时兜底合并永远落空。
+        return desc.find(pinNameLower) != std::wstring::npos ||
+               pinNameLower.find(desc) != std::wstring::npos;
     };
     for (size_t i = 0; i < cands.size(); ++i) {
         Cand& p = cands[i];
@@ -3884,9 +3904,11 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
     // 找该应用的全部存活 pid（按 exe 镜像路径匹配 key）
     std::vector<DWORD> pids = FindPidsByKey(item.key);
 
-    // 托盘驻留应用统一走 TrayList 方式：点击 Dock 图标 = 点击系统托盘图标，
-    // 由应用自己的托盘处理器恢复/显示可交互主窗口。绝对不能先走外部
-    // ShowWindow —— 微信等 Qt 自绘应用会得到“看得见点不动”的影子窗口。
+    // 托盘驻留应用：到达这里说明任务栏已无该应用窗口（点击路径先恢复
+    // 已有窗口，见 ToggleFocusOrLaunch），统一走 TrayList 方式 ——
+    // 点击 Dock 图标 = 点击系统托盘图标，由应用自己的托盘处理器恢复/
+    // 显示可交互主窗口。绝对不能先走外部 ShowWindow —— 微信等 Qt 自绘
+    // 应用会得到“看得见点不动”的影子窗口。
     if (item.trayMarked && !pids.empty() && !g_skipTrayTriggerOnce) {
         TrayIconTriggerAsync(s, item.displayName, pids, idx);
         return;
@@ -4080,13 +4102,13 @@ void ToggleFocusOrLaunch(AppState& s, size_t idx) {
         return;
     }
 
-    // 托盘驻留应用：统一走托盘图标触发，而不是通用窗口恢复/ShowWindow。
-    // 这是 TrayList 的正确打开方式——由应用自己的托盘处理器显示可交互窗口。
-    if (item.trayMarked) {
-        WakeTrayOnlyApp(s, idx);
-        s.needsRedraw = true;
-        return;
-    }
+    // 托盘驻留应用：优先打开任务栏已有窗口 —— item.windows 里收集到的
+    // 可见顶层主窗口与普通应用同路径恢复全部（最小化 SC_RESTORE）；
+    // 只有完全没有窗口时才走托盘图标触发（UIA 树，由应用自己的托盘
+    // 处理器恢复窗口），避免每次打开都强行走 UIA 树点托盘图标。
+    // item.windows 只含可见顶层窗口（EnumAppWindowProc 过滤），隐藏的
+    // Qt 自绘主窗（“看得见点不动”的影子窗口风险）不在集合内，恢复路径
+    // 天然安全；纯托盘驻留（无窗口）自然落入下方 WakeTrayOnlyApp 触发。
 
     // 优先使用 Dock 已收集的顶层窗口（item.windows 已包含 UWP 的
     // ApplicationFrameWindow 等真实应用窗口，不能只靠按 exe 枚举线程窗口）。
