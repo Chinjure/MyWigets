@@ -352,7 +352,7 @@ std::wstring ExeDisplayName(const std::wstring& fullPathLower) {
 // ============================== 日志 ==============================
 // main 分支禁止日志：kLogEnabled=false 时 LogInit 不建目录不开文件、
 // Logf 直接返回（release 行为，零 I/O）。debug 分支保持 true（完整日志）。
-constexpr bool kLogEnabled = false;
+constexpr bool kLogEnabled = true;
 
 FILE* g_logFile = nullptr;
 SRWLOCK g_logLock = SRWLOCK_INIT;  // 后台关闭线程与主线程可能同时写日志
