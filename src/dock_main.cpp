@@ -1532,9 +1532,11 @@ void RequestCloseByIndex(AppState& s, size_t idx);  // 中键关闭 + 立即隐�
 bool InDockStrip(POINT pt) {
     const int h = MulDiv(kDockStripHeightLogical, g_state.dpi, 96);
     const int bottom = g_primaryWorkArea.bottom;
-    // 含 bottom 这一行：物理屏幕最底像素/贴边时系统可能报 sh-1 或 sh，
-    // 一律算 Dock 有效区，避免最低一列丢失悬停/点击。
-    if (pt.y < bottom - h || pt.y > bottom) return false;
+    // 含 bottom 这一行：物理屏幕最底像素/贴边时系统可能报 sh-1、sh 或 sh+1，
+    // 一律算 Dock 有效区，避免最低一列丢失悬停/点击。上界再放宽 2px，
+    // 吸收光标贴底时坐标在 sh-1/sh/sh+1 之间的抖动（否则 onDock 每秒
+    // 在 0/1 间高频翻转，触发收起-展开往返与消息风暴）。
+    if (pt.y < bottom - h || pt.y > bottom + 2) return false;
     return pt.x >= g_state.winX && pt.x < g_state.winX + g_state.winW;
 }
 
@@ -1552,13 +1554,16 @@ bool PointInDockOrStrip(POINT pt) {
     const int left = g_state.winX;
     const int right = left + g_state.winW;
     const int top = g_state.winY;
-    if (pt.x >= left && pt.x < right && pt.y >= top && pt.y <= bottom) {
+    // 下界同 InDockStrip：吸收屏幕最底行坐标抖动（sh-1/sh/sh+1），
+    // 避免贴底时光标在“在 Dock”与“不在 Dock”之间高频切换。
+    if (pt.x >= left && pt.x < right && pt.y >= top && pt.y <= bottom + 2) {
         return true;
     }
     return InDockStrip(pt);
 }
 
-// 收起方向：上方/左侧/右侧离开才收起；底部（空隙/触发条）永不收起。
+// 收起方向：上方/左侧/右侧离开，或越过有效区下缘（如移到主屏下方的副屏）
+// 才收起；底部离开但仍在有效区（空隙/触发条/贴边容差）内则不收起。
 // wasOnDock 只在收起触发时复位（环带中间区域不复位），缓慢离开一样触发。
 LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
     // 本回调运行在专用的 WH_MOUSE_LL 钩子线程上，绝不阻塞/等待 UI 线程。
@@ -1577,7 +1582,12 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
             const bool onDock = PointInDockOrStrip(ms->pt);
             if (onDock != g_hookLastOnDock) {
                 g_hookLastOnDock = onDock;
-                PostMessageW(g_state.hwnd, kMsgHookMouse, onDock ? 1 : 0, 0);
+                // lParam 携带触发本次状态翻转的光标物理位置（ms->pt）：
+                // UI 线程用它判断离开方向（上/左/右 = 收起），避免 UI 线程
+                // 再次 GetCursorPos 读到抖动后的新位置，导致贴顶离开判定
+                // 失败、收起永不触发。
+                PostMessageW(g_state.hwnd, kMsgHookMouse, onDock ? 1 : 0,
+                             MAKELPARAM(ms->pt.x, ms->pt.y));
             }
         } else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP) {
             if (wParam == WM_LBUTTONDOWN && InCornerZone(ms->pt, true)) {
@@ -3794,14 +3804,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else {
                 s->mouseInside = false;
                 if (s->wasOnDock) {
+                    // 用钩子线程采集的“触发翻转时的光标位置”判定离开方向，
+                    // 而不是在这里重新 GetCursorPos：UI 线程处理该消息时游标
+                    // 可能已因 1-2px 抖动回到边界内（贴顶离开最常见的失败），
+                    // 让收起判定永远落空。lParam 即钩子投递的 ms->pt。
+                    const POINT cp{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
                     RECT wr{};
                     if (GetWindowRect(s->hwnd, &wr)) {
-                        POINT cp{};
-                        GetCursorPos(&cp);
                         const bool topExit = cp.y < wr.top;
                         const bool leftExit = cp.x < wr.left;
                         const bool rightExit = cp.x >= wr.right;
-                        if (topExit || leftExit || rightExit) {
+                        // 底部“离开”必须区分两种，只对第一种不收起：
+                        //  1) 离开后仍落在 Dock 有效区（窗口/空隙/触发条/贴边
+                        //     容差）内 —— 触碰下缘意为保持展开，且不复位
+                        //     wasOnDock（光标仍在有效区，下次真正离开会重新判定）；
+                        //  2) 越过有效区下缘（如移到主屏下方的副屏、或超出
+                        //     贴边容差）—— 这是真正的离开，必须收起。
+                        //     此前只认上/左/右三个方向，下方越界会误判为
+                        //     “还在有效区”，导致光标远走后 Dock 停留在展开态。
+                        const bool stillInZone = PointInDockOrStrip(cp);
+                        if (topExit || leftExit || rightExit || !stillInZone) {
                             s->hideRequested = true;
                             s->wasOnDock = false;
                             s->needsRedraw = true;
