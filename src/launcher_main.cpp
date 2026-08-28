@@ -41,6 +41,8 @@
 #include <string>
 #include <vector>
 
+#include "widgets.h"
+
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -54,7 +56,6 @@ using namespace Gdiplus;
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"DesktopLauncherWindow";
-constexpr wchar_t kMutexName[] = L"Local\\DesktopLauncher_SingleInstance";
 constexpr wchar_t kRegPath[] = L"Software\\DesktopLauncher";
 
 constexpr int kBaseWidth = 420;
@@ -3006,30 +3007,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 } // namespace
 
-int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
-    if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        CloseHandle(mutex);
-        return 0;
-    }
+// ============================== 组件接口 ==============================
+
+std::atomic<HWND> g_launcherHwnd{nullptr};
+
+DWORD WINAPI LauncherThreadProc(LPVOID param) {
+    const HINSTANCE hInstance = static_cast<HINSTANCE>(param);
 
     EnableDpiAwareness();
 
     // SHGetFileInfoW 等 Shell API 需要 STA COM 才能正确解析 .lnk 的自定义图标；
     // 未初始化时图标索引会退回 0（系统默认空白文件图标）
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
-        MessageBoxW(nullptr, L"COM 初始化失败。", L"DesktopLauncher",
-                    MB_OK | MB_ICONERROR);
-        CloseHandle(mutex);
         return 1;
     }
 
     ULONG_PTR gdiplusToken = 0;
     GdiplusStartupInput gsi;
     if (GdiplusStartup(&gdiplusToken, &gsi, nullptr) != Ok) {
-        MessageBoxW(nullptr, L"GDI+ 初始化失败。", L"DesktopLauncher",
-                    MB_OK | MB_ICONERROR);
-        CloseHandle(mutex);
+        CoUninitialize();
         return 1;
     }
 
@@ -3055,9 +3051,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     wc.lpszClassName = kWindowClass;
 
     if (!RegisterClassExW(&wc)) {
-        GdiplusShutdown(gdiplusToken);
-        CloseHandle(mutex);
-        return 1;
+        if (GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            // 组件在进程内被重启（关闭后再次打开）时类已注册，视为成功
+            GdiplusShutdown(gdiplusToken);
+            CoUninitialize();
+            return 1;
+        }
     }
 
     AppState state;
@@ -3069,9 +3068,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     if (!hwnd) {
         GdiplusShutdown(gdiplusToken);
-        CloseHandle(mutex);
+        CoUninitialize();
         return 1;
     }
+
+    g_launcherHwnd.store(hwnd);  // 先发布窗口句柄，宿主可立即隐藏/关闭
 
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
@@ -3083,6 +3084,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     GdiplusShutdown(gdiplusToken);
     CoUninitialize();
-    CloseHandle(mutex);
-    return static_cast<int>(msg.wParam);
+    g_launcherHwnd.store(nullptr);  // 窗口已销毁，线程即将退出
+    return static_cast<DWORD>(msg.wParam);
 }

@@ -1,15 +1,16 @@
-// MyWigets - 桌面组件启动器
+// MyWigets - 桌面组件进程内宿主
 //
 // 功能：
-//   1. 启动 MyWigets 时同时启动全部桌面组件：DesktopClock、DesktopCalendar、
-//      DesktopLauncher、DesktopTopBar、DesktopDock
-//      （各组件仍是独立进程、独立窗口，可分别自由拖动）
+//   1. 全部组件（时钟 / 日历 / 应用管理 / 顶栏 / Dock 栏）都以线程形式运行在
+//      本进程内：每个组件在自己的线程里创建窗口并泵自己的消息循环，
+//      不再存在任何独立的组件 exe 进程（同目录的其他组件 exe 已删除）。
 //   2. 系统托盘菜单：
 //        - 打开全部组件
 //        - 时钟 / 日历 / 应用管理 / 顶栏 / Dock 栏 勾选式开关
+//          （勾选 = 组件窗口已创建；点击 = 启动 / 优雅关闭该组件线程）
 //        - Dock 栏热键子菜单：全局热键开关 Dock（默认 Alt+Space，
 //          可选预设组合或自定义捕获，配置存 HKCU\...\MyWigets）
-//        - 关闭全部组件（先发 WM_CLOSE 优雅退出，超时则结束进程）
+//        - 关闭全部组件（逐个 WM_CLOSE 优雅退出，超时则结束线程）
 //        - 开机启动（勾选后写入 HKCU\...\Run）
 //        - 退出 MyWigets（关闭全部组件后退出托盘）
 //   3. 支持命令行：
@@ -36,6 +37,7 @@
 #include <tlhelp32.h>
 
 #include "resource.h"
+#include "widgets.h"
 
 #include <cstring>
 #include <cwchar>
@@ -48,11 +50,31 @@
 
 namespace {
 
+using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(HANDLE);
+
+// 进程级 DPI 感知（必须在本进程创建任何窗口之前设置；组件线程内也会调用，
+// 但第二次调用会失败并被各组件忽略，这里先调一次保证组件窗口按真实 DPI 创建）
+void EnableDpiAwareness() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        auto pSetContext = reinterpret_cast<SetProcessDpiAwarenessContextFn>(
+            GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+        if (pSetContext) {
+            // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == -4
+            if (pSetContext(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-4)))) {
+                return;
+            }
+        }
+    }
+    SetProcessDPIAware();
+}
+
 constexpr wchar_t kWindowClass[] = L"MyWigetsTrayWindow";
 constexpr wchar_t kMutexName[] = L"Local\\MyWigets_SingleInstance";
 constexpr wchar_t kRunKeyPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValueName[] = L"MyWigets";
 constexpr UINT kTrayMessage = WM_APP + 1;
+constexpr UINT kMsgOpenAll = WM_APP + 2;  // 第二实例 / 托盘左键：打开全部组件
 constexpr UINT kTrayIconId = 1;
 
 constexpr int kMenuOpenAll = 1001;
@@ -72,157 +94,182 @@ constexpr int kMenuHotkeyEnable = 1020;
 constexpr int kMenuHotkeyCustom = 1021;
 constexpr int kMenuHotkeyPresetFirst = 1030;
 
-#if defined(_M_X64) || defined(_M_AMD64) || defined(__x86_64__)
-constexpr wchar_t kClockExe[] = L"DesktopClock-x64.exe";
-constexpr wchar_t kCalendarExe[] = L"DesktopCalendar-x64.exe";
-constexpr wchar_t kLauncherExe[] = L"DesktopLauncher-x64.exe";
-constexpr wchar_t kTopBarExe[] = L"DesktopTopBar-x64.exe";
-constexpr wchar_t kDockExe[] = L"DesktopDock-x64.exe";
-#else
-constexpr wchar_t kClockExe[] = L"DesktopClock-x86.exe";
-constexpr wchar_t kCalendarExe[] = L"DesktopCalendar-x86.exe";
-constexpr wchar_t kLauncherExe[] = L"DesktopLauncher-x86.exe";
-constexpr wchar_t kTopBarExe[] = L"DesktopTopBar-x86.exe";
-constexpr wchar_t kDockExe[] = L"DesktopDock-x86.exe";
-#endif
+// ---------- 组件注册表（全部进程内线程） ----------
 
-bool GetMyWigetsDir(wchar_t* dir, size_t count) {
-    wchar_t self[MAX_PATH] = {};
-    const DWORD len = GetModuleFileNameW(nullptr, self, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) {
-        return false;
-    }
-    wchar_t* slash = wcsrchr(self, L'\\');
-    if (slash) {
-        *slash = L'\0'; // 去掉文件名，保留目录
-    }
-    return wcscpy_s(dir, count, self) == 0;
-}
+void ShowTrayBalloon(HWND hwnd, const wchar_t* text);  // 定义在下方
 
-bool BuildWidgetPath(const wchar_t* exeName, wchar_t* path, size_t count) {
-    wchar_t dir[MAX_PATH] = {};
-    if (!GetMyWigetsDir(dir, MAX_PATH)) {
-        return false;
-    }
-    return swprintf_s(path, count, L"%s\\%s", dir, exeName) > 0;
-}
+// 清理旧版独立组件进程（迁移期：它们的 exe 已被删除，但内存中实例可能还在；
+// 同一时刻只能有一份组件在运行，否则任务栏/Dock 状态会互相打架）
+const wchar_t* const kLegacyWidgetExes[] = {
+    L"DesktopClock-x64.exe", L"DesktopClock-x86.exe",
+    L"DesktopCalendar-x64.exe", L"DesktopCalendar-x86.exe",
+    L"DesktopLauncher-x64.exe", L"DesktopLauncher-x86.exe",
+    L"DesktopTopBar-x64.exe", L"DesktopTopBar-x86.exe",
+    L"DesktopDock-x64.exe", L"DesktopDock-x86.exe",
+};
 
-bool IsWidgetRunning(const wchar_t* mutexName) {
-    HANDLE h = OpenMutexW(SYNCHRONIZE, FALSE, mutexName);
-    if (h) {
-        CloseHandle(h);
-        return true;
-    }
-    return false;
-}
-
-bool LaunchWidget(const wchar_t* exeName, const wchar_t* mutexName) {
-    if (IsWidgetRunning(mutexName)) {
-        return true; // 已经在运行，不重复启动
-    }
-
-    wchar_t path[MAX_PATH] = {};
-    if (!BuildWidgetPath(exeName, path, MAX_PATH)) {
-        return false;
-    }
-
-    wchar_t cmdLine[MAX_PATH] = {};
-    wcscpy_s(cmdLine, path);
-
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(nullptr, cmdLine, nullptr, nullptr, FALSE,
-                        0, nullptr, nullptr, &si, &pi)) {
-        return false;
-    }
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return true;
-}
-
-void LaunchAllWidgets() {
-    LaunchWidget(kClockExe, L"Local\\DesktopAnalogClock_SingleInstance");
-    LaunchWidget(kCalendarExe, L"Local\\DesktopCalendar_SingleInstance");
-    LaunchWidget(kLauncherExe, L"Local\\DesktopLauncher_SingleInstance");
-    LaunchWidget(kTopBarExe, L"Local\\DesktopTopBar_SingleInstance");
-    LaunchWidget(kDockExe, L"Local\\DesktopDock_SingleInstance");
-}
-
-// ---------- 组件进程的查找与关闭 ----------
-
-// 按可执行文件名（不带路径）找出全部存活 pid
-std::vector<DWORD> FindPidsByExeName(const wchar_t* exeName) {
-    std::vector<DWORD> pids;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return pids;
-    PROCESSENTRY32W pe{};
-    pe.dwSize = sizeof(pe);
-    if (Process32FirstW(snap, &pe)) {
-        do {
-            if (_wcsicmp(pe.szExeFile, exeName) == 0) {
-                pids.push_back(pe.th32ProcessID);
-            }
-        } while (Process32NextW(snap, &pe));
-    }
-    CloseHandle(snap);
-    return pids;
-}
-
-// EnumWindows 回调上下文：给目标 pid 的全部顶层窗口投递 WM_CLOSE
-struct CloseWindowsContext {
+// WM_CLOSE 回调上下文：给指定 pid 的全部顶层窗口投递 WM_CLOSE
+struct LegacyCloseCtx {
     DWORD pid = 0;
 };
 
-BOOL CALLBACK CloseWindowsOfPidProc(HWND hwnd, LPARAM lParam) {
-    auto* ctx = reinterpret_cast<CloseWindowsContext*>(lParam);
+BOOL CALLBACK CloseLegacyWindowProc(HWND hwnd, LPARAM lp) {
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
-    if (pid == ctx->pid) {
+    if (pid == reinterpret_cast<const LegacyCloseCtx*>(lp)->pid) {
         PostMessageW(hwnd, WM_CLOSE, 0, 0);
     }
     return TRUE;
 }
 
-// 关闭一个组件：先向其全部顶层窗口发 WM_CLOSE 优雅退出，
-// 轮询约 1.5s 仍存活则逐个 TerminateProcess（组件均无未保存状态）
-void CloseComponent(const wchar_t* exeName) {
-    std::vector<DWORD> pids = FindPidsByExeName(exeName);
-    if (pids.empty()) return;
+void CloseLegacyWidgetProcesses() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            bool legacy = false;
+            for (const wchar_t* name : kLegacyWidgetExes) {
+                if (_wcsicmp(pe.szExeFile, name) == 0) {
+                    legacy = true;
+                    break;
+                }
+            }
+            if (!legacy) continue;
+            // 优雅关闭，再兜底结束（与旧托盘“关闭组件”行为一致）
+            LegacyCloseCtx ctx{pe.th32ProcessID};
+            EnumWindows(CloseLegacyWindowProc,
+                        reinterpret_cast<LPARAM>(&ctx));
+            Sleep(200);
+            HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+            if (proc) {
+                TerminateProcess(proc, 0);
+                CloseHandle(proc);
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+}
 
-    for (DWORD pid : pids) {
-        CloseWindowsContext ctx{pid};
-        EnumWindows(CloseWindowsOfPidProc, reinterpret_cast<LPARAM>(&ctx));
+struct WidgetEntry {
+    const wchar_t* label;           // 托盘菜单显示名
+    DWORD (WINAPI* proc)(LPVOID);   // 组件线程过程（原组件 WinMain）
+    std::atomic<HWND>* hwnd;        // 组件主窗口句柄（组件线程发布）
+    HANDLE thread = nullptr;        // 组件线程句柄（nullptr = 未运行）
+    DWORD tid = 0;
+};
+
+WidgetEntry g_widgets[] = {
+    {L"时钟", ClockThreadProc, &g_clockHwnd},
+    {L"日历", CalendarThreadProc, &g_calendarHwnd},
+    {L"应用管理", LauncherThreadProc, &g_launcherHwnd},
+    {L"顶栏", TopbarThreadProc, &g_topbarHwnd},
+    {L"Dock 栏", DockThreadProc, &g_dockHwnd},
+};
+constexpr int kWidgetCount =
+    static_cast<int>(sizeof(g_widgets) / sizeof(g_widgets[0]));
+
+// 回收已自行退出的组件线程（如组件右键菜单触发 WM_DESTROY）；
+// 返回该组件当前是否运行中
+bool IsWidgetRunning(int index) {
+    WidgetEntry& w = g_widgets[index];
+    if (!w.thread) return false;
+    const DWORD code = WaitForSingleObject(w.thread, 0);
+    if (code == WAIT_OBJECT_0) {
+        // 线程已结束（窗口被组件自身关闭）：回收句柄，视为停止
+        CloseHandle(w.thread);
+        w.thread = nullptr;
+        w.tid = 0;
+        return false;
     }
-    for (int i = 0; i < 15; ++i) {
-        Sleep(100);
-        if (FindPidsByExeName(exeName).empty()) return;
-    }
-    pids = FindPidsByExeName(exeName);
-    for (DWORD pid : pids) {
-        HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-        if (proc) {
-            TerminateProcess(proc, 0);
-            CloseHandle(proc);
+    return true;
+}
+
+// 启动组件：创建线程并等待其主窗口创建完成（超时 5s）
+bool StartWidget(int index) {
+    WidgetEntry& w = g_widgets[index];
+    if (IsWidgetRunning(index)) return true;  // 已在运行（内部会清理已退出线程）
+
+    w.hwnd->store(nullptr);
+    w.thread = CreateThread(nullptr, 0, w.proc,
+                            GetModuleHandleW(nullptr), 0, &w.tid);
+    if (!w.thread) return false;
+
+    // 组件线程在窗口创建成功后立即发布句柄；启动失败会提前退出线程
+    for (int i = 0; i < 500; ++i) {
+        if (w.hwnd->load() != nullptr) return true;
+        if (WaitForSingleObject(w.thread, 10) == WAIT_OBJECT_0) {
+            CloseHandle(w.thread);
+            w.thread = nullptr;
+            w.tid = 0;
+            return false;  // 组件启动失败（自身初始化错误）
         }
     }
+    return true;  // 超时但线程健在：窗口稍后可见，按运行处理
 }
 
-void CloseAllComponents() {
-    CloseComponent(kDockExe);
-    CloseComponent(kTopBarExe);
-    CloseComponent(kLauncherExe);
-    CloseComponent(kCalendarExe);
-    CloseComponent(kClockExe);
+// 关闭组件：WM_CLOSE 优雅退出（组件 WM_DESTROY 内自行清理并 PostQuitMessage），
+// 轮询约 2s 仍存活则 TerminateThread 兜底（组件均无未保存状态）
+void StopWidget(int index) {
+    WidgetEntry& w = g_widgets[index];
+    if (!w.thread) return;
+
+    HWND hwnd = w.hwnd->load();
+    if (hwnd && IsWindow(hwnd)) {
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    } else {
+        PostThreadMessageW(w.tid, WM_QUIT, 0, 0);
+    }
+    if (WaitForSingleObject(w.thread, 2000) != WAIT_OBJECT_0) {
+        TerminateThread(w.thread, 0);
+        WaitForSingleObject(w.thread, 300);
+    }
+    CloseHandle(w.thread);
+    w.thread = nullptr;
+    w.tid = 0;
+    w.hwnd->store(nullptr);
 }
 
-bool IsComponentRunning(const wchar_t* exeName) {
-    return !FindPidsByExeName(exeName).empty();
+void StartAllWidgets() {
+    for (int i = 0; i < kWidgetCount; ++i) {
+        StartWidget(i);
+    }
+}
+
+void StopAllWidgets() {
+    // 与旧的 exe 版 CloseAllComponents 相同的顺序：先停 Dock（恢复任务栏），
+    // 再停顶栏 / 应用管理 / 日历 / 时钟
+    for (int i = kWidgetCount - 1; i >= 0; --i) {
+        StopWidget(i);
+    }
+}
+
+// 托盘菜单 cmd → 组件索引（菜单项与 g_widgets 顺序一致）
+int WidgetIndexForCommand(int cmd) {
+    switch (cmd) {
+    case kMenuToggleClock: return 0;
+    case kMenuToggleCalendar: return 1;
+    case kMenuToggleLauncher: return 2;
+    case kMenuToggleTopBar: return 3;
+    case kMenuToggleDock: return 4;
+    default: return -1;
+    }
+}
+
+// 单个组件的开关：运行中则优雅关闭，未运行则启动（托盘菜单勾选项共用）
+void ToggleComponent(HWND hwnd, int index) {
+    WidgetEntry& w = g_widgets[index];
+    if (IsWidgetRunning(index)) {
+        StopWidget(index);
+        std::wstring tip = std::wstring(L"已关闭 ") + w.label;
+        ShowTrayBalloon(hwnd, tip.c_str());
+    } else {
+        StartWidget(index);
+    }
 }
 
 // ---------- Dock 开关热键 ----------
-
-void ShowTrayBalloon(HWND hwnd, const wchar_t* text);  // 定义在下方
 
 struct HotkeyChoice {
     UINT mods;
@@ -581,7 +628,7 @@ bool AddTrayIcon(HWND hwnd) {
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = kTrayMessage;
     nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP));
-    wcscpy_s(nid.szTip, L"MyWigets - 时钟 + 日历 + 顶栏 + Dock");
+    wcscpy_s(nid.szTip, L"MyWigets - 时钟 + 日历 + 应用管理 + 顶栏 + Dock");
     return Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
 }
 
@@ -602,42 +649,10 @@ void ToggleAutoStart(HWND hwnd) {
     }
 }
 
-// 单个组件的开关：运行中则关闭，未运行则启动（托盘菜单勾选项共用）
-void ToggleComponent(HWND hwnd, const wchar_t* exeName, const wchar_t* mutexName,
-                     const wchar_t* label) {
-    if (IsComponentRunning(exeName)) {
-        CloseComponent(exeName);
-        std::wstring tip = std::wstring(L"已关闭 ") + label;
-        ShowTrayBalloon(hwnd, tip.c_str());
-    } else {
-        LaunchWidget(exeName, mutexName);
-    }
-}
-
 void ExecuteMenuCommand(HWND hwnd, int cmd) {
     switch (cmd) {
     case kMenuOpenAll:
-        LaunchAllWidgets();
-        break;
-    case kMenuToggleClock:
-        ToggleComponent(hwnd, kClockExe,
-                        L"Local\\DesktopAnalogClock_SingleInstance", L"时钟");
-        break;
-    case kMenuToggleCalendar:
-        ToggleComponent(hwnd, kCalendarExe,
-                        L"Local\\DesktopCalendar_SingleInstance", L"日历");
-        break;
-    case kMenuToggleLauncher:
-        ToggleComponent(hwnd, kLauncherExe,
-                        L"Local\\DesktopLauncher_SingleInstance", L"应用管理");
-        break;
-    case kMenuToggleTopBar:
-        ToggleComponent(hwnd, kTopBarExe,
-                        L"Local\\DesktopTopBar_SingleInstance", L"顶栏");
-        break;
-    case kMenuToggleDock:
-        ToggleComponent(hwnd, kDockExe,
-                        L"Local\\DesktopDock_SingleInstance", L"Dock 栏");
+        StartAllWidgets();
         break;
     case kMenuHotkeyEnable:
         ApplyHotkey(hwnd, !g_hotkey.enabled, g_hotkey.mods, g_hotkey.vk);
@@ -651,7 +666,7 @@ void ExecuteMenuCommand(HWND hwnd, int cmd) {
         break;
     }
     case kMenuCloseAll:
-        CloseAllComponents();
+        StopAllWidgets();
         ShowTrayBalloon(hwnd, L"已关闭全部组件");
         break;
     case kMenuAutoStart:
@@ -660,14 +675,18 @@ void ExecuteMenuCommand(HWND hwnd, int cmd) {
     case kMenuExit:
         DestroyWindow(hwnd);
         break;
-    default:
-        if (cmd >= kMenuHotkeyPresetFirst &&
-            cmd < kMenuHotkeyPresetFirst + kHotkeyPresetCount) {
+    default: {
+        const int idx = WidgetIndexForCommand(cmd);
+        if (idx >= 0) {
+            ToggleComponent(hwnd, idx);
+        } else if (cmd >= kMenuHotkeyPresetFirst &&
+                   cmd < kMenuHotkeyPresetFirst + kHotkeyPresetCount) {
             const HotkeyChoice& preset =
                 kHotkeyPresets[cmd - kMenuHotkeyPresetFirst];
             ApplyHotkey(hwnd, true, preset.mods, preset.vk);
         }
         break;
+    }
     }
 }
 
@@ -684,29 +703,17 @@ void ShowTrayMenu(HWND hwnd) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
     // 全部组件统一的开关项：勾选 = 运行中，点击切换打开/关闭
-    struct ComponentToggle {
-        int id;
-        const wchar_t* exe;
-        const wchar_t* mutex;
-        const wchar_t* label;
+    // 菜单 id（1002/1003/1006/1007/1008）与 g_widgets 顺序的映射
+    static constexpr int kMenuIds[kWidgetCount] = {
+        kMenuToggleClock, kMenuToggleCalendar, kMenuToggleLauncher,
+        kMenuToggleTopBar, kMenuToggleDock,
     };
-    const ComponentToggle toggles[] = {
-        {kMenuToggleClock, kClockExe,
-         L"Local\\DesktopAnalogClock_SingleInstance", L"时钟"},
-        {kMenuToggleCalendar, kCalendarExe,
-         L"Local\\DesktopCalendar_SingleInstance", L"日历"},
-        {kMenuToggleLauncher, kLauncherExe,
-         L"Local\\DesktopLauncher_SingleInstance", L"应用管理"},
-        {kMenuToggleTopBar, kTopBarExe,
-         L"Local\\DesktopTopBar_SingleInstance", L"顶栏"},
-        {kMenuToggleDock, kDockExe,
-         L"Local\\DesktopDock_SingleInstance", L"Dock 栏"},
-    };
-    for (const auto& t : toggles) {
+    for (int i = 0; i < kWidgetCount; ++i) {
+        WidgetEntry& w = g_widgets[i];
         AppendMenuW(menu,
-                    MF_STRING | (IsComponentRunning(t.exe) ? MF_CHECKED
-                                                           : MF_UNCHECKED),
-                    t.id, t.label);
+                    MF_STRING | (IsWidgetRunning(i) ? MF_CHECKED
+                                                    : MF_UNCHECKED),
+                    kMenuIds[i], w.label);
     }
 
     // Dock 开关热键子菜单（默认 Alt+Space）
@@ -756,18 +763,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE:
         AddTrayIcon(hwnd);
-        LaunchAllWidgets();
+        CloseLegacyWidgetProcesses();  // 迁移期：清除内存中残留的旧版组件进程
         LoadHotkeyConfig();
+        StartAllWidgets();
         if (g_hotkey.enabled && !EnsureHotkeyRegistered(hwnd)) {
             ShowTrayBalloon(hwnd, L"Dock 热键注册失败（可能被其他程序占用）");
         }
         return 0;
 
+    case kMsgOpenAll:
+        StartAllWidgets();
+        return 0;
+
     case WM_HOTKEY:
         if (wParam == kHotkeyId) {
-            ToggleComponent(hwnd, kDockExe,
-                            L"Local\\DesktopDock_SingleInstance",
-                            L"Dock 栏");
+            ToggleComponent(hwnd, 4);  // Dock 栏
         }
         return 0;
 
@@ -775,7 +785,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU) {
             ShowTrayMenu(hwnd);
         } else if (LOWORD(lParam) == WM_LBUTTONUP) {
-            LaunchAllWidgets();
+            StartAllWidgets();
         }
         return 0;
 
@@ -789,12 +799,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_DESTROY:
         // 无论从菜单退出还是 WM_CLOSE（如 taskkill 优雅关闭），
-        // 都把托管的全部组件一并关闭，避免残留孤儿进程
+        // 都把进程内全部组件一并关闭，避免残留线程
         if (g_hotkeyRegistered) {
             UnregisterHotKey(hwnd, kHotkeyId);
             g_hotkeyRegistered = false;
         }
-        CloseAllComponents();
+        StopAllWidgets();
         RemoveTrayIcon(hwnd);
         PostQuitMessage(0);
         return 0;
@@ -816,11 +826,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
         return SetAutoStart(false) ? 0 : 1;
     }
 
+    EnableDpiAwareness();  // 先于本进程一切窗口创建
+
     HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         CloseHandle(mutex);
-        // 已有托盘实例在运行，本次只负责确保组件都打开，然后退出
-        LaunchAllWidgets();
+        // 已有托盘实例在运行：通知它打开全部组件，本次退出
+        HWND existing = FindWindowW(kWindowClass, nullptr);
+        if (existing) {
+            PostMessageW(existing, kMsgOpenAll, 0, 0);
+        }
         return 0;
     }
 

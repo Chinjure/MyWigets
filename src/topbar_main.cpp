@@ -58,6 +58,7 @@
 
 // Chrome 标签同步：纯逻辑层（JSON / SHA-1 / Base64 / WS 帧 / 同步模型）
 #include "topbar_ws_proto.h"
+#include "widgets.h"
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "user32.lib")
@@ -86,7 +87,6 @@ using Microsoft::WRL::ComPtr;
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"DesktopTopBarWindow";
-constexpr wchar_t kMutexName[] = L"Local\\DesktopTopBar_SingleInstance";
 
 // Chrome 浏览器标签栏的高度（96 DPI 下约 40 像素），随 DPI 缩放
 constexpr int kBaseTabHeight = 40;
@@ -3000,13 +3000,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 } // namespace
 
-int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
-    // 只允许运行一个实例
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
-    if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        CloseHandle(mutex);
-        return 0;
-    }
+// ============================== 组件接口 ==============================
+
+std::atomic<HWND> g_topbarHwnd{nullptr};
+
+DWORD WINAPI TopbarThreadProc(LPVOID param) {
+    const HINSTANCE hInstance = static_cast<HINSTANCE>(param);
 
     EnableDpiAwareness();
 
@@ -3016,9 +3015,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     ULONG_PTR gdiplusToken = 0;
     GdiplusStartupInput gdiplusStartupInput;
     if (GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, nullptr) != Ok) {
-        MessageBoxW(nullptr, L"GDI+ 初始化失败。", L"DesktopTopBar",
-                    MB_OK | MB_ICONERROR);
-        CloseHandle(mutex);
+        if (SUCCEEDED(comInit)) CoUninitialize();
         return 1;
     }
 
@@ -3045,11 +3042,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     wc.lpszClassName = kWindowClass;
 
     if (!RegisterClassExW(&wc)) {
-        MessageBoxW(nullptr, L"注册窗口类失败。", L"DesktopTopBar",
-                    MB_OK | MB_ICONERROR);
-        GdiplusShutdown(gdiplusToken);
-        CloseHandle(mutex);
-        return 1;
+        if (GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            // 组件在进程内被重启（关闭后再次打开）时类已注册，视为成功
+            GdiplusShutdown(gdiplusToken);
+            if (SUCCEEDED(comInit)) CoUninitialize();
+            return 1;
+        }
     }
 
     // Chrome 标签同步服务端需要 WinSock；失败只禁用该功能
@@ -3066,12 +3064,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         nullptr, nullptr, hInstance, &state);
 
     if (!hwnd) {
-        MessageBoxW(nullptr, L"创建顶栏窗口失败。", L"DesktopTopBar",
-                    MB_OK | MB_ICONERROR);
         GdiplusShutdown(gdiplusToken);
-        CloseHandle(mutex);
+        if (SUCCEEDED(comInit)) CoUninitialize();
+        if (wsaOk) WSACleanup();
         return 1;
     }
+
+    g_topbarHwnd.store(hwnd);  // 先发布窗口句柄，宿主可立即隐藏/关闭
 
     RECT initial{};
     GetWindowRect(hwnd, &initial);
@@ -3082,9 +3081,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
 
     if (!CreateBacking(state, width, height)) {
-        MessageBoxW(hwnd, L"创建绘图缓冲失败。", L"DesktopTopBar",
-                    MB_OK | MB_ICONERROR);
-        CloseHandle(mutex);
+        GdiplusShutdown(gdiplusToken);
+        if (SUCCEEDED(comInit)) CoUninitialize();
+        if (wsaOk) WSACleanup();
+        g_topbarHwnd.store(nullptr);
         return 1;
     }
 
@@ -3106,6 +3106,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     if (wsaOk) {
         WSACleanup();
     }
-    CloseHandle(mutex);
-    return static_cast<int>(msg.wParam);
+    g_topbarHwnd.store(nullptr);  // 窗口已销毁，线程即将退出
+    return static_cast<DWORD>(msg.wParam);
 }

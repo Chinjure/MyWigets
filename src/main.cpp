@@ -26,6 +26,8 @@
 #include <cstring>
 #include <new>
 
+#include "widgets.h"
+
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -36,7 +38,6 @@ using namespace Gdiplus;
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"DesktopAnalogClockWindow";
-constexpr wchar_t kMutexName[] = L"Local\\DesktopAnalogClock_SingleInstance";
 constexpr wchar_t kRegPath[] = L"Software\\DesktopClock";
 
 constexpr int kBaseSize = 220;          // 96 DPI 下的窗口边长
@@ -676,22 +677,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 } // namespace
 
-int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
-    // 只允许运行一个实例
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
-    if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        CloseHandle(mutex);
-        return 0;
-    }
+// ============================== 组件接口 ==============================
+
+std::atomic<HWND> g_clockHwnd{nullptr};
+
+DWORD WINAPI ClockThreadProc(LPVOID param) {
+    const HINSTANCE hInstance = static_cast<HINSTANCE>(param);
 
     EnableDpiAwareness();
 
     ULONG_PTR gdiplusToken = 0;
     GdiplusStartupInput gdiplusStartupInput;
     if (GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, nullptr) != Ok) {
-        MessageBoxW(nullptr, L"GDI+ 初始化失败。", L"DesktopClock",
-                    MB_OK | MB_ICONERROR);
-        CloseHandle(mutex);
         return 1;
     }
 
@@ -720,11 +717,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     wc.lpszClassName = kWindowClass;
 
     if (!RegisterClassExW(&wc)) {
-        MessageBoxW(nullptr, L"注册窗口类失败。", L"DesktopClock",
-                    MB_OK | MB_ICONERROR);
-        GdiplusShutdown(gdiplusToken);
-        CloseHandle(mutex);
-        return 1;
+        if (GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            // 组件在进程内被重启（关闭后再次打开）时类已注册，视为成功
+            GdiplusShutdown(gdiplusToken);
+            return 1;
+        }
     }
 
     AppState state;
@@ -737,12 +734,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         nullptr, nullptr, hInstance, &state);
 
     if (!hwnd) {
-        MessageBoxW(nullptr, L"创建时钟窗口失败。", L"DesktopClock",
-                    MB_OK | MB_ICONERROR);
         GdiplusShutdown(gdiplusToken);
-        CloseHandle(mutex);
         return 1;
     }
+
+    g_clockHwnd.store(hwnd);  // 先发布窗口句柄，宿主可立即隐藏/关闭
 
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
@@ -753,6 +749,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
 
     GdiplusShutdown(gdiplusToken);
-    CloseHandle(mutex);
-    return static_cast<int>(msg.wParam);
+    g_clockHwnd.store(nullptr);  // 窗口已销毁，线程即将退出
+    return static_cast<DWORD>(msg.wParam);
 }

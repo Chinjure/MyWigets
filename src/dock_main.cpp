@@ -52,12 +52,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
+#include <mutex>    // std::once_flag：托盘注册表监听线程每进程仅建一次
+#include <new>      // 组件重启时 placement-new 重建 g_state
 #include <share.h>   // _SH_DENYNO：日志允许外部同时读取
 #include <string>
 #include <thread>    // 关闭应用的后台等待线程（UI 不阻塞）
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include "widgets.h"
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "user32.lib")
@@ -75,7 +79,6 @@ using namespace Gdiplus;
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"DesktopDockWindow";
-constexpr wchar_t kMutexName[] = L"Local\\DesktopDock_SingleInstance";
 constexpr wchar_t kRegPath[] = L"Software\\DesktopSuite\\Dock";
 constexpr wchar_t kNotifyIconsKey[] = L"Control Panel\\NotifyIconSettings";
 
@@ -593,7 +596,6 @@ void SeedDefaultPinsIfEmpty(AppState& s) {
         return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
     };
     const std::wstring candidates[] = {
-        repoDir + L"\\bin\\DesktopLauncher-x64.exe",
         repoDir + L"\\Terminal.lnk",
         repoDir + L"\\记事本.lnk",
         repoDir + L"\\Excel.lnk",
@@ -1748,12 +1750,17 @@ void TrayRegistryWatchThread() {
             Sleep(30000);
             continue;
         }
-        PostMessageW(g_state.hwnd, kMsgRefresh, 0, 0);
+        PostMessageW(g_dockHwnd.load(), kMsgRefresh, 0, 0);
     }
 }
 
 void StartTrayRegistryWatch() {
-    std::thread([]() { TrayRegistryWatchThread(); }).detach();
+    // 进程内组件可反复重启（托盘关闭后再打开）：监听线程只随进程创建一次，
+    // 通过原子句柄 g_dockHwnd 追踪当前 Dock 窗口（窗口销毁期间投递自然失效）
+    static std::once_flag once;
+    std::call_once(once, []() {
+        std::thread([]() { TrayRegistryWatchThread(); }).detach();
+    });
 }
 
 // ============================== 刷新合并 ==============================
@@ -3053,7 +3060,7 @@ void TrayIconTriggerAsync(AppState& s, const std::wstring& nameHint,
         Logf(ok ? L"托盘图标触发成功：%ls（等待应用自行恢复）"
                 : L"托盘图标触发失败：%ls",
              nameHint.c_str());
-        PostMessageW(g_state.hwnd, kMsgTriggerDone, ok ? 1 : 0,
+        PostMessageW(g_dockHwnd.load(), kMsgTriggerDone, ok ? 1 : 0,
                      static_cast<LPARAM>(itemIdx));
     }).detach();
 }
@@ -3975,12 +3982,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 }  // namespace
 
-int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
-    if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        CloseHandle(mutex);
-        return 0;
-    }
+// ============================== 组件接口 ==============================
+
+std::atomic<HWND> g_dockHwnd{nullptr};
+
+namespace {
+
+// 进程内重启（托盘关闭后再次打开）时重建全部全局状态：
+// g_state 里累积的 items/geoms/orderMap/缓存等都来自上一运行周期。
+void ResetDockGlobalsForRestart() {
+    g_state.~AppState();
+    ::new (static_cast<void*>(&g_state)) AppState();
+    g_showDesktopMinimized.clear();
+    g_showDesktopActive = false;
+    g_suiteWindows.clear();
+    g_hookLastOnDock = false;
+    g_hookLeftDownOnDock = false;
+    g_skipTrayTriggerOnce = false;
+}
+
+}  // namespace
+
+DWORD WINAPI DockThreadProc(LPVOID param) {
+    const HINSTANCE hInstance = static_cast<HINSTANCE>(param);
+
+    ResetDockGlobalsForRestart();
 
     EnableDpiAwareness();
     RefreshPrimaryWorkArea();  // DPI 感知就绪后建立工作区缓存（后续热路径零系统调用）
@@ -3991,10 +4017,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     ULONG_PTR token = 0;
     GdiplusStartupInput gsi{};
     if (GdiplusStartup(&token, &gsi, nullptr) != Ok) {
-        MessageBoxW(nullptr, L"GDI+ 初始化失败。", L"DesktopDock",
-                    MB_OK | MB_ICONERROR);
         if (SUCCEEDED(comInit)) CoUninitialize();
-        if (mutex) CloseHandle(mutex);
         return 1;
     }
 
@@ -4020,13 +4043,13 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     wc.hCursor = LoadCursorW(nullptr, IDC_HAND);
     wc.lpszClassName = kWindowClass;
     if (!RegisterClassExW(&wc)) {
-        MessageBoxW(nullptr, L"注册窗口类失败。", L"DesktopDock",
-                    MB_OK | MB_ICONERROR);
-        GdiplusShutdown(token);
-        LogClose();
-        if (SUCCEEDED(comInit)) CoUninitialize();
-        if (mutex) CloseHandle(mutex);
-        return 1;
+        if (GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            // 组件在进程内被重启（关闭后再次打开）时类已注册，视为成功
+            GdiplusShutdown(token);
+            LogClose();
+            if (SUCCEEDED(comInit)) CoUninitialize();
+            return 1;
+        }
     }
 
     const SIZE initial = DesiredWindowSize(s);
@@ -4036,14 +4059,13 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         kWindowClass, L"DesktopDock", WS_POPUP, CW_USEDEFAULT, CW_USEDEFAULT,
         initial.cx, initial.cy, nullptr, nullptr, hInstance, nullptr);
     if (!s.hwnd) {
-        MessageBoxW(nullptr, L"创建 Dock 窗口失败。", L"DesktopDock",
-                    MB_OK | MB_ICONERROR);
         GdiplusShutdown(token);
         LogClose();
         if (SUCCEEDED(comInit)) CoUninitialize();
-        if (mutex) CloseHandle(mutex);
         return 1;
     }
+
+    g_dockHwnd.store(s.hwnd);  // 先发布窗口句柄，宿主可立即隐藏/关闭
 
     DragAcceptFiles(s.hwnd, TRUE);
 
@@ -4087,6 +4109,6 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     GdiplusShutdown(token);
     LogClose();
     if (SUCCEEDED(comInit)) CoUninitialize();
-    if (mutex) CloseHandle(mutex);
-    return static_cast<int>(msg.wParam);
+    g_dockHwnd.store(nullptr);  // 窗口已销毁，线程即将退出
+    return static_cast<DWORD>(msg.wParam);
 }

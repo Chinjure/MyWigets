@@ -36,13 +36,22 @@ if (-not $vsDevCmd -and -not (Get-Command cl.exe -ErrorAction SilentlyContinue))
     throw 'MSVC not found. Run this script from "x64 Native Tools Command Prompt" or install the VS C++ workload.'
 }
 
-$src = Join-Path $root 'src\mywigets_main.cpp'
-$rc = Join-Path $root 'src\app.rc'
 $srcDir = Join-Path $root 'src'
 $outDir = Join-Path $root 'bin'
 $null = New-Item -ItemType Directory -Force -Path $outDir
 $exe = Join-Path $outDir "MyWigets-$Architecture.exe"
 $res = Join-Path $outDir "mywigets-$Architecture.res"
+
+# Single-process host: all widget sources are linked into MyWigets.exe.
+# No standalone widget exe is produced anymore.
+$sources = @(
+    'mywigets_main.cpp',
+    'main.cpp',          # clock
+    'calendar_main.cpp', # calendar
+    'launcher_main.cpp', # launcher
+    'topbar_main.cpp',   # topbar
+    'dock_main.cpp'      # dock
+) | ForEach-Object { (Join-Path $srcDir $_) }
 
 $defs = '/DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX'
 if ($Configuration -eq 'Release') {
@@ -51,7 +60,12 @@ if ($Configuration -eq 'Release') {
     $optim = '/Od /MTd /Zi'
 }
 
-$clLine = "cl /nologo /std:c++17 /EHsc $optim /W4 /permissive- /utf-8 $defs /Fe:`"$exe`" `"$src`" `"$res`" /link /SUBSYSTEM:WINDOWS user32.lib advapi32.lib shell32.lib gdi32.lib"
+$srcNames = $sources | ForEach-Object { '"' + $_ + '"' }
+$srcList = $srcNames -join ' '
+
+$libs = 'gdiplus.lib user32.lib gdi32.lib advapi32.lib shell32.lib ole32.lib oleaut32.lib ws2_32.lib uuid.lib version.lib propsys.lib dwmapi.lib uiautomationcore.lib comctl32.lib Mmdevapi.lib'
+
+$clLine = "cl /nologo /std:c++17 /EHsc $optim /W4 /permissive- /utf-8 $defs /Fe:`"$exe`" $srcList `"$res`" /link /SUBSYSTEM:WINDOWS $libs"
 
 $bat = Join-Path $env:TEMP 'mywigets_build.bat'
 $lines = @('@echo off', 'setlocal')
