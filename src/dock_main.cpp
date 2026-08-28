@@ -1563,6 +1563,24 @@ bool PointInDockOrStrip(POINT pt) {
     return InDockStrip(pt);
 }
 
+// 低层钩子收到的光标坐标是"未裁剪"的原始位置：光标贴住屏幕外缘（如贴底）
+// 继续推动时，系统把真实光标钳制在虚拟屏内，但递交给钩子的位置仍带原始
+// 增量，可任意越界（实测贴底每次 +3/-5 推动即出现 y=1602/1605，大增量可到
+// 1650+）。若直接用该越界值做"是否在 Dock"判定，贴底继续向下推动会被误判
+// 为已离开 → 收起；随后帧自愈用真实（钳制后）坐标又判为"仍在 Dock" →
+// 立即取消收起，形成"先向下收起再迅速展开"的往返跳动（贴底推动时 Dock
+// 上下抖动的根因）。因此凡是要用光标位置做"在 Dock / 角部"判定，一律先
+// 按虚拟屏边界钳制原始坐标（钳制结果 == 系统对真实光标的钳制位置）。
+POINT RealHookPoint(MSLLHOOKSTRUCT* ms) {
+    POINT pt = ms->pt;
+    const RECT v = VirtualScreenRect();
+    if (pt.x < v.left) pt.x = v.left;
+    else if (pt.x >= v.right) pt.x = v.right - 1;
+    if (pt.y < v.top) pt.y = v.top;
+    else if (pt.y >= v.bottom) pt.y = v.bottom - 1;
+    return pt;
+}
+
 // 收起方向：上方/左侧/右侧离开，或越过有效区下缘（如移到主屏下方的副屏）
 // 才收起；底部离开但仍在有效区（空隙/触发条/贴边容差）内则不收起。
 // wasOnDock 只在收起触发时复位（环带中间区域不复位），缓慢离开一样触发。
@@ -1584,16 +1602,20 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
             return CallNextHookEx(nullptr, code, wParam, lParam);
         }
 
+        // 统一真实（钳制后）光标位置：见 RealHookPoint 的说明，钩子原始
+        // 坐标在屏幕外缘可越界，所有判定都必须用钳制后的物理真值。
+        const POINT pt = RealHookPoint(ms);
+
         if (wParam == WM_MOUSEMOVE) {
-            const bool onDock = PointInDockOrStrip(ms->pt);
+            const bool onDock = PointInDockOrStrip(pt);
             if (onDock != g_hookLastOnDock) {
                 g_hookLastOnDock = onDock;
-                // lParam 携带触发本次状态翻转的光标物理位置（ms->pt）：
+                // lParam 携带触发本次状态翻转的光标位置（钳制后的真值）：
                 // UI 线程用它判断离开方向（上/左/右 = 收起），避免 UI 线程
                 // 再次 GetCursorPos 读到抖动后的新位置，导致贴顶离开判定
                 // 失败、收起永不触发。
                 PostMessageW(g_state.hwnd, kMsgHookMouse, onDock ? 1 : 0,
-                             MAKELPARAM(ms->pt.x, ms->pt.y));
+                             MAKELPARAM(pt.x, pt.y));
             }
         } else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP ||
                    wParam == WM_LBUTTONDBLCLK) {
@@ -1602,13 +1624,13 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
             // 作为无伴生按下的孤儿序列穿透到 Dock 下方窗口。
             const bool isDown =
                 wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONDBLCLK;
-            if (isDown && InCornerZone(ms->pt, true)) {
+            if (isDown && InCornerZone(pt, true)) {
                 // 左下角：仿 Windows 开始按钮 —— 触发 Win 键（打开开始菜单）
                 PostMessageW(g_state.hwnd, kMsgHookClick, kHookClickStart, 0);
                 g_hookLeftDownOnDock = true;
                 return 1;  // 吞掉：点击不穿透到下方窗口
             }
-            if (isDown && InCornerZone(ms->pt, false)) {
+            if (isDown && InCornerZone(pt, false)) {
                 // 右下角：显示桌面（再点恢复）
                 PostMessageW(g_state.hwnd, kMsgHookClick,
                              kHookClickShowDesktop, 0);
@@ -1617,9 +1639,9 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
             }
 
             // 只采集 Dock/透明底部空隙/贴底边缘的点击，动作由 UI 线程执行。
-            if (isDown && PointInDockOrStrip(ms->pt)) {
-                float mx = static_cast<float>(ms->pt.x - g_state.winX);
-                float my = static_cast<float>(ms->pt.y - g_state.winY);
+            if (isDown && PointInDockOrStrip(pt)) {
+                float mx = static_cast<float>(pt.x - g_state.winX);
+                float my = static_cast<float>(pt.y - g_state.winY);
                 // 空隙处于窗口矩形下方时，按最近有效边缘处理
                 if (my >= static_cast<float>(g_state.winH)) {
                     my = static_cast<float>(g_state.winH) - 1.f;
@@ -1651,7 +1673,7 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
             // 即“Dock 外界面点不动、键盘正常”的元凶）。
             // 现在：按下落在 Dock 有效区同样吞掉，抬起按配对吞掉并投递关闭。
             if (wParam == WM_MBUTTONDOWN) {
-                if (PointInDockOrStrip(ms->pt)) {
+                if (PointInDockOrStrip(pt)) {
                     g_hookMiddleDownOnDock = true;
                     return 1;
                 }
@@ -1663,9 +1685,9 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
                 g_hookMiddleDownOnDock = false;
                 // 与窗口内中键一致：底部空隙/贴边也能中键关闭，并立即隐藏圆点。
                 // 同样只采集，投递到 UI 线程后执行（避免钩子内做窗口管理）。
-                if (PointInDockOrStrip(ms->pt)) {
-                    float mx = static_cast<float>(ms->pt.x - g_state.winX);
-                    float my = static_cast<float>(ms->pt.y - g_state.winY);
+                if (PointInDockOrStrip(pt)) {
+                    float mx = static_cast<float>(pt.x - g_state.winX);
+                    float my = static_cast<float>(pt.y - g_state.winY);
                     if (my >= static_cast<float>(g_state.winH)) {
                         my = static_cast<float>(g_state.winH) - 1.f;
                     }
@@ -3842,7 +3864,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     // 用钩子线程采集的“触发翻转时的光标位置”判定离开方向，
                     // 而不是在这里重新 GetCursorPos：UI 线程处理该消息时游标
                     // 可能已因 1-2px 抖动回到边界内（贴顶离开最常见的失败），
-                    // 让收起判定永远落空。lParam 即钩子投递的 ms->pt。
+                    // 让收起判定永远落空。lParam 即钩子投递的钳制后真实位置
+                    // （见 RealHookPoint：贴住屏幕外缘的原始坐标按虚拟屏钳制，
+                    // 与系统对真实光标的钳制结果一致）。
                     const POINT cp{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
                     RECT wr{};
                     if (GetWindowRect(s->hwnd, &wr)) {
