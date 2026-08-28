@@ -2429,17 +2429,25 @@ void DrawVolumeGlyph(Graphics& g, const RectF& r, float scale, const Color& col,
 }
 
 // Win11 风格任务栏时钟：时间在上、日期在下两行，居中显示于时钟区域。
-// 字体跟随 Win11 任务栏（Segoe UI Variable Text，回退 Segoe UI）。
+// 字体用圆润的 MiSans（回退 Segoe UI Variable / Segoe UI），
+// 并强制灰度抗锯齿：分层窗口上 GDI+ 默认的 ClearType 会产生彩色描边。
 void DrawClock(Graphics& g, AppState& s, const RectF& r) {
     const float k = s.scale;
 
-    // Win11 任务栏字体（Segoe UI Variable Text，回退 Segoe UI）。
-    // GDI+ FontFamily 拷贝赋值是 private，用两个实例 + 指针选择。
-    FontFamily famUiVar(L"Segoe UI Variable Text");
-    FontFamily famUi(L"Segoe UI");
-    const FontFamily* fam = &famUiVar;
-    if (famUiVar.GetLastStatus() != Ok) {
-        fam = &famUi;
+    // 灰度抗锯齿，去掉文本彩色描边（默认 TextRenderingHint 是 ClearType）
+    g.SetTextRenderingHint(TextRenderingHintAntiAlias);
+
+    // 圆润字体选择：MiSans → Segoe UI Variable Text Semibold → Segoe UI Semibold。
+    // GDI+ FontFamily 拷贝赋值是 private，用多个实例 + 指针选择。
+    FontFamily famMiSans(L"MiSans");
+    FontFamily famSegVar(L"Segoe UI Variable Text Semibold");
+    FontFamily famSeg(L"Segoe UI Semibold");
+    const FontFamily* fam = &famMiSans;
+    if (famMiSans.GetLastStatus() != Ok) {
+        fam = &famSegVar;
+        if (famSegVar.GetLastStatus() != Ok) {
+            fam = &famSeg;
+        }
     }
     Gdiplus::Font font(fam, 12.0f * k, FontStyleRegular, UnitPixel);
 
