@@ -16,7 +16,7 @@
 //      即「现在正以托盘形式驻留的第三方程序」。这类程序即使没有任何可见窗口，
 //      也出现在 Dock 运行区并带运行圆点；纯后台静默项可右键隐藏。
 //   5. 点击行为：应用未在前台时 打开该应用的全部主窗口（最小化的一次性恢复），
-//      前台时 最小化全部；纯托盘驻留（隐藏 Qt 主窗等）仍走托盘图标触发或启动；
+//      前台时 最小化全部；纯托盘驻留统一走托盘图标触发（TrayList 方式）或启动；
 //      启动时有 macOS 风格弹跳动画直到应用出现；中键关闭该应用全部窗口
 //
 // 日志写入 ..\logs\dock.log
@@ -40,6 +40,7 @@
 #include <propsys.h>         // System.Link.TargetParsingPath（广告式 lnk 解析）
 #include <dwmapi.h>
 #include <UIAutomationClient.h>  // Win11 XAML 托盘图标触发（UIA Invoke）
+#include <wrl/client.h>          // TrayList 同款 ComPtr 托盘枚举/点击
 #include <tlhelp32.h>
 #include <objidl.h>  // GDI+ 需要 IStream 等 COM 类型，先于 gdiplus.h 包含
 #include <gdiplus.h>
@@ -52,6 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
+#include <functional>  // 托盘 UIA 树遍历递归（std::function）
 #include <mutex>    // std::once_flag：托盘注册表监听线程每进程仅建一次
 #include <new>      // 组件重启时 placement-new 重建 g_state
 #include <share.h>   // _SH_DENYNO：日志允许外部同时读取
@@ -113,7 +115,7 @@ constexpr ULONGLONG kSafetyPollMs = 60000;     // 事件失效保底轮询（功
 constexpr ULONGLONG kRunningPathsCacheMs = 3000;  // 运行路径/托盘注册表缓存（进程级枚举较贵）
 constexpr ULONGLONG kTooltipDelayMs = 480;     // 悬停出提示延迟
 constexpr ULONGLONG kLaunchBounceMs = 3600;    // 启动弹跳超时
-constexpr ULONGLONG kTrayTriggerWindowMs = 2200;  // 托盘图标触发：任务栏临时可见窗口
+constexpr ULONGLONG kTrayTriggerWindowMs = 2200;  // 托盘图标触发：UIA 重试窗口
 constexpr int kMenuBaseId = 4000;
 constexpr int kMenuExit = 1001;
 constexpr int kMenuToggleAutoCollapse = 1002;  // 空白区右键：自动收起开关
@@ -2954,11 +2956,21 @@ void RequestCloseByIndex(AppState& s, size_t idx) {
 }
 
 // ============ 托盘图标触发（Win11 XAML 托盘）============
-// 参考桌面 TrayList 项目：Win11 任务栏托盘图标是 XAML 元素（无 HWND、
+// 参考桌面 TrayList 项目重构：Win11 任务栏托盘图标是 XAML 元素（无 HWND、
 // 无 ToolbarWindow32），但 UIA 树暴露其元素且支持 Invoke /
-// LegacyIAccessible.DoDefaultAction —— 等价于点击托盘图标，让应用自己
-// 恢复主窗口。这是"仅托盘驻留"应用（微信主窗被销毁等场景）唯一可靠的
-// 打开方式。任务栏必须可见（UIA 树才存在），由调用方负责临时显示。
+// LegacyIAccessible.DoDefaultAction / 坐标点击 —— 等价于点击托盘图标，让应用
+// 自己恢复主窗口。这是"仅托盘驻留"应用（微信主窗被销毁等场景）唯一可靠的
+// 打开方式。
+//
+// 与旧实现的关键差异：
+//   1. 不再只按 ClassName 含 "SystemTray." 过滤，而是沿用 TrayList 的
+//      Windows.UI.Composition.DesktopWindowContentBridge / TrayNotifyWnd
+//      全量 UIA 枚举（Button/ListItem/Image），避免 XAML 类名变化导致找不到。
+//   2. 优先用 RuntimeId 精确定位后 UIA Invoke，失败再用图标包围盒中心
+//      SendInput 坐标点击（TrayList click.cpp 同款）。
+//   3. 覆盖溢出区（隐藏托盘）图标，OpenOverflow 后按显示名匹配点击。
+//   4. 根据实测，TrayList 在任务栏被 Dock 隐藏时仍能正常打开托盘图标；
+//      因此不再临时 ShowTaskbar，避免任务栏闪烁和触发期间工作区来回切换。
 //
 // 为什么必须走这条路（而不是 ShowWindow 强显）：
 // 微信 4.0（Weixin.exe，Qt 5.15 自绘无边框）主窗口的输入管线只有在应用
@@ -2967,145 +2979,705 @@ void RequestCloseByIndex(AppState& s, size_t idx) {
 // 键盘全部无响应 —— “看得见点不动”的影子窗口，且微信随后还会检测到
 // 外部篡改而销毁重建窗口。唯一可靠的恢复入口就是它自己的托盘图标处理器。
 
-// 托盘图标元素匹配：主判据 = 元素 ProcessId ∈ 目标应用 pid；
-// 兜底判据 = 元素 Name（工具提示）与显示名互相包含（含微信中文名别名）
+// 前置声明：TrayIconMatchesApp 等辅助函数会使用（定义在下方）。
 bool TrayElementNameMatches(const std::wstring& hint,
-                            const std::wstring& name) {
-    if (hint.empty() || name.empty()) return false;
-    if (name.find(hint) != std::wstring::npos) return true;
-    if (hint.find(name) != std::wstring::npos) return true;
-    const std::wstring lowerHint = ToLower(hint);
-    if (lowerHint.find(L"weixin") != std::wstring::npos ||
-        lowerHint.find(L"wechat") != std::wstring::npos) {
-        // 微信的产品名是中文“微信”，显示名是英文 Weixin
-        static const wchar_t* kWxNames[] = {L"微信", L"wechat", L"WeChat"};
-        for (const wchar_t* a : kWxNames) {
-            if (name.find(a) != std::wstring::npos) return true;
+                            const std::wstring& name);
+
+namespace {
+using Microsoft::WRL::ComPtr;
+
+constexpr wchar_t kShellTrayWndCls[] = L"Shell_TrayWnd";
+constexpr wchar_t kTrayNotifyWndCls[] = L"TrayNotifyWnd";
+constexpr wchar_t kDesktopContentBridgeCls[] =
+    L"Windows.UI.Composition.DesktopWindowContentBridge";
+constexpr wchar_t kOverflowXamlIslandCls[] =
+    L"TopLevelWindowForOverflowXamlIsland";
+constexpr wchar_t kNotifyIconOverflowCls[] = L"NotifyIconOverflowWindow";
+constexpr wchar_t kToolbarWindow32Cls[] = L"ToolbarWindow32";
+constexpr wchar_t kSysPagerCls[] = L"SysPager";
+
+struct DockTrayIconInfo {
+    int index = 0;
+    std::wstring name;
+    std::wstring tooltip;
+    std::wstring processName;
+    std::wstring executablePath;
+    DWORD processId = 0;
+    std::wstring automationId;
+    std::wstring runtimeId;
+    RECT bounds{};
+    bool hasValidBounds = false;
+
+    std::wstring DisplayName() const {
+        if (!tooltip.empty()) return tooltip;
+        if (!name.empty()) return name;
+        if (!processName.empty()) return processName;
+        return L"未知图标 #" + std::to_wstring(index + 1);
+    }
+};
+
+// 递归收集托盘区域的 XAML DesktopWindowContentBridge 桥窗口。
+// 这些桥窗口是 Win11 XAML 化托盘的 UIA 宿主，TrayList 正是从这里枚举。
+void FindBridgeWindowsRecursive(HWND parent, std::vector<HWND>& out) {
+    if (!parent) return;
+    HWND child = nullptr;
+    while (true) {
+        child = FindWindowExW(parent, child, nullptr, nullptr);
+        if (!child) break;
+        wchar_t cls[256] = {};
+        GetClassNameW(child, cls, 255);
+        if (_wcsicmp(cls, kDesktopContentBridgeCls) == 0) {
+            out.push_back(child);
+        }
+        FindBridgeWindowsRecursive(child, out);
+    }
+}
+
+std::vector<HWND> CollectTrayBridgeWindows() {
+    std::vector<HWND> bridges;
+    HWND hTray = FindWindowW(kShellTrayWndCls, nullptr);
+    if (hTray) FindBridgeWindowsRecursive(hTray, bridges);
+    HWND hNotify = hTray ? FindWindowExW(hTray, nullptr, kTrayNotifyWndCls,
+                                         nullptr)
+                         : nullptr;
+    if (hNotify) FindBridgeWindowsRecursive(hNotify, bridges);
+    std::sort(bridges.begin(), bridges.end());
+    bridges.erase(std::unique(bridges.begin(), bridges.end()), bridges.end());
+    return bridges;
+}
+
+std::wstring UiaElementName(ComPtr<IUIAutomationElement>& el) {
+    BSTR b = nullptr;
+    std::wstring out;
+    if (SUCCEEDED(el->get_CurrentName(&b)) && b) {
+        out = b;
+        SysFreeString(b);
+    }
+    return out;
+}
+
+std::wstring UiaElementAutomationId(ComPtr<IUIAutomationElement>& el) {
+    BSTR b = nullptr;
+    std::wstring out;
+    if (SUCCEEDED(el->get_CurrentAutomationId(&b)) && b) {
+        out = b;
+        SysFreeString(b);
+    }
+    return out;
+}
+
+std::wstring UiaElementRuntimeId(ComPtr<IUIAutomationElement>& el) {
+    SAFEARRAY* psa = nullptr;
+    if (FAILED(el->GetRuntimeId(&psa)) || !psa) return L"";
+    std::wstring out;
+    int* data = nullptr;
+    LONG lb = 0, ub = 0;
+    SafeArrayGetLBound(psa, 1, &lb);
+    SafeArrayGetUBound(psa, 1, &ub);
+    if (SUCCEEDED(SafeArrayAccessData(psa,
+                                      reinterpret_cast<void**>(&data)))) {
+        for (LONG i = lb; i <= ub; ++i) {
+            if (!out.empty()) out += L",";
+            out += std::to_wstring(data[i]);
+        }
+        SafeArrayUnaccessData(psa);
+    }
+    SafeArrayDestroy(psa);
+    return out;
+}
+
+bool UiaElementBounds(ComPtr<IUIAutomationElement>& el, RECT& rc) {
+    rc = {};
+    if (FAILED(el->get_CurrentBoundingRectangle(&rc))) return false;
+    return rc.right - rc.left > 0 && rc.bottom - rc.top > 0;
+}
+
+int UiaElementControlType(ComPtr<IUIAutomationElement>& el) {
+    CONTROLTYPEID t = 0;
+    el->get_CurrentControlType(&t);
+    return static_cast<int>(t);
+}
+
+DWORD UiaElementProcessId(ComPtr<IUIAutomationElement>& el) {
+    int pid = 0;
+    el->get_CurrentProcessId(&pid);
+    return static_cast<DWORD>(pid);
+}
+
+std::wstring UiaLegacyDescription(ComPtr<IUIAutomationElement>& el) {
+    IUnknown* raw = nullptr;
+    if (FAILED(el->GetCurrentPattern(UIA_LegacyIAccessiblePatternId,
+                                     &raw)) ||
+        !raw) {
+        return L"";
+    }
+    ComPtr<IUnknown> unk;
+    unk.Attach(raw);
+    ComPtr<IUIAutomationLegacyIAccessiblePattern> p;
+    if (FAILED(unk.As(&p)) || !p) return L"";
+
+    BSTR b = nullptr;
+    if (SUCCEEDED(p->get_CurrentDescription(&b)) && b) {
+        std::wstring out(b);
+        SysFreeString(b);
+        if (!out.empty()) return out;
+    }
+    b = nullptr;
+    if (SUCCEEDED(p->get_CurrentName(&b)) && b) {
+        std::wstring out(b);
+        SysFreeString(b);
+        return out;
+    }
+    return L"";
+}
+
+std::vector<ComPtr<IUIAutomationElement>> UiaFindAll(
+    IUIAutomation* uia, ComPtr<IUIAutomationElement>& root, TreeScope scope) {
+    std::vector<ComPtr<IUIAutomationElement>> out;
+    if (!uia || !root) return out;
+    IUIAutomationCondition* rawCond = nullptr;
+    if (FAILED(uia->CreateTrueCondition(&rawCond)) || !rawCond) return out;
+    ComPtr<IUIAutomationCondition> cond;
+    cond.Attach(rawCond);
+    IUIAutomationElementArray* rawArr = nullptr;
+    if (FAILED(root->FindAll(scope, cond.Get(), &rawArr)) || !rawArr) {
+        return out;
+    }
+    ComPtr<IUIAutomationElementArray> arr;
+    arr.Attach(rawArr);
+    int n = 0;
+    arr->get_Length(&n);
+    for (int i = 0; i < n; ++i) {
+        IUIAutomationElement* rawEl = nullptr;
+        if (SUCCEEDED(arr->GetElement(i, &rawEl)) && rawEl) {
+            ComPtr<IUIAutomationElement> e;
+            e.Attach(rawEl);
+            out.push_back(e);
+        }
+    }
+    return out;
+}
+
+bool InvokeTrayElement(ComPtr<IUIAutomationElement>& el) {
+    // 左键点击语义：InvokePattern 优先，失败退 LegacyIAccessible.DoDefaultAction。
+    IUnknown* rawInv = nullptr;
+    if (SUCCEEDED(el->GetCurrentPattern(UIA_InvokePatternId, &rawInv)) &&
+        rawInv) {
+        ComPtr<IUnknown> unk;
+        unk.Attach(rawInv);
+        ComPtr<IUIAutomationInvokePattern> p;
+        if (SUCCEEDED(unk.As(&p)) && p && SUCCEEDED(p->Invoke())) {
+            return true;
+        }
+    }
+    IUnknown* rawLeg = nullptr;
+    if (SUCCEEDED(el->GetCurrentPattern(UIA_LegacyIAccessiblePatternId,
+                                        &rawLeg)) &&
+        rawLeg) {
+        ComPtr<IUnknown> unk;
+        unk.Attach(rawLeg);
+        ComPtr<IUIAutomationLegacyIAccessiblePattern> p;
+        if (SUCCEEDED(unk.As(&p)) && p && SUCCEEDED(p->DoDefaultAction())) {
+            return true;
         }
     }
     return false;
 }
 
-// 单次 UIA 扫描：在任务栏 UIA 树中找目标应用的托盘图标并触发。
-// 返回 true 表示已成功发出 Invoke / DoDefaultAction（应用将自行恢复）。
-bool UiTrayIconInvokeOnce(IUIAutomation* uia, const std::wstring& nameHint,
-                          const std::vector<DWORD>& pids) {
-    if (!uia) return false;
-    bool done = false;
+// TrayList click.cpp 同款：绝对坐标 + 虚拟桌面映射的 SendInput 点击。
+bool SendTrayClickAt(int screenX, int screenY) {
+    int vscreenW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int vscreenH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    int vscreenL = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int vscreenT = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    if (vscreenW <= 0) vscreenW = GetSystemMetrics(SM_CXSCREEN);
+    if (vscreenH <= 0) vscreenH = GetSystemMetrics(SM_CYSCREEN);
 
-    IUIAutomationElement* root = nullptr;
-    if (FAILED(uia->GetRootElement(&root)) || !root) return false;
-
-    VARIANT vCls{};
-    vCls.vt = VT_BSTR;
-    vCls.bstrVal = SysAllocString(L"Shell_TrayWnd");
-    IUIAutomationCondition* cond = nullptr;
-    if (SUCCEEDED(uia->CreatePropertyCondition(UIA_ClassNamePropertyId, vCls,
-                                               &cond)) &&
-        cond) {
-        IUIAutomationElement* tray = nullptr;
-        if (SUCCEEDED(root->FindFirst(TreeScope_Children, cond, &tray)) &&
-            tray) {
-            IUIAutomationCondition* trueCond = nullptr;
-            if (SUCCEEDED(uia->CreateTrueCondition(&trueCond)) && trueCond) {
-                IUIAutomationElementArray* els = nullptr;
-                if (SUCCEEDED(tray->FindAll(TreeScope_Descendants, trueCond,
-                                            &els)) &&
-                    els) {
-                    int len = 0;
-                    els->get_Length(&len);
-                    for (int i = 0; i < len && !done; ++i) {
-                        IUIAutomationElement* el = nullptr;
-                        if (FAILED(els->GetElement(i, &el)) || !el) continue;
-
-                        // 只看托盘按钮元素（SystemTray.NormalButton /
-                        // SystemTray.AccentButton 等）
-                        BSTR cls = nullptr;
-                        el->get_CurrentClassName(&cls);
-                        const bool isTrayBtn =
-                            cls && wcsstr(cls, L"SystemTray.") != nullptr;
-                        if (cls) SysFreeString(cls);
-                        if (!isTrayBtn) {
-                            el->Release();
-                            continue;
-                        }
-
-                        bool matched = false;
-                        int pid = 0;
-                        if (SUCCEEDED(el->get_CurrentProcessId(&pid))) {
-                            const DWORD dpid = static_cast<DWORD>(pid);
-                            for (DWORD p : pids) {
-                                if (p == dpid) {
-                                    matched = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (!matched) {
-                            BSTR nm = nullptr;
-                            if (SUCCEEDED(el->get_CurrentName(&nm)) && nm) {
-                                matched = TrayElementNameMatches(
-                                    nameHint, nm);
-                                SysFreeString(nm);
-                            }
-                        }
-                        if (!matched) {
-                            el->Release();
-                            continue;
-                        }
-
-                        // InvokePattern 优先，失败退 LegacyIAccessible
-                        IUIAutomationInvokePattern* inv = nullptr;
-                        if (SUCCEEDED(el->GetCurrentPatternAs(
-                                         UIA_InvokePatternId,
-                                         IID_PPV_ARGS(&inv))) &&
-                            inv) {
-                            inv->Invoke();
-                            inv->Release();
-                            done = true;
-                        } else {
-                            IUIAutomationLegacyIAccessiblePattern* leg =
-                                nullptr;
-                            if (SUCCEEDED(el->GetCurrentPatternAs(
-                                             UIA_LegacyIAccessiblePatternId,
-                                             IID_PPV_ARGS(&leg))) &&
-                                leg) {
-                                leg->DoDefaultAction();
-                                leg->Release();
-                                done = true;
-                            }
-                        }
-                        el->Release();
-                    }
-                    els->Release();
-                }
-                trueCond->Release();
-            }
-            tray->Release();
-        }
-        cond->Release();
-    }
-    VariantClear(&vCls);
-    root->Release();
-    return done;
+    int absX = static_cast<int>(
+        (static_cast<LONG_PTR>(screenX - vscreenL) * 65536L) / vscreenW);
+    int absY = static_cast<int>(
+        (static_cast<LONG_PTR>(screenY - vscreenT) * 65536L) / vscreenH);
+    const DWORD absFlag =
+        MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    INPUT inputs[2]{};
+    inputs[0].type = INPUT_MOUSE;
+    inputs[0].mi.dx = absX;
+    inputs[0].mi.dy = absY;
+    inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN | absFlag;
+    inputs[1].type = INPUT_MOUSE;
+    inputs[1].mi.dx = absX;
+    inputs[1].mi.dy = absY;
+    inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP | absFlag;
+    UINT sent = SendInput(2, inputs, sizeof(INPUT));
+    return sent == 2;
 }
 
-// 托盘图标触发（异步）：临时显示任务栏 → 后台线程重试 UIA 触发 →
-// 完成后通知主线程收回任务栏（kMsgTriggerDone）。
-// 原同步实现把“显示任务栏 → UIA 查找/重试 → 收回”整个流程卡在点击线程上
-// （最长 3.5s），期间 Dock 冻结、任务栏长时间闪现 —— “打开很慢”的主因。
+// 按 RuntimeId 在桥窗口树中重新定位并触发（防止枚举时保存的元素句柄失效）。
+bool ClickTrayByRuntimeId(IUIAutomation* uia, const std::wstring& runtimeId) {
+    if (!uia || runtimeId.empty()) return false;
+    auto bridges = CollectTrayBridgeWindows();
+    for (HWND hb : bridges) {
+        ComPtr<IUIAutomationElement> root;
+        IUIAutomationElement* rawRoot = nullptr;
+        if (FAILED(uia->ElementFromHandle(hb, &rawRoot)) || !rawRoot) continue;
+        root.Attach(rawRoot);
+        auto desc = UiaFindAll(uia, root, TreeScope_Descendants);
+        for (auto& child : desc) {
+            if (UiaElementRuntimeId(child) == runtimeId) {
+                if (InvokeTrayElement(child)) return true;
+            }
+        }
+    }
+    // 桥窗口不足时回退：直接遍历 TrayNotifyWnd / Shell_TrayWnd 的 UIA 子树。
+    HWND hTray = FindWindowW(kShellTrayWndCls, nullptr);
+    HWND hNotify = hTray ? FindWindowExW(hTray, nullptr, kTrayNotifyWndCls,
+                                         nullptr)
+                         : nullptr;
+    HWND roots[] = {hTray, hNotify};
+    for (HWND h : roots) {
+        if (!h) continue;
+        ComPtr<IUIAutomationElement> root;
+        IUIAutomationElement* rawRoot = nullptr;
+        if (FAILED(uia->ElementFromHandle(h, &rawRoot)) || !rawRoot) continue;
+        root.Attach(rawRoot);
+        auto desc = UiaFindAll(uia, root, TreeScope_Descendants);
+        for (auto& child : desc) {
+            if (UiaElementRuntimeId(child) == runtimeId) {
+                if (InvokeTrayElement(child)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool ExtractTrayIconInfo(IUIAutomation* uia,
+                         ComPtr<IUIAutomationElement>& el, int index,
+                         DockTrayIconInfo& out) {
+    if (!uia || !el) return false;
+    out = DockTrayIconInfo{};
+    out.index = index;
+    out.name = UiaElementName(el);
+    out.automationId = UiaElementAutomationId(el);
+    out.runtimeId = UiaElementRuntimeId(el);
+    std::wstring desc = UiaLegacyDescription(el);
+    if (!desc.empty()) {
+        out.tooltip = desc;
+    } else {
+        out.tooltip = out.name;
+    }
+    RECT rc{};
+    if (UiaElementBounds(el, rc)) {
+        out.bounds = rc;
+        out.hasValidBounds = true;
+    }
+    out.processId = UiaElementProcessId(el);
+    if (out.processId != 0) {
+        out.executablePath = ImagePathOfPid(out.processId);
+        if (!out.executablePath.empty()) {
+            out.processName = PathBasename(out.executablePath);
+        }
+    }
+    return true;
+}
+
+bool ContainsCaseInsensitive(const std::wstring& hay,
+                             const std::wstring& needle) {
+    if (needle.empty()) return true;
+    const std::wstring h = ToLower(hay);
+    const std::wstring n = ToLower(needle);
+    return h.find(n) != std::wstring::npos;
+}
+
+// 托盘图标元素匹配：进程信息 → exe 路径 → 显示名/工具提示，逐级兜底。
+bool TrayIconMatchesApp(const DockTrayIconInfo& icon,
+                        const std::wstring& nameHint,
+                        const std::wstring& appKey,
+                        const std::vector<DWORD>& pids) {
+    if (icon.processId != 0 && !pids.empty()) {
+        for (DWORD p : pids) {
+            if (icon.processId == p) return true;
+        }
+    }
+
+    const std::wstring keyNorm = NormalizePath(appKey);
+    const std::wstring keyBase = ToLower(PathBasename(appKey));
+    const std::wstring keyBaseNoExt = ToLower(StripExtension(keyBase));
+
+    if (!icon.executablePath.empty()) {
+        const std::wstring iconNorm = NormalizePath(icon.executablePath);
+        if (iconNorm == keyNorm) return true;
+        const std::wstring iconBase =
+            ToLower(PathBasename(icon.executablePath));
+        const std::wstring iconBaseNoExt =
+            ToLower(StripExtension(iconBase));
+        if (keyBase == iconBase || keyBaseNoExt == iconBaseNoExt) return true;
+    }
+    if (!icon.processName.empty()) {
+        const std::wstring pn = ToLower(icon.processName);
+        const std::wstring pnNoExt = ToLower(StripExtension(pn));
+        if (keyBase == pn || keyBaseNoExt == pn ||
+            keyBase == pn + L".exe" || keyBaseNoExt == pnNoExt) {
+            return true;
+        }
+    }
+
+    if (!nameHint.empty()) {
+        if (TrayElementNameMatches(nameHint, icon.name) ||
+            TrayElementNameMatches(nameHint, icon.tooltip) ||
+            TrayElementNameMatches(nameHint, icon.DisplayName())) {
+            return true;
+        }
+        // 有些托盘图标的 Name/Tooltip 是英文进程名，Dock 条目显示中文名，
+        // 用 exe 基名再碰一次（微信/钉钉等常见场景已由 TrayElementNameMatches 覆盖）。
+        if (!keyBaseNoExt.empty() &&
+            (TrayElementNameMatches(keyBaseNoExt, icon.name) ||
+             TrayElementNameMatches(keyBaseNoExt, icon.tooltip) ||
+             TrayElementNameMatches(keyBaseNoExt, icon.DisplayName()))) {
+            return true;
+        }
+        if (ContainsCaseInsensitive(icon.DisplayName(), nameHint)) return true;
+    }
+    return false;
+}
+
+// 可见区枚举 + 点击：遍历桥窗口（不足时直接 TrayNotifyWnd），
+// 过滤 Button/ListItem/Image，命中后用 RuntimeId / 坐标点击。
+bool ClickTrayInVisible(IUIAutomation* uia, const std::wstring& nameHint,
+                        const std::wstring& appKey,
+                        const std::vector<DWORD>& pids) {
+    if (!uia) return false;
+    HWND hTray = FindWindowW(kShellTrayWndCls, nullptr);
+    if (!hTray) return false;
+    HWND hNotify =
+        FindWindowExW(hTray, nullptr, kTrayNotifyWndCls, nullptr);
+    if (!hNotify) return false;
+
+    RECT trayArea{};
+    GetWindowRect(hNotify, &trayArea);
+    auto bridges = CollectTrayBridgeWindows();
+    std::unordered_set<std::wstring> seen;
+    int index = 0;
+
+    auto tryRoot = [&](ComPtr<IUIAutomationElement>& root) {
+        auto desc = UiaFindAll(uia, root, TreeScope_Descendants);
+        for (auto& child : desc) {
+            const int ct = UiaElementControlType(child);
+            if (ct != UIA_ButtonControlTypeId &&
+                ct != UIA_ListItemControlTypeId &&
+                ct != UIA_ImageControlTypeId) {
+                continue;
+            }
+            RECT br{};
+            const bool hasValid = UiaElementBounds(child, br);
+            if (hasValid) {
+                const bool inH = br.left >= trayArea.left - 8 &&
+                                 br.right <= trayArea.right + 8;
+                const bool inV = br.top >= trayArea.top - 8 &&
+                                 br.bottom <= trayArea.bottom + 8;
+                if (!inH || !inV) continue;
+            }
+            DockTrayIconInfo info;
+            if (!ExtractTrayIconInfo(uia, child, index, info)) continue;
+
+            const std::wstring display = info.DisplayName();
+            // 跳过溢出展开按钮（左侧 ^ / “隐藏”等）
+            bool overflowToggle =
+                (hasValid && br.left < trayArea.left) ||
+                ContainsCaseInsensitive(info.name, L"隐藏") ||
+                ContainsCaseInsensitive(info.name, L"hidden") ||
+                ContainsCaseInsensitive(info.automationId, L"overflow");
+            if (overflowToggle) continue;
+            if (info.name.empty() && info.automationId.empty()) continue;
+
+            const std::wstring dedupKey = !info.runtimeId.empty()
+                                              ? info.runtimeId
+                                              : display;
+            if (!seen.insert(dedupKey).second) continue;
+            ++index;
+
+            if (!TrayIconMatchesApp(info, nameHint, appKey, pids)) continue;
+
+            // 优先 RuntimeId 精确定位触发（TrayList 同款），失败坐标点击。
+            if (!info.runtimeId.empty() &&
+                ClickTrayByRuntimeId(uia, info.runtimeId)) {
+                return true;
+            }
+            if (info.hasValidBounds &&
+                info.bounds.right > info.bounds.left &&
+                info.bounds.bottom > info.bounds.top) {
+                const int cx = (info.bounds.left + info.bounds.right) / 2;
+                const int cy = (info.bounds.top + info.bounds.bottom) / 2;
+                if (SendTrayClickAt(cx, cy)) return true;
+            }
+        }
+        return false;
+    };
+
+    for (HWND hb : bridges) {
+        ComPtr<IUIAutomationElement> root;
+        IUIAutomationElement* rawRoot = nullptr;
+        if (FAILED(uia->ElementFromHandle(hb, &rawRoot)) || !rawRoot) continue;
+        root.Attach(rawRoot);
+        if (tryRoot(root)) return true;
+    }
+
+    // 桥窗口不足时，直接遍历 TrayNotifyWnd 子树。
+    if (bridges.empty()) {
+        ComPtr<IUIAutomationElement> notifyRoot;
+        IUIAutomationElement* rawRoot = nullptr;
+        if (SUCCEEDED(uia->ElementFromHandle(hNotify, &rawRoot)) && rawRoot) {
+            notifyRoot.Attach(rawRoot);
+            if (tryRoot(notifyRoot)) return true;
+        }
+        ComPtr<IUIAutomationElement> trayRoot;
+        rawRoot = nullptr;
+        if (SUCCEEDED(uia->ElementFromHandle(hTray, &rawRoot)) && rawRoot) {
+            trayRoot.Attach(rawRoot);
+            if (tryRoot(trayRoot)) return true;
+        }
+    }
+    return false;
+}
+
+// 溢出区（隐藏托盘）：先尝试直接枚举，失败则临时显示溢出窗口后按名称点击。
+bool ClickTrayInOverflow(IUIAutomation* uia, const std::wstring& nameHint,
+                         const std::wstring& appKey,
+                         const std::vector<DWORD>& pids) {
+    if (!uia) return false;
+    HWND hOuter = FindWindowW(kOverflowXamlIslandCls, nullptr);
+    if (hOuter) {
+        HWND hInner = FindWindowExW(hOuter, nullptr,
+                                    kDesktopContentBridgeCls, nullptr);
+        bool wasVisible = IsWindowVisible(hOuter) != FALSE;
+        if (!wasVisible) {
+            ShowWindowAsync(hOuter, SW_SHOWNOACTIVATE);
+            Sleep(400);  // TrayList click.cpp 同款：溢出 XAML 装配需要等待
+        }
+        if (hInner) {
+            ComPtr<IUIAutomationElement> inner;
+            IUIAutomationElement* rawInner = nullptr;
+            if (SUCCEEDED(uia->ElementFromHandle(hInner, &rawInner)) &&
+                rawInner) {
+                inner.Attach(rawInner);
+                auto children = UiaFindAll(uia, inner, TreeScope_Children);
+                int idx = 0;
+                for (auto& child : children) {
+                    DockTrayIconInfo info;
+                    if (!ExtractTrayIconInfo(uia, child, idx++, info)) continue;
+                    if (!TrayIconMatchesApp(info, nameHint, appKey, pids)) {
+                        continue;
+                    }
+                    if (InvokeTrayElement(child)) {
+                        if (!wasVisible) ShowWindowAsync(hOuter, SW_HIDE);
+                        return true;
+                    }
+                    if (info.hasValidBounds &&
+                        info.bounds.right > info.bounds.left &&
+                        info.bounds.bottom > info.bounds.top) {
+                        const int cx =
+                            (info.bounds.left + info.bounds.right) / 2;
+                        const int cy =
+                            (info.bounds.top + info.bounds.bottom) / 2;
+                        if (SendTrayClickAt(cx, cy)) {
+                            if (!wasVisible) ShowWindowAsync(hOuter, SW_HIDE);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!wasVisible) ShowWindowAsync(hOuter, SW_HIDE);
+    }
+
+    // 传统 Win10 溢出窗口回退。
+    HWND hLegacy = FindWindowW(kNotifyIconOverflowCls, nullptr);
+    if (hLegacy) {
+        HWND hToolbar = FindWindowExW(hLegacy, nullptr,
+                                      kToolbarWindow32Cls, nullptr);
+        if (!hToolbar) {
+            HWND hPager = FindWindowExW(hLegacy, nullptr, kSysPagerCls,
+                                        nullptr);
+            if (hPager) {
+                hToolbar = FindWindowExW(hPager, nullptr,
+                                         kToolbarWindow32Cls, nullptr);
+            }
+        }
+        if (hToolbar) {
+            ComPtr<IUIAutomationElement> tb;
+            IUIAutomationElement* rawTb = nullptr;
+            if (SUCCEEDED(uia->ElementFromHandle(hToolbar, &rawTb)) &&
+                rawTb) {
+                tb.Attach(rawTb);
+                auto children = UiaFindAll(uia, tb, TreeScope_Children);
+                int idx = 0;
+                for (auto& child : children) {
+                    DockTrayIconInfo info;
+                    if (!ExtractTrayIconInfo(uia, child, idx++, info)) continue;
+                    if (!TrayIconMatchesApp(info, nameHint, appKey, pids)) {
+                        continue;
+                    }
+                    if (InvokeTrayElement(child)) return true;
+                    if (info.hasValidBounds &&
+                        info.bounds.right > info.bounds.left &&
+                        info.bounds.bottom > info.bounds.top) {
+                        const int cx =
+                            (info.bounds.left + info.bounds.right) / 2;
+                        const int cy =
+                            (info.bounds.top + info.bounds.bottom) / 2;
+                        if (SendTrayClickAt(cx, cy)) return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// 直接 UIA 树遍历：最后手段，按尺寸（8~80 × 8~56）与托盘范围过滤。
+bool ClickTrayInDirectUIA(IUIAutomation* uia, const std::wstring& nameHint,
+                          const std::wstring& appKey,
+                          const std::vector<DWORD>& pids) {
+    if (!uia) return false;
+    HWND hTray = FindWindowW(kShellTrayWndCls, nullptr);
+    HWND hNotify = hTray ? FindWindowExW(hTray, nullptr, kTrayNotifyWndCls,
+                                         nullptr)
+                         : nullptr;
+    if (!hTray || !hNotify) return false;
+    RECT trayArea{};
+    GetWindowRect(hNotify, &trayArea);
+
+    std::function<bool(ComPtr<IUIAutomationElement>&, int)> walk =
+        [&](ComPtr<IUIAutomationElement>& el, int depth) -> bool {
+        if (depth > 20 || !el) return false;
+        const int ct = UiaElementControlType(el);
+        if (ct == UIA_ButtonControlTypeId ||
+            ct == UIA_ListItemControlTypeId ||
+            ct == UIA_ImageControlTypeId) {
+            RECT br{};
+            if (UiaElementBounds(el, br)) {
+                const int w = br.right - br.left;
+                const int h = br.bottom - br.top;
+                const bool inTray =
+                    br.left >= trayArea.left - 8 &&
+                    br.right <= trayArea.right + 8 &&
+                    br.top >= trayArea.top - 8 &&
+                    br.bottom <= trayArea.bottom + 8;
+                if (inTray && w >= 8 && w <= 80 && h >= 8 && h <= 56) {
+                    DockTrayIconInfo info;
+                    if (ExtractTrayIconInfo(uia, el, 0, info) &&
+                        TrayIconMatchesApp(info, nameHint, appKey, pids)) {
+                        if (InvokeTrayElement(el)) return true;
+                        if (info.hasValidBounds &&
+                            info.bounds.right > info.bounds.left &&
+                            info.bounds.bottom > info.bounds.top) {
+                            const int cx =
+                                (info.bounds.left + info.bounds.right) / 2;
+                            const int cy =
+                                (info.bounds.top + info.bounds.bottom) / 2;
+                            if (SendTrayClickAt(cx, cy)) return true;
+                        }
+                    }
+                }
+            }
+        }
+        auto children = UiaFindAll(uia, el, TreeScope_Children);
+        for (auto& c : children) {
+            if (walk(c, depth + 1)) return true;
+        }
+        return false;
+    };
+
+    ComPtr<IUIAutomationElement> trayRoot;
+    IUIAutomationElement* rawRoot = nullptr;
+    if (SUCCEEDED(uia->ElementFromHandle(hTray, &rawRoot)) && rawRoot) {
+        trayRoot.Attach(rawRoot);
+        if (walk(trayRoot, 0)) return true;
+    }
+    ComPtr<IUIAutomationElement> notifyRoot;
+    rawRoot = nullptr;
+    if (SUCCEEDED(uia->ElementFromHandle(hNotify, &rawRoot)) && rawRoot) {
+        notifyRoot.Attach(rawRoot);
+        if (walk(notifyRoot, 0)) return true;
+    }
+    return false;
+}
+
+// 参照 TrayList ClickIcon 的主入口：可见 → 溢出 → 直接 UIA 遍历。
+bool ClickTrayIconForApp(IUIAutomation* uia, const std::wstring& nameHint,
+                         const std::wstring& appKey,
+                         const std::vector<DWORD>& pids) {
+    if (!uia) return false;
+    if (ClickTrayInVisible(uia, nameHint, appKey, pids)) return true;
+    if (ClickTrayInOverflow(uia, nameHint, appKey, pids)) return true;
+    if (ClickTrayInDirectUIA(uia, nameHint, appKey, pids)) return true;
+    return false;
+}
+
+}  // namespace
+
+// 托盘图标元素匹配：主判据 = 元素 ProcessId ∈ 目标应用 pid；
+// 兜底判据 = 元素 Name（工具提示）与显示名互相包含（含微信中文名别名）
+bool TrayElementNameMatches(const std::wstring& hint,
+                            const std::wstring& name) {
+    if (hint.empty() || name.empty()) return false;
+    const std::wstring lowerHint = ToLower(hint);
+    const std::wstring lowerName = ToLower(name);
+    if (lowerName.find(lowerHint) != std::wstring::npos) return true;
+    if (lowerHint.find(lowerName) != std::wstring::npos) return true;
+
+    // 常见托盘应用的中文名 ↔ exe 名变体映射（参考 TrayList 的 kNameExeHints）。
+    // 用于 Dock 条目显示名是中文、UIA 图标名是英文（或反之）时仍能匹配。
+    struct NameExeAlias {
+        const wchar_t* display;
+        const wchar_t* exe;
+    };
+    static const NameExeAlias kAliases[] = {
+        {L"微信", L"weixin"}, {L"微信", L"wechat"},
+        {L"wechat", L"微信"}, {L"weixin", L"微信"},
+        {L"钉钉", L"dingtalk"}, {L"dingtalk", L"钉钉"},
+        {L"企业微信", L"wxwork"}, {L"wxwork", L"企业微信"},
+        {L"腾讯会议", L"wemeetapp"}, {L"wemeetapp", L"腾讯会议"},
+        {L"飞书", L"feishu"}, {L"feishu", L"飞书"},
+        {L"网易云", L"cloudmusic"}, {L"cloudmusic", L"网易云"},
+        {L"qq", L"qq"},
+        {L"迅雷", L"thunder"}, {L"thunder", L"迅雷"},
+        {L"百度网盘", L"baidunetdisk"}, {L"baidunetdisk", L"百度网盘"},
+        {L"向日葵", L"sunloginclient"}, {L"sunloginclient", L"向日葵"},
+        {L"teamviewer", L"teamviewer"},
+        {L"steam", L"steam"},
+        {L"discord", L"discord"},
+        {L"telegram", L"telegram"},
+        {L"onedrive", L"onedrive"},
+        {L"obsidian", L"obsidian"},
+        {L"everything", L"everything"},
+    };
+    for (const auto& a : kAliases) {
+        const std::wstring da = ToLower(a.display);
+        const std::wstring ea = ToLower(a.exe);
+        if ((lowerHint.find(da) != std::wstring::npos &&
+             lowerName.find(ea) != std::wstring::npos) ||
+            (lowerHint.find(ea) != std::wstring::npos &&
+             lowerName.find(da) != std::wstring::npos)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 托盘图标触发（异步）：后台 STA 线程按 TrayList 方式枚举/触发 →
+// 完成后通知主线程（kMsgTriggerDone）。Dock 隐藏任务栏时 TrayList 仍能
+// 工作，因此不再临时显示任务栏，去掉任务栏闪烁与工作区来回切换。
 bool g_skipTrayTriggerOnce = false;  // 触发失败后的二次回退：直接评分强显
 
 void TrayIconTriggerAsync(AppState& s, const std::wstring& nameHint,
                           const std::vector<DWORD>& pids, size_t itemIdx) {
-    if (pids.empty()) return;
-    s.taskbarShowUntil = GetTickCount64() + kTrayTriggerWindowMs;
-    ShowTaskbar();  // 任务栏可见 + 工作区还原为任务栏占位值
+    if (pids.empty() || itemIdx >= s.items.size()) return;
+    const std::wstring appKey = s.items[itemIdx].key;
 
-    std::thread([nameHint, pids, itemIdx]() {
+    std::thread([nameHint, appKey, pids, itemIdx]() {
         bool ok = false;
         IUIAutomation* uia = nullptr;
-        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
             if (SUCCEEDED(CoCreateInstance(CLSID_CUIAutomation, nullptr,
                                            CLSCTX_INPROC_SERVER,
@@ -3114,10 +3686,11 @@ void TrayIconTriggerAsync(AppState& s, const std::wstring& nameHint,
                 const ULONGLONG until =
                     GetTickCount64() + kTrayTriggerWindowMs;
                 while (!ok && GetTickCount64() < until) {
-                    ok = UiTrayIconInvokeOnce(uia, nameHint, pids);
+                    ok = ClickTrayIconForApp(uia, nameHint, appKey, pids);
                     if (!ok) {
-                        // XAML 托盘树在任务栏显示后有一个装配延迟，重试
-                        Sleep(250);
+                        // XAML 托盘 UIA 树（尤其 explorer 重启后）有装配延迟，
+                        // 短暂重试；无需显示任务栏。
+                        Sleep(200);
                     }
                 }
                 uia->Release();
@@ -3141,6 +3714,14 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
 
     // 找该应用的全部存活 pid（按 exe 镜像路径匹配 key）
     std::vector<DWORD> pids = FindPidsByKey(item.key);
+
+    // 托盘驻留应用统一走 TrayList 方式：点击 Dock 图标 = 点击系统托盘图标，
+    // 由应用自己的托盘处理器恢复/显示可交互主窗口。绝对不能先走外部
+    // ShowWindow —— 微信等 Qt 自绘应用会得到“看得见点不动”的影子窗口。
+    if (item.trayMarked && !pids.empty() && !g_skipTrayTriggerOnce) {
+        TrayIconTriggerAsync(s, item.displayName, pids, idx);
+        return;
+    }
 
     // 收集该应用全部“有界面”窗口。钉钉等进程动辄几十个隐藏窗口
     // （消息窗/阴影窗/工具窗），必须按“像不像主窗口”过滤，
@@ -3202,13 +3783,6 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
         CloseHandle(tsnap);
     }
 
-    auto IsQtClass = [](HWND hwnd) -> bool {
-        wchar_t cls[64] = {};
-        GetClassNameW(hwnd, cls, 63);
-        return wcsstr(cls, L"Qt5") != nullptr ||
-               wcsstr(cls, L"Qt6") != nullptr;
-    };
-
     // 先筛出“主窗口形态”的窗口：这就是要打开的全部窗口集合。
     std::vector<HWND> mains;
     for (const Candidate& c : cands) {
@@ -3237,7 +3811,17 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
             }
         }
         if (best) {
-            const bool qt = IsQtClass(best);
+            // 托盘驻留应用不区分 Qt/非 Qt：统一走托盘图标触发，
+            // 由应用自己的托盘处理器打开窗口；绝不直接 ShowWindow/SC_RESTORE。
+            if (item.trayMarked && !pids.empty()) {
+                if (!g_skipTrayTriggerOnce) {
+                    TrayIconTriggerAsync(s, item.displayName, pids, idx);
+                } else {
+                    Logf(L"托盘触发失败：%ls 不再外部显示窗口（避免影子窗口）",
+                         item.displayName.c_str());
+                }
+                return;
+            }
             if (IsIconic(best)) {
                 DWORD_PTR dummy = 0;
                 SendMessageTimeoutW(best, WM_SYSCOMMAND, SC_RESTORE, 0,
@@ -3248,11 +3832,6 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
                 return;
             }
             if (!IsWindowVisible(best)) {
-                if (qt && item.trayMarked && !pids.empty() &&
-                    !g_skipTrayTriggerOnce) {
-                    TrayIconTriggerAsync(s, item.displayName, pids, idx);
-                    return;
-                }
                 ShowWindow(best, SW_SHOW);
                 ForceForegroundWindow(best);
                 Logf(L"唤起托盘应用主窗口：%ls", item.displayName.c_str());
@@ -3268,24 +3847,16 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
         return;
     }
 
-    // 托盘图标驻留 + Qt 隐藏主窗：必须走应用自己的托盘图标处理器。
-    // 外部 ShowWindow 对这类窗口会得到影子窗口（无法交互），
-    // 由 TrayIconTriggerAsync 临时显示任务栏并触发 UIA Invoke。
-    bool hasHiddenQtMain = false;
-    for (HWND w : mains) {
-        if (!IsWindowVisible(w) && !IsIconic(w) && IsQtClass(w)) {
-            hasHiddenQtMain = true;
-            break;
-        }
-    }
-    if (item.trayMarked && hasHiddenQtMain && !pids.empty() &&
-        !g_skipTrayTriggerOnce) {
-        TrayIconTriggerAsync(s, item.displayName, pids, idx);
+    // 托盘驻留应用（无论窗口是否 Qt、是否隐藏/可见）：不做任何外部窗口操作。
+    // 到这里只可能是托盘触发已经失败后的回退路径；直接放弃，避免影子窗口。
+    if (item.trayMarked && !pids.empty()) {
+        Logf(L"托盘触发失败：%ls 不再外部显示窗口（避免影子窗口）",
+             item.displayName.c_str());
         return;
     }
 
-    // 打开全部主窗口：最小化的走 SC_RESTORE（任务栏语义，Qt 也安全），
-    // 完全隐藏的非 Qt 窗口直接显示。
+    // 打开全部主窗口：最小化的走 SC_RESTORE（任务栏语义），
+    // 完全隐藏的非托盘窗口直接显示。
     int restored = 0;
     for (HWND w : mains) {
         if (!IsWindow(w) || IsCloaked(w)) continue;
@@ -3340,30 +3911,20 @@ void ToggleFocusOrLaunch(AppState& s, size_t idx) {
         return;
     }
 
+    // 托盘驻留应用：统一走托盘图标触发，而不是通用窗口恢复/ShowWindow。
+    // 这是 TrayList 的正确打开方式——由应用自己的托盘处理器显示可交互窗口。
+    if (item.trayMarked) {
+        WakeTrayOnlyApp(s, idx);
+        s.needsRedraw = true;
+        return;
+    }
+
     // 优先使用 Dock 已收集的顶层窗口（item.windows 已包含 UWP 的
     // ApplicationFrameWindow 等真实应用窗口，不能只靠按 exe 枚举线程窗口）。
     // 这里一次性恢复全部“主窗口形态”的窗口，而不是只唤起一个。
     std::vector<HWND> mains;
     for (HWND w : item.windows) {
         if (IsWindow(w) && IsMainShapeWindow(w)) mains.push_back(w);
-    }
-
-    // 如果收集到的是隐藏的 Qt 主窗（通常是刚隐藏、Dock 还没刷新的托盘应用），
-    // 不能外部 ShowWindow——会得到“看得见点不动”的影子窗口。交给
-    // WakeTrayOnlyApp 走托盘图标触发。
-    if (item.trayMarked) {
-        for (HWND w : mains) {
-            if (!IsWindowVisible(w) && !IsIconic(w)) {
-                wchar_t cls[64] = {};
-                GetClassNameW(w, cls, 63);
-                if (wcsstr(cls, L"Qt5") != nullptr ||
-                    wcsstr(cls, L"Qt6") != nullptr) {
-                    WakeTrayOnlyApp(s, idx);
-                    s.needsRedraw = true;
-                    return;
-                }
-            }
-        }
     }
 
     if (!mains.empty()) {
@@ -4002,11 +4563,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HealMinimizedSuiteWindows();
             return 0;
 
-        // 托盘图标触发完成（worker 线程）：收回任务栏并收尾
+        // 托盘图标触发完成（worker 线程）：确保任务栏保持隐藏并收尾
+        // （TrayList 方案不临时显示任务栏，这里仅做兜底自愈）
         case kMsgTriggerDone: {
             const bool ok = wParam != 0;
             s->taskbarShowUntil = 0;
-            EnsureTaskbarHidden(*s);  // 立即收回：隐藏任务栏 + 工作区扩回全屏
+            EnsureTaskbarHidden(*s);  // 兜底：隐藏任务栏 + 工作区扩回全屏
             if (!ok) {
                 // 触发失败：回退评分强显（旧行为兜底，尽力而为）
                 const size_t idx = static_cast<size_t>(lParam);
