@@ -4265,15 +4265,14 @@ void ProcessDockDragMove(AppState& s) {
     SetFrameCadence(s, true);  // Dragging 期间帧驱动持续运行（见 FrameTick）
 }
 
-// 可见固定槽 → s.pins 下标映射：解析失败/被屏蔽的 pin 不占可视槽。
-// （按名称并入运行组的边缘情况会缺项，此时该固定项不可重排——见 ApplyDockReorder）
+// 可见固定槽 → s.pins 下标映射：按行序（items 的前 pinCount 个）收集，
+// 保证 shown[k] = 行内第 k 个固定条目对应的 pins 下标。
+// （按名称并入运行组的条目 key 与 pin 不同，不会出现在映射中 —— 此类条目不可重排）
 std::vector<size_t> ShownPinIndexList(AppState& s) {
     std::vector<size_t> out;
-    for (size_t p = 0; p < s.pins.size(); ++p) {
-        const std::wstring dk = DescribePin(s.pins[p]).key;
-        if (dk.empty() || BasenameBlocked(dk)) continue;
-        for (size_t i = 0; i < s.pinCount; ++i) {
-            if (s.items[i].key == dk) {
+    for (size_t i = 0; i < s.pinCount && i < s.items.size(); ++i) {
+        for (size_t p = 0; p < s.pins.size(); ++p) {
+            if (DescribePin(s.pins[p]).key == s.items[i].key) {
                 out.push_back(p);
                 break;
             }
@@ -4353,15 +4352,22 @@ void ApplyDockReorder(AppState& s) {
             break;
         }
     }
+    if (srcSlot < 0) return;  // 防御：拖拽源必在可见固定槽内（否则上方已放弃）
     int destSlot = s.dragInsertPos;
     if (destSlot < 0) destSlot = srcSlot;
     if (destSlot == srcSlot) return;  // 原位放下：顺序无变化
 
-    // 目标锚点（删除 src 后的 pins 下标）：插入到 shown[destSlot] 之前；
-    // destSlot == shown.size() 时追加到末尾。
+    // 关键映射：destSlot 是“删除被拖项后”的可见槽序号，而 shown 按含被拖项的
+    // 行序收集（被拖项自己占一个行槽）。目标在被拖项右侧时直接取
+    // shown[destSlot] 会整体前移一位 —— 即“向右拖动总落在释放位前一位”的根因。
+    int rowOrd = destSlot;
+    if (destSlot >= srcSlot) ++rowOrd;  // 被拖项占据的行槽：向右目标 +1 还原
+
+    // 目标锚点（删除 src 后的 pins 下标）：插入到行内第 rowOrd 个固定项之前；
+    // rowOrd 超出可见固定槽数时追加到末尾。
     size_t insertAt = s.pins.size() - 1;
-    if (destSlot < static_cast<int>(shown.size())) {
-        size_t anchor = shown[static_cast<size_t>(destSlot)];
+    if (rowOrd >= 0 && rowOrd < static_cast<int>(shown.size())) {
+        size_t anchor = shown[static_cast<size_t>(rowOrd)];
         if (anchor > src) --anchor;  // 先删 src，锚点下标整体前移一位
         insertAt = anchor;
     }
