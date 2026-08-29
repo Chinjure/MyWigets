@@ -1522,10 +1522,78 @@ bool IsOwnSuitePid(DWORD pid) {
     return false;
 }
 
+// 是否为“显示桌面”应最小化的窗口：可见、未最小化、非桌面/系统/套件组件。
+bool ShouldShowDesktopMinimize(HWND hwnd) {
+    if (!IsWindowVisible(hwnd)) return false;  // 隐藏窗不动
+    if (IsIconic(hwnd)) return false;          // 已最小化不动
+    if (IsCloaked(hwnd)) return false;         // UWP 幽灵窗不动
+    if (GetWindow(hwnd, GW_OWNER)) return false;  // 跟随属主
+    if (IsShellSystemClass(hwnd)) return false;   // 桌面/任务栏本体
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, 63);
+    if (wcsstr(cls, L"Ghost") || wcsstr(cls, L"Island")) {
+        return false;
+    }
+    const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    // 工具窗（无任务栏按钮）与系统热键窗：不参与显示桌面
+    if ((ex & WS_EX_TOOLWINDOW) != 0 && (ex & WS_EX_APPWINDOW) == 0) {
+        return false;
+    }
+    if (IsOwnSuitePid(PidOf(hwnd))) return false;  // 自家组件永不隐藏
+    return true;
+}
+
+// 当前是否还有“应该被显示桌面最小化”的可见窗口：
+// 展示桌面后新打开的窗口、或被用户手动恢复的旧窗口都算。
+bool HasVisibleShowDesktopCandidate() {
+    bool found = false;
+    EnumWindows(
+        [](HWND hwnd, LPARAM lp) -> BOOL {
+            auto* p = reinterpret_cast<bool*>(lp);
+            if (ShouldShowDesktopMinimize(hwnd)) {
+                *p = true;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&found));
+    return found;
+}
+
+// 最小化全部“应显示桌面”的可见窗口，并追加到恢复列表。
+// 返回本次新增进恢复列表的窗口数量（已恢复过的旧窗口不重复计入）。
+int MinimizeShowDesktopCandidates() {
+    int added = 0;
+    EnumWindows(
+        [](HWND hwnd, LPARAM lp) -> BOOL {
+            if (!ShouldShowDesktopMinimize(hwnd)) return TRUE;
+            ShowWindow(hwnd, SW_MINIMIZE);
+            auto* p = reinterpret_cast<int*>(lp);
+            if (std::find(g_showDesktopMinimized.begin(),
+                          g_showDesktopMinimized.end(), hwnd) ==
+                g_showDesktopMinimized.end()) {
+                g_showDesktopMinimized.push_back(hwnd);
+                ++*p;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&added));
+    return added;
+}
+
 // 显示桌面：最小化除桌面/系统/套件组件外的全部可见顶层窗口；
-// 处于显示桌面状态时再次调用则恢复上次最小化的窗口（与 Windows 一致）
+// 处于显示桌面状态时再次调用则恢复上次最小化的窗口（与 Windows 一致）。
+// 修正：若展示桌面后用户又打开了新窗口（或手动恢复了旧窗口），第二次点击
+// 不应无脑恢复上次窗口，而应先继续把这些可见窗口最小化、保持桌面态；
+// 只有桌面已经真正干净时，再点才恢复上次最小化的全部窗口。
 void ToggleShowDesktop() {
     if (g_showDesktopActive) {
+        if (HasVisibleShowDesktopCandidate()) {
+            const int n = MinimizeShowDesktopCandidates();
+            Logf(L"显示桌面：检测到新窗口，继续最小化 %d 个", n);
+            return;
+        }
+
         const size_t n = g_showDesktopMinimized.size();
         for (HWND w : g_showDesktopMinimized) {
             if (IsWindow(w) && IsIconic(w)) ShowWindow(w, SW_RESTORE);
@@ -1537,35 +1605,12 @@ void ToggleShowDesktop() {
     }
 
     g_showDesktopMinimized.clear();
-    EnumWindows(
-        [](HWND hwnd, LPARAM) -> BOOL {
-            if (!IsWindowVisible(hwnd)) return TRUE;  // 隐藏窗不动
-            if (IsIconic(hwnd)) return TRUE;          // 已最小化不动
-            if (IsCloaked(hwnd)) return TRUE;         // UWP 幽灵窗不动
-            if (GetWindow(hwnd, GW_OWNER)) return TRUE;  // 跟随属主
-            if (IsShellSystemClass(hwnd)) return TRUE;   // 桌面/任务栏本体
-            wchar_t cls[64] = {};
-            GetClassNameW(hwnd, cls, 63);
-            if (wcsstr(cls, L"Ghost") || wcsstr(cls, L"Island")) {
-                return TRUE;
-            }
-            const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            // 工具窗（无任务栏按钮）与系统热键窗：不参与显示桌面
-            if ((ex & WS_EX_TOOLWINDOW) != 0 &&
-                (ex & WS_EX_APPWINDOW) == 0) {
-                return TRUE;
-            }
-            if (IsOwnSuitePid(PidOf(hwnd))) return TRUE;  // 自家组件永不隐藏
-            ShowWindow(hwnd, SW_MINIMIZE);
-            g_showDesktopMinimized.push_back(hwnd);
-            return TRUE;
-        },
-        0);
+    const int n = MinimizeShowDesktopCandidates();
 
     // 没有任何窗口需要最小化时（如已在桌面态）不进入“恢复”状态，
     // 下次点击重新尝试最小化 —— 与 Windows 的显示桌面语义一致
-    g_showDesktopActive = !g_showDesktopMinimized.empty();
-    Logf(L"显示桌面：最小化 %zu 个窗口", g_showDesktopMinimized.size());
+    g_showDesktopActive = n > 0;
+    Logf(L"显示桌面：最小化 %d 个窗口", n);
 }
 
 // 交互动作定义在下方；低层鼠标钩子只采集点击并投递给 WndProc 统一执行
@@ -1573,7 +1618,7 @@ void ToggleShowDesktop() {
 int HitIndexAt(AppState& s, float x, float y);
 void ToggleFocusOrLaunch(AppState& s, size_t idx);
 void SetFrameCadence(AppState& s, bool fast);
-void RequestCloseByIndex(AppState& s, size_t idx);  // 中键关闭 + 立即隐藏圆点
+void RequestCloseByIndex(AppState& s, size_t idx);  // 中键关闭：固定项隐藏圆点，临时项直接移除
 size_t FindItemByKey(AppState& s, const std::wstring& key);          // 按 key 定位条目
 void BeginDockPress(AppState& s, size_t idx, POINT pt);              // 固定区按下
 void ProcessDockDragMove(AppState& s);                               // 拖拽推进
@@ -3135,13 +3180,39 @@ void CloseAppByKey(const std::wstring& key, const std::wstring& displayName) {
 
 // 中键关闭入口：先标记“关闭中”并立即重绘（运行圆点立刻消失），
 // 再执行实际关闭；窗口内与低层钩子共用同一路径，行为一致。
+// 非常驻（未固定）图标本来就是临时运行项，关闭后不等窗口销毁/进程退出
+// 的下一次刷新，直接从 Dock 移除并立即重排重绘。
 void RequestCloseByIndex(AppState& s, size_t idx) {
     if (idx >= s.items.size()) return;
     DockItem& item = s.items[idx];
-    s.closingKeys.insert(item.key);
-    s.needsRedraw = true;
-    DrawAndPresent(s);
-    CloseAppByKey(item.key, item.displayName);
+    const std::wstring key = item.key;
+    const std::wstring displayName = item.displayName;
+    const bool pinned = item.pinned;
+
+    if (!pinned) {
+        // 先移除临时图标，再发送关闭请求：UI 立刻收拢，不阻塞在窗口枚举上。
+        // 图标已经消失，无需再为它保留“关闭中”抑制圆点状态；若因关闭失败
+        // 再次出现在 Dock，圆点应恢复正常显示。
+        Logf(L"关闭并移除临时图标：%ls", displayName.c_str());
+        s.items.erase(s.items.begin() + static_cast<long>(idx));
+        if (s.hoverIndex != static_cast<size_t>(-1)) {
+            if (s.hoverIndex > idx) {
+                --s.hoverIndex;
+            } else if (s.hoverIndex == idx) {
+                s.hoverIndex = static_cast<size_t>(-1);
+            }
+        }
+        EnsureWindowSize(s);
+        s.needsRedraw = true;
+        UpdateLayoutOneFrame(s);
+        DrawAndPresent(s);
+    } else {
+        s.closingKeys.insert(key);
+        s.needsRedraw = true;
+        DrawAndPresent(s);
+    }
+
+    CloseAppByKey(key, displayName);
 }
 
 // ============ 托盘图标触发（Win11 XAML 托盘）============
