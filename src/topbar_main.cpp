@@ -137,6 +137,16 @@ constexpr UINT kSlowRefreshMs = 10000;
 // 右键新建窗口后抢前台的失败重试次数（随挂起态短轮询触发，约每 200ms 一次）
 constexpr int kMaxPendingFocusAttempts = 5;
 
+// Dock 点击"已打开的应用"并激活后,显式请求顶栏聚焦该应用窗口。
+// 顶栏的目标粘住逻辑不认 Dock 窗口上的点击(套件窗口),若不绕过,
+// 用户从 Dock 切换应用时顶栏会停留在旧目标(如被最小化的应用)。
+// lParam = 目标窗口 HWND;0 = 无直接句柄(异步托盘触发),仅解除粘住
+// 并跟随当前前台。与 dock_main.cpp 的 kMsgTopBarFocus 同值。
+constexpr UINT kDockFocusMsg = WM_APP + 12;
+// 屏幕左上角触发角点击:展开/收起音量面板(当前目标应用的音量)。
+// 与 dock_main.cpp 的 kMsgTopBarVolumePanel 同值。
+constexpr UINT kDockVolumePanelMsg = WM_APP + 13;
+
 constexpr int kMenuExit = 1001;
 
 // ---- Chrome 标签同步（WebSocket 服务端）----
@@ -506,6 +516,19 @@ bool IsControlTarget(HWND hwnd, HWND self) {    if (!hwnd || hwnd == self) {
         wcscmp(cls, L"Shell_TrayWnd") == 0 ||
         wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0) {
         return false;
+    }
+    // 忽略本套件组件窗口（Dock/时钟/日历/启动台/托盘宿主）：
+    // 独立 exe 模式下与顶栏不同进程，pid 检查拦不住；点击套件窗口
+    // （如 Dock 图标切换应用）不应被视为"显式选择了另一个窗口"
+    static const wchar_t* kSuiteCls[] = {
+        L"DesktopTopBarWindow", L"DesktopDockWindow",
+        L"DesktopAnalogClockWindow", L"DesktopCalendarWindow",
+        L"DesktopLauncherWindow", L"MyWigetsTrayWindow",
+    };
+    for (const wchar_t* c : kSuiteCls) {
+        if (wcscmp(cls, c) == 0) {
+            return false;
+        }
     }
     // 忽略我们自己进程创建的组件窗口
     DWORD pid = 0;
@@ -1720,12 +1743,34 @@ constexpr UINT kUserSwitchMsg = WM_APP + 3;  // 用户显式点击/Alt+Tab 其�
 HHOOK g_volumeHook = nullptr;
 HWND g_volumeHookHwnd = nullptr;
 
+// 左上角触发角（与 Dock 左下/右下角同规格：12×48 逻辑像素，贴屏幕左上缘）。
+// 点击 = 展开/收起音量面板。该区域由 Dock 的角部钩子统一吞掉并投递
+// kDockVolumePanelMsg，顶栏自身的 LL 钩子必须跳过它——否则面板打开时
+// 点角区会同时触发"点面板外收起"（kCloseVolumeMsg）与 Dock 的 toggle
+// 消息，造成"收起后立刻又打开"；且角区下方可能恰是应用窗口，
+// 把角区点击记录成"显式切换窗口"会误解除目标粘住。
+constexpr int kTriggerCornerW = 12;  // 逻辑像素（96 DPI 基准）
+constexpr int kTriggerCornerH = 48;
+
+bool InTriggerCornerZone(POINT pt, const AppState& s) {
+    const int w = MulDiv(kTriggerCornerW, s.dpi, 96);
+    const int h = MulDiv(kTriggerCornerH, s.dpi, 96);
+    return pt.x >= 0 && pt.x < w && pt.y >= 0 && pt.y < h;
+}
+
 LRESULT CALLBACK VolumeLowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && wParam == WM_LBUTTONDOWN) {
         const auto* info = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
         HWND hwnd = g_volumeHookHwnd;
         AppState* s = hwnd ? reinterpret_cast<AppState*>(
             GetWindowLongPtrW(hwnd, GWLP_USERDATA)) : nullptr;
+
+        // 左上角触发角：Dock 角部钩子先/后处理均只有一条路径生效
+        // （先装钩子时本钩子跳过 + Dock 吞掉；后装钩子时事件已被 Dock 吞掉，
+        // 本钩子收不到），双钩子不会重复 toggle。
+        if (s && InTriggerCornerZone(info->pt, *s)) {
+            return CallNextHookEx(nullptr, nCode, wParam, lParam);
+        }
 
         // 记录用户显式点击的顶层窗口（排除顶栏自身与音量面板）
         HWND clicked = WindowFromPoint(info->pt);
@@ -3123,6 +3168,57 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (s) {
             UpdateTarget(*s);
             DrawBarAndPresent(*s);
+        }
+        return 0;
+
+    case kDockFocusMsg: {
+        // Dock 点击"已打开的应用"后显式要求聚焦：这是用户发起的应用切换
+        // （点击发生在套件窗口上，不被目标粘住逻辑视为显式选择），
+        // 直接解除粘住并应用目标，不必等 EVENT_SYSTEM_FOREGROUND。
+        if (!s) {
+            return 0;
+        }
+        HWND focus = reinterpret_cast<HWND>(lParam);
+        if (focus && IsWindow(focus) && IsControlTarget(focus, hwnd)) {
+            s->targetSticky = false;
+            g_lastClickWindow = nullptr;
+            g_altTabPressed = false;
+            ApplyTargetInfo(*s, focus);
+        } else {
+            // 无直接句柄（异步托盘触发）或窗口已失效：解除粘住。
+            // 若旧目标仍处于最小化（粘住的根因），仅解粘会在下一次
+            // UpdateTarget 重新粘住它——须一并清空目标，让托盘应用
+            // 窗口出现后由 EVENT_SYSTEM_FOREGROUND 自然接管；旧目标
+            // 正常（非最小化）时保留现状，不制造无谓的标签清空。
+            const bool wasStuck =
+                s->targetSticky && s->targetHwnd && IsWindow(s->targetHwnd) &&
+                IsIconic(s->targetHwnd);
+            s->targetSticky = false;
+            g_lastClickWindow = nullptr;
+            g_altTabPressed = false;
+            if (wasStuck) {
+                s->targetHwnd = nullptr;
+                s->hasTarget = false;
+                s->targetMaximized = false;
+                s->tabs.clear();
+                s->hoverButton = kHitNone;
+                s->hoverTab = -1;
+                if (s->volumeTargetHwnd != nullptr) {
+                    s->volumeTargetHwnd = nullptr;
+                    ResolveVolumeSession(*s);
+                }
+            }
+        }
+        DrawBarAndPresent(*s);
+        return 0;
+    }
+
+    case kDockVolumePanelMsg:
+        // 左上角触发角点击：展开/收起音量面板（当前目标应用）。
+        // 与点击顶栏音量按钮同语义；顶栏自己的 LL 钩子已跳过角区，
+        // 只此一条路径生效，不会双 toggle。
+        if (s) {
+            SetVolumeOpen(*s, !s->volumeOpen);
         }
         return 0;
 

@@ -135,6 +135,13 @@ constexpr UINT kMsgTriggerDone = WM_APP + 3;  // 托盘触发完成（worker →
 constexpr UINT kMsgHookClick = WM_APP + 4; // 低层鼠标钩子采集的点击 → 主窗口线程执行
 constexpr UINT kMsgHookMouse = WM_APP + 5; // 低层鼠标钩子：进入/离开 Dock 状态切换 → 主窗口线程
 constexpr UINT kMsgDockDrag = WM_APP + 6;  // 低层鼠标钩子：固定区拖拽重排的移动/松手
+// → 顶栏:点击"已打开的应用"并激活后,显式请求顶栏聚焦该应用窗口。
+// 顶栏的目标粘住逻辑只认鼠标显式点击/Alt+Tab,Dock 窗口点击不算
+// 显式切换目标(套件窗口),因此由 Dock 直接指明目标窗口;
+// lParam = 目标窗口 HWND(0 = 无直接句柄,仅解除粘住并跟随当前前台)
+constexpr UINT kMsgTopBarFocus = WM_APP + 12;
+// → 顶栏:左上角触发角点击,请求展开/收起顶栏当前应用的音量面板
+constexpr UINT kMsgTopBarVolumePanel = WM_APP + 13;
 
 // 固定区拖拽重排消息子类型（wParam）
 constexpr WPARAM kDockDragMove = 1;  // 按下后仍在按住 → 移动（UI 自行读取物理光标）
@@ -145,6 +152,7 @@ constexpr WPARAM kHookClickDockLeft = 1;      // Dock 图标左键（切换/打�
 constexpr WPARAM kHookClickDockMiddle = 2;    // Dock 图标中键（关闭应用）
 constexpr WPARAM kHookClickStart = 3;         // 左下角开始按钮
 constexpr WPARAM kHookClickShowDesktop = 4;   // 右下角显示桌面
+constexpr WPARAM kHookClickTopLeftVolume = 5; // 左上角触发角：顶栏音量面板
 
 // 启动台拖入固定（WM_COPYDATA 自定协议）：“DOCK” 魔数，lpData = UTF-16 路径
 constexpr DWORD kDesktopDockPinMagic =
@@ -1337,6 +1345,19 @@ void ForceForegroundWindow(HWND hwnd) {
     SetForegroundWindow(hwnd);
 }
 
+// 点击 Dock 图标并激活某应用窗口后,显式通知顶栏"聚焦该应用窗口"。
+// 顶栏的目标粘住逻辑只认鼠标显式点击/Alt+Tab,而点击发生在 Dock 自己的
+// 窗口上,不会被当作显式切换目标(套件窗口被 IsControlTarget 排除),
+// 导致顶栏停留在旧目标、不跟随 Dock 切换。此处由 Dock(切换的发起方)
+// 直接指明目标窗口,绕过粘住逻辑。
+// target = nullptr 时仅请求"解除粘住并跟随当前前台"(托盘 UIA 触发场景:
+// 窗口由应用自己的托盘处理器异步恢复,没有可预知的 HWND)。
+void NotifyTopBarFocus(HWND target) {
+    HWND bar = FindWindowW(L"DesktopTopBarWindow", nullptr);
+    if (!bar || !IsWindow(bar)) return;
+    PostMessageW(bar, kMsgTopBarFocus, 0, reinterpret_cast<LPARAM>(target));
+}
+
 RECT g_primaryWorkArea{};  // 主屏工作区缓存：鼠标移动热路径（LL 钩子/每帧）零系统调用
 
 void RefreshPrimaryWorkArea() {
@@ -1489,6 +1510,15 @@ bool InCornerZone(POINT pt, bool left) {
     if (pt.y < sh - h || pt.y >= sh) return false;
     if (left) return pt.x >= 0 && pt.x < w;
     return pt.x >= sw - w && pt.x < sw;
+}
+
+// 左上角触发角（主屏物理坐标；同尺寸，贴屏幕左上缘）。
+// 注意与左下/右下角的竖直判据相反：上边缘从 y=0 向下延伸 h。
+// 点击 = 展开/收起顶栏当前应用的音量面板。
+bool InTopLeftCornerZone(POINT pt) {
+    const int w = MulDiv(kShowDesktopWLogical, g_state.dpi, 96);
+    const int h = MulDiv(kShowDesktopHLogical, g_state.dpi, 96);
+    return pt.x >= 0 && pt.x < w && pt.y >= 0 && pt.y < h;
 }
 
 // 触发 Win 键（干净的一下：按下+弹起，等同系统开始按钮），打开/切换开始菜单
@@ -1769,6 +1799,21 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
             // 作为无伴生按下的孤儿序列穿透到 Dock 下方窗口。
             const bool isDown =
                 wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONDBLCLK;
+            if (isDown && InTopLeftCornerZone(pt)) {
+                // 左上角触发角：展开/收起顶栏当前应用的音量面板。
+                // 顶栏窗口是桌面底层（普通窗口可覆盖其上），只有角部全局
+                // 钩子才能保证"窗口盖住顶栏也能触发"（与左下/右下角一致）。
+                // 仅当顶栏在运行时才吞掉点击（顶栏关闭时角区下方窗口可点，
+                // 避免吃掉一个无声无息的 12×48 区域）。
+                HWND bar = FindWindowW(L"DesktopTopBarWindow", nullptr);
+                if (bar && IsWindow(bar)) {
+                    PostMessageW(g_state.hwnd, kMsgHookClick,
+                                 kHookClickTopLeftVolume, 0);
+                    g_hookLeftDownOnDock = true;
+                    return 1;  // 吞掉：点击不穿透到下方窗口
+                }
+                // 顶栏未运行：不吞，继续走下方常规路径
+            }
             if (isDown && InCornerZone(pt, true)) {
                 // 左下角：仿 Windows 开始按钮 —— 触发 Win 键（打开开始菜单）
                 PostMessageW(g_state.hwnd, kMsgHookClick, kHookClickStart, 0);
@@ -2987,6 +3032,12 @@ bool AppOwnsForeground(const DockItem& item) {
     HWND fg = GetForegroundWindow();
     if (!fg) return false;
     if (IsCloaked(fg)) return false;
+    // 桌面/任务栏等 shell 窗口不能算“应用前台”。尤其是 explorer.exe
+    // 同时是系统 shell 和文件管理器宿主：桌面没有其他窗口时，前台可能
+    // 是 Progman/WorkerW/ApplicationFrameWindow 等 shell 窗口，若按同
+    // 进程误判为“资源管理器已聚焦”，点击 Dock 图标只会走最小化分支，
+    // 永远无法打开被隐藏/最小化的文件管理器窗口。
+    if (IsShellSystemClass(fg)) return false;
     // 前台必须是“主窗口形态”：歌词/迷你/弹窗等辅助窗抢前台时不算聚焦态，
     // 否则点 Dock 图标会误触发“最小化全部”而非“聚焦主窗口”
     RECT rc{};
@@ -2998,8 +3049,15 @@ bool AppOwnsForeground(const DockItem& item) {
         if (!IsWindow(w)) continue;
         if (fg == w) return true;
     }
-    // 同进程多顶级窗口：前台属于同 exe 即算聚焦态
+    // 同进程多顶级窗口：前台属于同 exe 即算聚焦态。
+    // 但对 explorer.exe 这个“shell + 文件管理器”双身份进程做特判：
+    // 只有真正的文件管理器窗口（CabinetWClass/ExploreWClass）才算该
+    // Dock 项的前台；其余同进程 shell/辅助窗口不属于用户的应用窗口。
     DWORD fgPid = PidOf(fg);
+    if (ToLower(PathBasename(ImagePathOfPid(fgPid))) == L"explorer.exe" &&
+        !IsFileExplorerWindow(fg)) {
+        return false;
+    }
     for (HWND w : item.windows) {
         if (!IsWindow(w)) continue;
         if (PidOf(w) == fgPid) return true;
@@ -4035,6 +4093,9 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
     // 应用会得到“看得见点不动”的影子窗口。
     if (item.trayMarked && !pids.empty() && !g_skipTrayTriggerOnce) {
         TrayIconTriggerAsync(s, item.displayName, pids, idx);
+        // 托盘触发是异步的（窗口由应用自己的托盘处理器恢复）：
+        // 没有可预知的窗口句柄，仅请求顶栏解除粘住并跟随随后出现的前台
+        NotifyTopBarFocus(nullptr);
         return;
     }
 
@@ -4131,6 +4192,7 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
             if (item.trayMarked && !pids.empty()) {
                 if (!g_skipTrayTriggerOnce) {
                     TrayIconTriggerAsync(s, item.displayName, pids, idx);
+                    NotifyTopBarFocus(nullptr);  // 异步托盘触发：解除顶栏粘住
                 } else {
                     Logf(L"托盘触发失败：%ls 不再外部显示窗口（避免影子窗口）",
                          item.displayName.c_str());
@@ -4143,12 +4205,14 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
                                     SMTO_ABORTIFHUNG | SMTO_BLOCK, 500,
                                     &dummy);
                 ForceForegroundWindow(best);
+                NotifyTopBarFocus(best);
                 Logf(L"恢复任务栏窗口：%ls", item.displayName.c_str());
                 return;
             }
             if (!IsWindowVisible(best)) {
                 ShowWindow(best, SW_SHOW);
                 ForceForegroundWindow(best);
+                NotifyTopBarFocus(best);
                 Logf(L"唤起托盘应用主窗口：%ls", item.displayName.c_str());
                 return;
             }
@@ -4201,6 +4265,7 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
     if (!target && !mains.empty()) target = mains.front();
     if (target) {
         ForceForegroundWindow(target);
+        NotifyTopBarFocus(target);
         Logf(L"打开全部窗口：%ls（共 %zu 个，恢复 %d 个）",
              item.displayName.c_str(), mains.size(), restored);
     } else {
@@ -4216,14 +4281,21 @@ void ToggleFocusOrLaunch(AppState& s, size_t idx) {
 
     // 应用已在前台：点击 = 最小化该应用全部可见窗口（保留原有切换语义）。
     if (AppOwnsForeground(item)) {
+        bool minimizedAny = false;
         for (HWND w : item.windows) {
             if (IsWindow(w) && IsWindowVisible(w) && !IsIconic(w)) {
                 ShowWindow(w, SW_MINIMIZE);
+                minimizedAny = true;
             }
         }
-        Logf(L"最小化：%ls", item.displayName.c_str());
-        s.needsRedraw = true;
-        return;
+        if (minimizedAny) {
+            Logf(L"最小化：%ls", item.displayName.c_str());
+            s.needsRedraw = true;
+            return;
+        }
+        // 应用窗口已经全部最小化/隐藏（例如点击后正处于“桌面无其他窗口”的
+        // 隐藏态）：此时不应返回空操作，继续走下方恢复路径，让再次点击
+        // Dock 图标能把隐藏/最小化的窗口重新打开。
     }
 
     // 托盘驻留应用：优先打开任务栏已有窗口 —— item.windows 里收集到的
@@ -4270,6 +4342,7 @@ void ToggleFocusOrLaunch(AppState& s, size_t idx) {
         if (!target && !mains.empty()) target = mains.front();
         if (target) {
             ForceForegroundWindow(target);
+            NotifyTopBarFocus(target);
         }
         Logf(L"打开全部窗口：%ls（共 %zu 个，恢复 %d 个）",
              item.displayName.c_str(), mains.size(), restored);
@@ -4683,6 +4756,7 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
                                         500, &dummy);
                 }
                 ForceForegroundWindow(e.window);
+                NotifyTopBarFocus(e.window);
             }
             break;
         case ItemAction::Launch:
@@ -5129,6 +5203,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 TriggerWinKey();
             } else if (wParam == kHookClickShowDesktop) {
                 ToggleShowDesktop();
+            } else if (wParam == kHookClickTopLeftVolume) {
+                // 左上角触发角：请求顶栏展开/收起当前应用的音量面板
+                HWND bar = FindWindowW(L"DesktopTopBarWindow", nullptr);
+                if (bar && IsWindow(bar)) {
+                    PostMessageW(bar, kMsgTopBarVolumePanel, 0, 0);
+                } else {
+                    Logf(L"[角部] 左上角触发：顶栏未运行，忽略");
+                }
             }
             // 与 Dock 交互后立即自愈工作区：开始菜单/显示桌面等操作可能让
             // explorer 把工作区改回“任务栏占位”，导致 Dock 跳到任务栏上方。
