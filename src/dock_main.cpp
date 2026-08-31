@@ -2484,13 +2484,25 @@ bool UpdateLayoutOneFrame(AppState& s) {
             s.mouseY = static_cast<float>(cp.y - wr.top);
             // 每帧用物理光标位置自愈 mouseOverDock：不依赖 LL 钩子是否
             // 正好送达最底一行，贴底/空隙悬停更稳定。
-            s.mouseOverDock = PointInDockOrStrip(cp);
+            // 注意：判定必须用「本帧目标几何」—— 顶边 = 工作区底 − 窗口高 +
+            // 当前收起偏移（FrameTick 已先行推进 offset）。绝不能用缓存 winY
+            // 或 GetWindowRect 的旧矩形：收起动画第一帧窗口尚未实际下移，
+            // 旧矩形会把刚从顶边离开的光标误判回区内，立即撤销刚发起的收起
+            // （17:15:27 事故：收起被“自愈”荡回，Dock 滞留展开 5.5 秒）。
+            const RECT wa = g_primaryWorkArea;
+            const int effGap = MulDiv(s.bottomGapBase, s.dpi, 96);
+            const int effTop = wa.bottom - effGap - s.winH +
+                               static_cast<int>(s.collapseOffset + 0.5f);
+            s.mouseOverDock =
+                (cp.x >= s.winX && cp.x < s.winX + s.winW &&
+                 cp.y >= effTop && cp.y <= wa.bottom + 2) ||
+                InDockStrip(cp);
             if (s.mouseOverDock) {
                 if (!s.wasOnDock || s.hideRequested) {
                     // 诊断：帧间自愈进场（钩子事件缺失/折返的旁证）
-                    Logf(L"[帧] 自愈进场 光标=(%d,%d) wasOnDock=%d "
+                    Logf(L"[帧] 自愈进场 光标=(%d,%d) 目标顶边=%d wasOnDock=%d "
                          L"hideRequested=%d → 复位收起请求",
-                         cp.x, cp.y, s.wasOnDock ? 1 : 0,
+                         cp.x, cp.y, effTop, s.wasOnDock ? 1 : 0,
                          s.hideRequested ? 1 : 0);
                 }
                 s.wasOnDock = true;
