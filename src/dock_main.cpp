@@ -2199,6 +2199,13 @@ bool RefreshItems(AppState& s) {
     std::vector<Cand*> shownPtrs;
     shownPtrs.reserve(cands.size());
     for (auto& c : cands) {
+        // 非固定项中键按下后：立即从 Dock 消失，即使窗口/进程还没真正退出；
+        // 否则关闭慢时图标会“消失一瞬间又被下一次刷新重新加回”。
+        // 托盘驻留项同样要在关闭完成前隐藏（战网等会先以托盘形式短暂残留，
+        // 若不过滤会再次出现）。
+        if (s.closingKeys.count(c.item.key) && !c.item.pinned) {
+            continue;
+        }
         if (c.item.trayMarked && !c.item.hasWindow && !c.item.pinned &&
             s.hiddenKeys.count(c.item.key)) {
             continue;
@@ -2215,6 +2222,27 @@ bool RefreshItems(AppState& s) {
                          return a->ordinal < b->ordinal;
                      });
 
+    // ---- 中键关闭抑制状态清理 ----
+    // 必须在“应用到状态”之前基于完整 cands 判断：被抑制的非固定项虽然
+    // 不会进入 shownPtrs/s.items，但只要底层仍有窗口/托盘驻留（正在慢速
+    // 关闭），就继续保持抑制，避免下一次刷新把图标重新加回；真正退出后
+    // 才解除。
+    for (auto it = s.closingKeys.begin(); it != s.closingKeys.end();) {
+        bool stillRunning = false;
+        for (const auto& c : cands) {
+            if (c.item.key == *it &&
+                (c.item.hasWindow || c.item.trayMarked)) {
+                stillRunning = true;
+                break;
+            }
+        }
+        if (!stillRunning) {
+            it = s.closingKeys.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     // ---- 应用到状态 ----
     s.items.clear();
     s.items.reserve(shownPtrs.size());
@@ -2227,24 +2255,6 @@ bool RefreshItems(AppState& s) {
         if (animIt != prevAnim.end()) item.scaleAnim = animIt->second;
         if (item.pinned) ++s.pinCount;
         s.items.push_back(std::move(item));
-    }
-
-    // ---- 中键关闭抑制状态清理 ----
-    // 一旦应用确实不再有窗口/托盘驻留（或条目已消失），解除抑制；
-    // 若仍存活（关闭中/优雅退出尚未完成），继续保持圆点隐藏。
-    for (auto it = s.closingKeys.begin(); it != s.closingKeys.end();) {
-        bool stillRunning = false;
-        for (const auto& item : s.items) {
-            if (item.key == *it && (item.hasWindow || item.trayMarked)) {
-                stillRunning = true;
-                break;
-            }
-        }
-        if (!stillRunning) {
-            it = s.closingKeys.erase(it);
-        } else {
-            ++it;
-        }
     }
 
     // ---- 变更检测与日志（仅状态切换的那一次 poll 会触发）----
@@ -3302,8 +3312,10 @@ void RequestCloseByIndex(AppState& s, size_t idx) {
 
     if (!pinned) {
         // 先移除临时图标，再发送关闭请求：UI 立刻收拢，不阻塞在窗口枚举上。
-        // 图标已经消失，无需再为它保留“关闭中”抑制圆点状态；若因关闭失败
-        // 再次出现在 Dock，圆点应恢复正常显示。
+        // 所有非固定项（包括托盘驻留）都插入 closingKeys 进行“关闭中”抑制：
+        // 即使应用关闭很慢、窗口或托盘进程还未退出，下一次刷新也不能把
+        // 图标重新加回；否则会出现“短暂消失又出现，直到真正关闭才消失”。
+        s.closingKeys.insert(key);
         Logf(L"关闭并移除临时图标：%ls", displayName.c_str());
         s.items.erase(s.items.begin() + static_cast<long>(idx));
         if (s.hoverIndex != static_cast<size_t>(-1)) {
