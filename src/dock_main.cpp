@@ -122,6 +122,7 @@ constexpr float kDragThreshold = 6.0f;         // 固定区图标：按压→拖
 constexpr int kMenuBaseId = 4000;
 constexpr int kMenuExit = 1001;
 constexpr int kMenuToggleAutoCollapse = 1002;  // 空白区右键：自动收起开关
+constexpr int kMenuToggleLog = 1003;           // 右键菜单：运行日志开关
 constexpr int kDockStripHeightLogical = 2;     // 展开触发条高度（逻辑像素，与 Dock 同宽）
 constexpr UINT_PTR kTooltipTimerId = 4;        // 悬停提示一次性定时器（停帧模式下到期踢帧）
 constexpr UINT_PTR kCollapseWatchTimerId = 5;  // 收起状态监视（诊断专用：本应收起未收起）
@@ -386,13 +387,19 @@ std::wstring ExeDisplayName(const std::wstring& fullPathLower) {
 // ============================== 日志 ==============================
 // main 分支禁止日志：kLogEnabled=false 时 LogInit 不建目录不开文件、
 // Logf 直接返回（release 行为，零 I/O）。debug 分支保持 true（完整日志）。
+// 运行期开关：右键菜单「运行日志」可切换并经注册表持久化（LogEnabled，
+// 与自动收起开关同机制）。关闭后 Logf 立即短路（零写入），句柄保持打开。
 constexpr bool kLogEnabled = true;
+std::atomic<bool> g_logEnabled{kLogEnabled};
 
 FILE* g_logFile = nullptr;
 SRWLOCK g_logLock = SRWLOCK_INIT;  // 后台关闭线程与主线程可能同时写日志
 
 void Logf(const wchar_t* fmt, ...) {
-    if (!kLogEnabled || !g_logFile) return;
+    if (!kLogEnabled || !g_logEnabled.load(std::memory_order_relaxed) ||
+        !g_logFile) {
+        return;
+    }
     AcquireSRWLockExclusive(&g_logLock);
     SYSTEMTIME st{};
     GetLocalTime(&st);
@@ -408,7 +415,11 @@ void Logf(const wchar_t* fmt, ...) {
 }
 
 void LogInit() {
-    if (!kLogEnabled) return;  // main 分支：不创建 logs 目录、不写日志
+    // 编译期开关 + 运行期（注册表持久化）开关：LoadConfig 须在 LogInit 之前，
+    // 否则关闭状态会先写出一条“启动”头再被短路。
+    if (!kLogEnabled || !g_logEnabled.load(std::memory_order_relaxed)) {
+        return;
+    }
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     const std::wstring binDir = PathDir(exe);          // ...\bin
@@ -574,9 +585,9 @@ void LoadConfig(AppState& s, bool* existed) {
     // 旧版本默认 6（悬空）→ 新版本默认 0（贴底），迁移历史配置
     if (s.bottomGapBase == 6) s.bottomGapBase = 0;
     s.autoCollapse = ReadRegDword(key, L"AutoCollapse", 1) != 0;
+    g_logEnabled.store(ReadRegDword(key, L"LogEnabled", 1) != 0,
+                       std::memory_order_relaxed);
     RegCloseKey(key);
-    Logf(L"配置载入：固定 %zu 项，隐藏 %zu 项", s.pins.size(),
-         s.hiddenKeys.size());
 }
 
 void SaveConfig(AppState& s) {
@@ -616,7 +627,24 @@ void SaveConfig(AppState& s) {
     RegSetValueExW(key, L"AutoCollapse", 0, REG_DWORD,
                    reinterpret_cast<const BYTE*>(&autoCollapse),
                    sizeof(autoCollapse));
+    const DWORD logOn = g_logEnabled.load(std::memory_order_relaxed) ? 1 : 0;
+    RegSetValueExW(key, L"LogEnabled", 0, REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&logOn), sizeof(logOn));
     RegCloseKey(key);
+}
+
+// 右键菜单：切换运行日志开关（持久化到注册表，与自动收起开关同机制）。
+// 关闭：先写「已关闭」再短路；开启：文件未建过才补建（启动即关时的情况）。
+void ToggleLogEnabled() {
+    if (g_logEnabled.load(std::memory_order_relaxed)) {
+        Logf(L"运行日志：关闭");
+        g_logEnabled.store(false, std::memory_order_relaxed);
+    } else {
+        g_logEnabled.store(true, std::memory_order_relaxed);
+        if (!g_logFile) LogInit();  // 启动时即关闭则此刻才建日志文件
+        Logf(L"运行日志：开启");
+    }
+    SaveConfig(g_state);
 }
 
 // 初次运行：从仓库目录常见快捷方式挑选固定项（仅注册表无任何记录时执行）
@@ -4600,6 +4628,11 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
                 MF_STRING | (s.autoCollapse ? MF_CHECKED : MF_UNCHECKED),
                 kMenuToggleAutoCollapse,
                 L"自动收起（光标离开收到底部，触碰下缘展开）");
+    AppendMenuW(menu,
+                MF_STRING | (g_logEnabled.load(std::memory_order_relaxed)
+                                 ? MF_CHECKED
+                                 : MF_UNCHECKED),
+                kMenuToggleLog, L"运行日志（记录展开收起诊断）");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuExit, L"退出桌面 Dock");
 
@@ -4622,6 +4655,10 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
         if (!s.autoCollapse) s.hideRequested = false;  // 关闭即展开
         SaveConfig(s);
         Logf(s.autoCollapse ? L"自动收起：开启" : L"自动收起：关闭");
+        return;
+    }
+    if (cmd == kMenuToggleLog) {
+        ToggleLogEnabled();
         return;
     }
     if (cmd == kMenuExit) {
@@ -4683,6 +4720,11 @@ void ShowBlankContextMenu(AppState& s) {
                 MF_STRING | (s.autoCollapse ? MF_CHECKED : MF_UNCHECKED),
                 kMenuToggleAutoCollapse,
                 L"自动收起（光标离开收到底部，触碰下缘展开）");
+    AppendMenuW(menu,
+                MF_STRING | (g_logEnabled.load(std::memory_order_relaxed)
+                                 ? MF_CHECKED
+                                 : MF_UNCHECKED),
+                kMenuToggleLog, L"运行日志（记录展开收起诊断）");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuExit, L"退出桌面 Dock");
 
@@ -4702,6 +4744,8 @@ void ShowBlankContextMenu(AppState& s) {
         if (!s.autoCollapse) s.hideRequested = false;  // 关闭即展开
         SaveConfig(s);
         Logf(s.autoCollapse ? L"自动收起：开启" : L"自动收起：关闭");
+    } else if (cmd == kMenuToggleLog) {
+        ToggleLogEnabled();
     } else if (cmd == kMenuExit) {
         Logf(L"用户请求退出");
         DestroyWindow(s.hwnd);
@@ -5295,19 +5339,20 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
         return 1;
     }
 
-    LogInit();
-
     AppState& s = g_state;
     s.hwnd = nullptr;
     s.dpi = QueryPrimaryDpi();
     s.scale = static_cast<float>(s.dpi) / 96.0f;
 
     bool configExists = false;
-    LoadConfig(s, &configExists);
+    LoadConfig(s, &configExists);  // 先读配置（含持久化的日志开关），再开日志
     if (!configExists) {
         SeedDefaultPinsIfEmpty(s);
         SaveConfig(s);
     }
+    LogInit();
+    Logf(L"配置载入：固定 %zu 项，隐藏 %zu 项", s.pins.size(),
+         s.hiddenKeys.size());
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
