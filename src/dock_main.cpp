@@ -124,6 +124,8 @@ constexpr int kMenuExit = 1001;
 constexpr int kMenuToggleAutoCollapse = 1002;  // 空白区右键：自动收起开关
 constexpr int kDockStripHeightLogical = 2;     // 展开触发条高度（逻辑像素，与 Dock 同宽）
 constexpr UINT_PTR kTooltipTimerId = 4;        // 悬停提示一次性定时器（停帧模式下到期踢帧）
+constexpr UINT_PTR kCollapseWatchTimerId = 5;  // 收起状态监视（诊断专用：本应收起未收起）
+constexpr UINT kCollapseWatchMs = 2000;        // 监视周期（2s，只记录不干预）
 
 // 事件驱动消息（WinEvent 回调/注册表监听线程 → 主窗口）
 constexpr UINT kMsgRefresh = WM_APP + 1;   // 窗口集合/托盘状态可能变化，合并刷新
@@ -288,6 +290,10 @@ struct AppState {
     std::atomic<bool> menuOpen{false};  // 右键菜单打开期间不收起（低层钩子线程也会读取）
     bool mouseOverDock = false;   // 悬停真值（LL 钩子按光标物理位置维护）
     bool wasOnDock = false;       // 钩子：上一拍光标是否在有效交互区（状态迁移）
+    float diagLastTarget = -1.0f; // 诊断：上次记录的收起目标（变化才记）
+    float diagLastOffset = -1.0f; // 诊断：上次完成的 offset（完成检测用）
+    int diagWatchState = 0;       // 诊断：收起监视状态（0=正常 1=应收未收 2=收起请求未推进）
+    ULONGLONG diagWatchLogTick = 0;  // 诊断：异常日志上次落盘时刻（防刷屏）
     Font* uiFont = nullptr;
 
     // ---- 固定区拖拽重排状态 ----
@@ -2480,6 +2486,13 @@ bool UpdateLayoutOneFrame(AppState& s) {
             // 正好送达最底一行，贴底/空隙悬停更稳定。
             s.mouseOverDock = PointInDockOrStrip(cp);
             if (s.mouseOverDock) {
+                if (!s.wasOnDock || s.hideRequested) {
+                    // 诊断：帧间自愈进场（钩子事件缺失/折返的旁证）
+                    Logf(L"[帧] 自愈进场 光标=(%d,%d) wasOnDock=%d "
+                         L"hideRequested=%d → 复位收起请求",
+                         cp.x, cp.y, s.wasOnDock ? 1 : 0,
+                         s.hideRequested ? 1 : 0);
+                }
                 s.wasOnDock = true;
                 if (s.hideRequested) s.hideRequested = false;
             }
@@ -4735,10 +4748,29 @@ void FrameTick(AppState& s) {
     // （缓动收敛；菜单打开期间保持展开以便操作）
     {
         const float target = CollapseTargetOf(s);
+        const float prevTarget = s.diagLastTarget;
+        if (target != prevTarget) {
+            // 诊断：收起/展开目标翻转（含启动首拍 -1 → 目标值）
+            Logf(L"[收起] 目标变化 %.1f → %.1f (offset=%.1f autoCollapse=%d "
+                 L"hideRequested=%d menuOpen=%d)",
+                 prevTarget, target, s.collapseOffset, s.autoCollapse ? 1 : 0,
+                 s.hideRequested ? 1 : 0, s.menuOpen.load() ? 1 : 0);
+            s.diagLastTarget = target;
+        }
         const float cur = s.collapseOffset;
         const float next = cur + (target - cur) * 0.22f;
         s.collapseOffset =
             (std::fabs(target - next) < 0.5f) ? target : next;
+        // 诊断：动画收敛完成（首拍不记，避免启动噪声）
+        if (prevTarget >= 0.f && s.collapseOffset == target &&
+            s.diagLastOffset != target) {
+            if (target == 0.f) {
+                Logf(L"[展开] 完成 offset=0");
+            } else {
+                Logf(L"[收起] 完成 offset=%.1f (winH=%d)", target, s.winH);
+            }
+        }
+        s.diagLastOffset = s.collapseOffset;
     }
     const bool collapseAnimating =
         s.collapseOffset != 0.f && s.collapseOffset != static_cast<float>(s.winH);
@@ -4760,6 +4792,69 @@ void FrameTick(AppState& s) {
     SetFrameCadence(s, animating || collapseAnimating ||
                            !s.pendingLaunches.empty() ||
                            s.dragPhase == DockDragPhase::Dragging);
+}
+
+// ===== 收起状态监视（诊断、只记录不干预）=====
+// 每 2s 校验一次「光标已离开 Dock 区但窗口仍展开」的不一致状态：
+//   - wasOnDock=1 且 hideRequested=0：离开事件（kMsgHookMouse）丢失/未生效
+//     —— 记录「本应收起但未收起」；
+//   - wasOnDock=0（从未进场）但 offset=0 展开停留：启动/复位后从未被触碰
+//     —— 同样记录（否则 Dock 启动后永远展开）；
+//   - hideRequested=1 但帧驱动已停（offset 未推进）：记录「收起请求停在原地」。
+// 以上只落日志、不改任何状态（待复现确认后再决定修复方案）。
+// menuOpen 或 autoCollapse=关闭 期间不判定（菜单期保持展开属预期行为）。
+void CollapseWatchdog(AppState& s) {
+    if (!s.autoCollapse || s.menuOpen) {
+        if (s.diagWatchState != 0) {
+            Logf(L"[监视] 停止（autoCollapse=%d menuOpen=%d 期间不判定）",
+                 s.autoCollapse ? 1 : 0, s.menuOpen.load() ? 1 : 0);
+            s.diagWatchState = 0;
+        }
+        return;
+    }
+    POINT cp{};
+    GetCursorPos(&cp);
+    const bool inZone = PointInDockOrStrip(cp);
+    const bool expandedLike =
+        s.collapseOffset < static_cast<float>(s.winH) - 4.f;
+
+    if (!inZone && expandedLike && !s.hideRequested) {
+        // 展开且光标不在区内却没有收起任务 —— 即「本应收起但未收起」
+        const ULONGLONG now = GetTickCount64();
+        if (s.diagWatchState == 0 || now - s.diagWatchLogTick >= 30000) {
+            Logf(L"[监视] 本应收起但未收起：光标=(%d,%d) 区内=%d wasOnDock=%d "
+                 L"offset=%.1f winH=%d 原因=%ls（仅记录，未干预）",
+                 cp.x, cp.y, inZone ? 1 : 0, s.wasOnDock ? 1 : 0,
+                 s.collapseOffset, s.winH,
+                 s.wasOnDock ? L"离开事件丢失" : L"从未进场/进场事件未达");
+            s.diagWatchLogTick = now;
+        }
+        s.diagWatchState = 1;
+        return;
+    }
+    if (!inZone && expandedLike && s.hideRequested) {
+        // 已请求收起但未见推进（帧驱动停/offset 未动）：记录（不踢帧）
+        const ULONGLONG now = GetTickCount64();
+        if (s.frameIntervalMs == 0 && s.collapseOffset == 0.f &&
+            (s.diagWatchState != 2 ||
+             now - s.diagWatchLogTick >= 30000)) {
+            Logf(L"[监视] 收起请求已置但帧停：offset=%.1f winH=%d（仅记录，未干预）",
+                 s.collapseOffset, s.winH);
+            s.diagWatchLogTick = now;
+        }
+        if (s.diagWatchState != 2) {
+            Logf(L"[监视] 收起推进中：offset=%.1f winH=%d",
+                 s.collapseOffset, s.winH);
+            s.diagWatchState = 2;
+        }
+        return;
+    }
+    // 正常 / 已收起 / 光标在区内
+    if (s.diagWatchState != 0) {
+        Logf(L"[监视] 恢复一致：偏移=%.1f 区内=%d hideRequested=%d",
+             s.collapseOffset, inZone ? 1 : 0, s.hideRequested ? 1 : 0);
+    }
+    s.diagWatchState = 0;
 }
 
 // ============================== 窗口过程 ==============================
@@ -4881,8 +4976,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // 避免钩子线程直接修改 UI 状态；即使 UI 线程偶然阻塞，鼠标钩子也已返回。
         case kMsgHookMouse: {
             const bool onDock = wParam != 0;
+            const POINT hsPos{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             s->mouseOverDock = onDock;
             if (onDock) {
+                if (!s->wasOnDock || s->hideRequested) {
+                    // 诊断：进场（含收起途中折返：收起-展开跳动即在此留下记录）
+                    Logf(L"[钩子] 进入有效区 光标=(%d,%d) wasOnDock=%d "
+                         L"hideRequested=%d offset=%.1f winH=%d",
+                         hsPos.x, hsPos.y, s->wasOnDock ? 1 : 0,
+                         s->hideRequested ? 1 : 0, s->collapseOffset, s->winH);
+                }
                 s->wasOnDock = true;
                 if (s->hideRequested) s->hideRequested = false;
                 s->needsRedraw = true;
@@ -4907,11 +5010,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         //     容差）内 —— 触碰下缘意为保持展开，且不复位
                         //     wasOnDock（光标仍在有效区，下次真正离开会重新判定）；
                         //  2) 越过有效区下缘（如移到主屏下方的副屏、或超出
-                        //     贴边容差）—— 这是真正的离开，必须收起。
-                        //     此前只认上/左/右三个方向，下方越界会误判为
-                        //     “还在有效区”，导致光标远走后 Dock 停留在展开态。
+                        //     贴边容差）—— 这是真正的离开，必须收起。（此前
+                        //     只认上/左/右三个方向，下方越界会误判为“还在
+                        //     有效区”，导致光标远走后 Dock 停留在展开态。）
                         const bool stillInZone = PointInDockOrStrip(cp);
-                        if (topExit || leftExit || rightExit || !stillInZone) {
+                        const bool collapseIt =
+                            topExit || leftExit || rightExit || !stillInZone;
+                        Logf(L"[钩子] 离开有效区 光标=(%d,%d) win=(%d,%d..%d,%d) "
+                             L"上=%d 左=%d 右=%d 仍区内=%d 拖拽=%d → %ls",
+                             cp.x, cp.y, wr.left, wr.top, wr.right, wr.bottom,
+                             topExit ? 1 : 0, leftExit ? 1 : 0,
+                             rightExit ? 1 : 0, stillInZone ? 1 : 0,
+                             s->dragPhase == DockDragPhase::None ? 0 : 1,
+                             collapseIt ? L"开始收起" : L"下缘空白，保持展开");
+                        if (collapseIt) {
                             // 拖拽重排期间不随光标离开收起（否则窗口滑出屏幕、
                             // 幽灵消失）；拖拽结束的松手点由 ResetDockDrag 补判定。
                             if (s->dragPhase == DockDragPhase::None) {
@@ -4919,9 +5031,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                 s->wasOnDock = false;
                                 s->needsRedraw = true;
                                 SetFrameCadence(*s, true);
+                            } else {
+                                Logf(L"[钩子] 离开有效区但拖拽重排中 → 不收起");
                             }
                         }
                     }
+                } else {
+                    // 诊断：离开时 wasOnDock=0 —— 若此刻窗口仍展开，即
+                    // “进场事件未达/状态错位”的痕迹（监视器只记录、不干预）。
+                    Logf(L"[钩子] 离开有效区(未进场) 光标=(%d,%d) wasOnDock=0 "
+                         L"offset=%.1f → 不触发收起",
+                         hsPos.x, hsPos.y, s->collapseOffset);
                 }
             }
             return 0;
@@ -5027,6 +5147,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 DoPoll(*s);
             } else if (wParam == kSafetyTimerId) {
                 DoPoll(*s);  // 事件失效保底（1 次/分钟）
+            } else if (wParam == kCollapseWatchTimerId) {
+                CollapseWatchdog(*s);  // 诊断：2s 校验「应收未收」并自愈
             } else if (wParam == kTooltipTimerId) {
                 // 悬停名称提示到期：踢一帧完成绘制
                 KillTimer(hwnd, kTooltipTimerId);
@@ -5104,6 +5226,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd, kFrameTimerId);
             KillTimer(hwnd, kRefreshTimerId);
             KillTimer(hwnd, kSafetyTimerId);
+            KillTimer(hwnd, kCollapseWatchTimerId);
             UninstallDockWinEventHook();
             UninstallShowDesktopHook();
             ShowTaskbar();  // 恢复 Windows 任务栏
@@ -5225,12 +5348,22 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
     DrawAndPresent(s);
     // ULW 窗口同样必须 ShowWindow 一次，否则始终处于隐藏态
     ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+    // 诊断：记录启动态（展开/收起、开关、光标位置），便于对账
+    {
+        POINT cp{};
+        GetCursorPos(&cp);
+        Logf(L"[启动] autoCollapse=%d collapseOffset=%.1f winH=%d 光标=(%d,%d) 区内=%d",
+             s.autoCollapse ? 1 : 0, s.collapseOffset, s.winH, cp.x, cp.y,
+             PointInDockOrStrip(cp) ? 1 : 0);
+    }
     // 事件驱动接管（替代定时轮询）：空暇零唤醒
     s.taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
     InstallDockWinEventHook();   // 窗口集合变化 / Win+D 最小化自愈
     StartTrayRegistryWatch();    // 托盘注册表阻塞式监听（RegNotifyChangeKeyValue）
     SetTimer(s.hwnd, kSafetyTimerId, static_cast<UINT>(kSafetyPollMs),
              nullptr);           // 事件失效保底（1 次/分钟）
+    SetTimer(s.hwnd, kCollapseWatchTimerId, kCollapseWatchMs,
+             nullptr);           // 诊断：收起状态监视（2s）
     s.lastPollTick = GetTickCount64();  // 启动后立即首次轮询
     SetTimer(s.hwnd, kFrameTimerId, kFrameIntervalMs, nullptr);
 
