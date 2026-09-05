@@ -4536,7 +4536,6 @@ void ProcessDockDragUp(AppState& s, POINT client) {
 }
 
 void ResetDockDrag(AppState& s) {
-    const bool wasDragging = s.dragPhase == DockDragPhase::Dragging;
     s.dragPhase = DockDragPhase::None;
     s.dragKey.clear();
     s.dragPressIdx = -1;
@@ -4546,15 +4545,18 @@ void ResetDockDrag(AppState& s) {
     s.dragGhostRect = RectF();
     s.needsRedraw = true;
     SetFrameCadence(s, true);
-    // 拖拽期间抑制收起（离开事件被 kMsgHookMouse 跳过）；结束时按光标
-    // 当前位置补判定：人已不在 Dock 则正常收起。
-    if (wasDragging) {
-        POINT cp{};
-        GetCursorPos(&cp);
-        if (!PointInDockOrStrip(cp)) {
-            s.hideRequested = true;
-            s.wasOnDock = false;
-        }
+    // 拖拽/点击期间离开事件被抑制（kMsgHookMouse 的“拖拽中不收起”分支）；
+    // 收尾时按光标当前位置补判定 —— 人已不在 Dock 则正常收起。
+    // 不区分 Dragging/Pressed：普通点击（未超阈值）同样可能在 Dock 外
+    // 松手，其离开事件被吞后此前无人补触发（仅对 Dragging 补判定），
+    // 造成“点亮应用后 Dock 停留展开、直到下次进/出 Dock 才收起”的滞留
+    // （监视器记录为“离开事件丢失”）。一律按当前光标补判定即可覆盖两态。
+    POINT cp{};
+    GetCursorPos(&cp);
+    if (!PointInDockOrStrip(cp)) {
+        Logf(L"拖动/点击收尾：光标=(%d,%d) 已不在 Dock，补收起", cp.x, cp.y);
+        s.hideRequested = true;
+        s.wasOnDock = false;
     }
 }
 
@@ -5166,8 +5168,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                              s->dragPhase == DockDragPhase::None ? 0 : 1,
                              collapseIt ? L"开始收起" : L"下缘空白，保持展开");
                         if (collapseIt) {
-                            // 拖拽重排期间不随光标离开收起（否则窗口滑出屏幕、
-                            // 幽灵消失）；拖拽结束的松手点由 ResetDockDrag 补判定。
+                            // 拖拽/点击收尾期间不随光标离开收起（否则窗口滑出
+                            // 屏幕、幽灵消失）；结束后由 ResetDockDrag 按当前
+                            // 光标位置补判定（含未超拖拽阈值的普通点击）。
                             if (s->dragPhase == DockDragPhase::None) {
                                 s->hideRequested = true;
                                 s->wasOnDock = false;
