@@ -117,6 +117,12 @@ constexpr int kVolumePanelH = 60;       // 展开的音量面板高度
 constexpr int kVolumePanelMargin = 2;   // 按键/面板贴合左上角的小边距
 constexpr int kMuteButtonW = 30;        // 面板内静音按钮宽度
 constexpr UINT kVolumeApplyDelayMs = 40;
+// 目标进程尚无音频会话时的补解析轮询：应用可能先无声（如浏览器未播放任何东西），
+// 之后才开始出声（如开始播放视频）。仅在音量面板展开期间以 1.5s 短间隔轮询，
+// 面板关闭即停（零轮询）：音量调节只能在面板内进行，打开面板瞬间会补解析一次；
+// 解析成功即停。
+constexpr UINT_PTR kVolumeRetryTimerId = 6;
+constexpr UINT kVolumeRetryMs = 1500;
 // 挂起态短轮询：右键新建窗口待插入 / 抢前台重试期间每 200ms 刷新一次，
 // 状态结束即停（不常驻）
 constexpr UINT_PTR kTabRefreshTimerId = 1;
@@ -1683,8 +1689,12 @@ ComPtr<ISimpleAudioVolume> FindProcessVolumeSession(DWORD pid) {
     return nullptr;
 }
 
-// 刷新音量会话：目标窗口变化时重新解析其进程的音频会话
+// 刷新音量会话：目标窗口变化时重新解析其进程的音频会话。
+// 解析不到会话（应用当前没有声音）时，仅当音量面板展开才启动短间隔补解析轮询，
+// 应用之后才开始出声（如浏览器开始播放视频）会自动被捕获；
+// 面板关闭即停（零轮询），下次展开面板会立即再补解析一次。
 void ResolveVolumeSession(AppState& s) {
+    KillTimer(s.hwnd, kVolumeRetryTimerId);
     s.volumeSession.Reset();
     s.volumeSessionPid = 0;
     s.volumeReady = false;
@@ -1700,6 +1710,10 @@ void ResolveVolumeSession(AppState& s) {
 
     ComPtr<ISimpleAudioVolume> vol = FindProcessVolumeSession(pid);
     if (!vol) {
+        // 应用尚无音频会话：面板展开期间短间隔重试，等它出声
+        if (s.volumeOpen) {
+            SetTimer(s.hwnd, kVolumeRetryTimerId, kVolumeRetryMs, nullptr);
+        }
         return;
     }
 
@@ -2367,8 +2381,13 @@ void SetVolumeOpen(AppState& s, bool open) {
     }
     s.volumeOpen = open;
     if (open) {
+        // 展开时立即补解析一次：即使目标应用先前无声（解析不到会话），
+        // 此时也会解析成功/启动面板展开期轮询，滑条尽快恢复可用
+        ResolveVolumeSession(s);
         ShowVolumePanel(s);
     } else {
+        // 面板关闭即停轮询（零轮询：无声应用常驻聚焦也无后台开销）
+        KillTimer(s.hwnd, kVolumeRetryTimerId);
         HideVolumePanel(s);
     }
 }
@@ -3254,6 +3273,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (RefreshTabs(*s)) {
                 DrawBarAndPresent(*s);
             }
+        } else if (wParam == kVolumeRetryTimerId) {
+            // 目标进程的音频会话晚到（先无声后出声）：面板展开期间补解析。
+            // 解析成功即停；成功时刷新顶栏与音量面板，滑条/静音立即恢复可用
+            if (s->volumeReady || !s->volumeOpen) {
+                KillTimer(hwnd, kVolumeRetryTimerId);
+                return 0;
+            }
+            ResolveVolumeSession(*s);
+            if (s->volumeReady) {
+                DrawBarAndPresent(*s);
+                if (s->volumePanelHwnd && s->panelBitmap) {
+                    Graphics g(s->panelBitmap);
+                    DrawVolumePanelContent(g, *s);
+                    PresentVolumePanel(*s);
+                }
+            }
         } else if (wParam == kClockTimerId) {
             // 时钟：每秒检查一次，仅时间/日期文本变化时重绘
             if (UpdateClock(*s)) {
@@ -3290,6 +3325,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         KillTimer(hwnd, kTargetRetryTimerId);
         KillTimer(hwnd, kTabRefreshDebounceTimerId);
         KillTimer(hwnd, kSlowRefreshTimerId);
+        KillTimer(hwnd, kVolumeRetryTimerId);
         KillTimer(hwnd, kClockTimerId);
         ChromeSyncStop();  // 先停网络线程（会向本窗口发状态消息，需在窗口销毁前）
         UninstallVolumeHook();
