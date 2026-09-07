@@ -20,6 +20,11 @@
 //      前台时 最小化全部；托盘驻留应用优先恢复任务栏已有窗口，确实没有
 //      窗口时才走托盘图标触发（TrayList 方式）或启动；
 //      启动时有 macOS 风格弹跳动画直到应用出现；中键关闭该应用全部窗口
+//   6. 自动收起开关（空白区/图标右键菜单，注册表持久化）：光标离开 Dock
+//      即收起到屏幕底边，触碰下缘触发条展开；开启期间与顶栏联动 ——
+//      Dock 展开时顶栏与 Dock 一样置顶（不被应用窗口覆盖），Dock 收起时
+//      顶栏恢复桌面层（只在桌面显示、被应用窗口覆盖）；关闭自动收起时
+//      顶栏行为不变（默认桌面层）
 //
 // 日志写入 ..\logs\dock.log
 
@@ -142,6 +147,14 @@ constexpr UINT kMsgDockDrag = WM_APP + 6;  // 低层鼠标钩子：固定区拖�
 constexpr UINT kMsgTopBarFocus = WM_APP + 12;
 // → 顶栏:左上角触发角点击,请求展开/收起顶栏当前应用的音量面板
 constexpr UINT kMsgTopBarVolumePanel = WM_APP + 13;
+// → 顶栏:自动收起联动。自动收起开启期间,顶栏层级跟随 Dock 展开/收起
+// (Dock 展开=顶栏与 Dock 一样置顶、不被应用窗口覆盖,wParam=1;
+// Dock 收起=顶栏恢复桌面层、只在桌面显示,wParam=0)。自动收起关闭时
+// 状态恒为 0,顶栏行为不变(默认桌面层)。
+constexpr UINT kMsgTopBarDockState = WM_APP + 14;
+// ← 顶栏:启动/重置时查询当前联动状态(通过 SendMessageTimeout 的返回值应答,
+// 返回值 = 1 置顶/0 桌面层;同时按需补投递一次 kMsgTopBarDockState)。
+constexpr UINT kMsgTopBarDockQuery = WM_APP + 15;
 
 // 固定区拖拽重排消息子类型（wParam）
 constexpr WPARAM kDockDragMove = 1;  // 按下后仍在按住 → 移动（UI 自行读取物理光标）
@@ -303,6 +316,7 @@ struct AppState {
     float diagLastOffset = -1.0f; // 诊断：上次完成的 offset（完成检测用）
     int diagWatchState = 0;       // 诊断：收起监视状态（0=正常 1=应收未收 2=收起请求未推进）
     ULONGLONG diagWatchLogTick = 0;  // 诊断：异常日志上次落盘时刻（防刷屏）
+    int dockLinkStateSent = -1;    // 顶栏联动：上次投递的展开态（-1=未投递；变化才投递）
     Font* uiFont = nullptr;
 
     // ---- 固定区拖拽重排状态 ----
@@ -1682,6 +1696,7 @@ void ToggleShowDesktop() {
 int HitIndexAt(AppState& s, float x, float y);
 void ToggleFocusOrLaunch(AppState& s, size_t idx);
 void SetFrameCadence(AppState& s, bool fast);
+void SyncTopBarDockState(AppState& s, bool force);  // 顶栏联动：展开/收起态同步（定义在下方）
 void RequestCloseByIndex(AppState& s, size_t idx);  // 中键关闭：固定项隐藏圆点，临时项直接移除
 size_t FindItemByKey(AppState& s, const std::wstring& key);          // 按 key 定位条目
 void BeginDockPress(AppState& s, size_t idx, POINT pt);              // 固定区按下
@@ -4742,6 +4757,8 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
         if (!s.autoCollapse) s.hideRequested = false;  // 关闭即展开
         SaveConfig(s);
         Logf(s.autoCollapse ? L"自动收起：开启" : L"自动收起：关闭");
+        // 顶栏联动即时生效：关闭自动收起 → 顶栏恢复默认桌面层；开启 → 按当前态同步
+        SyncTopBarDockState(s, true);
         return;
     }
     if (cmd == kMenuToggleLog) {
@@ -4832,6 +4849,8 @@ void ShowBlankContextMenu(AppState& s) {
         if (!s.autoCollapse) s.hideRequested = false;  // 关闭即展开
         SaveConfig(s);
         Logf(s.autoCollapse ? L"自动收起：开启" : L"自动收起：关闭");
+        // 顶栏联动即时生效：关闭自动收起 → 顶栏恢复默认桌面层；开启 → 按当前态同步
+        SyncTopBarDockState(s, true);
     } else if (cmd == kMenuToggleLog) {
         ToggleLogEnabled();
     } else if (cmd == kMenuExit) {
@@ -4850,6 +4869,25 @@ float CollapseTargetOf(const AppState& s) {
             s.dragPhase == DockDragPhase::None)
                ? static_cast<float>(s.winH)
                : 0.f;
+}
+
+// 顶栏联动派生状态：1=置顶（顶栏与 Dock 一样不被应用窗口覆盖）/ 0=桌面层
+// （顶栏只在桌面显示、被应用窗口覆盖，与时钟/日历/启动台一致）。
+// 自动收起关闭时恒为 0 → 顶栏行为不变（默认桌面层）。
+int TopBarLinkStateOf(const AppState& s) {
+    return (s.autoCollapse && CollapseTargetOf(s) == 0.0f) ? 1 : 0;
+}
+
+// 把当前联动状态投递给顶栏：状态翻转才投递（去重，避免帧驱动/多路径重复
+// 发送消息风暴）；force 忽略去重，用于菜单切换、查询应答等必须即时生效的
+// 路径。顶栏未运行/尚未创建窗口时只更新缓存，顶栏启动后由其查询补齐。
+void SyncTopBarDockState(AppState& s, bool force = false) {
+    const int state = TopBarLinkStateOf(s);
+    if (!force && state == s.dockLinkStateSent) return;
+    s.dockLinkStateSent = state;
+    HWND bar = FindWindowW(L"DesktopTopBarWindow", nullptr);
+    if (!bar || !IsWindow(bar)) return;
+    PostMessageW(bar, kMsgTopBarDockState, static_cast<WPARAM>(state), 0);
 }
 
 // 自适应定时器节奏：动画/启动弹跳/悬停期间 15ms；空闲彻底停帧（零唤醒）。
@@ -4918,6 +4956,12 @@ void FrameTick(AppState& s) {
     }
     const bool collapseAnimating =
         s.collapseOffset != 0.f && s.collapseOffset != static_cast<float>(s.winH);
+
+    // 顶栏联动：展开/收起意图翻转即同步给顶栏（去重投递，顶栏据此在
+    // 置顶/桌面层之间切换）。所有能翻转状态的路径（钩子进出场、拖拽收尾、
+    // 菜单切换、帧内自愈）都会踢帧，因此在帧上做一次集中同步即可覆盖，
+    // 无需逐事件发送。
+    SyncTopBarDockState(s);
 
     const bool animating = UpdateLayoutOneFrame(s);
     const uint64_t sig = MakeSignature(s);
@@ -5233,6 +5277,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        // 顶栏启动/重置时查询联动状态：以返回值应答当前展开态（顶栏先行
+        // 计算初始层级/风格），同时按需补投递一次状态消息对齐去重缓存。
+        case kMsgTopBarDockQuery: {
+            SyncTopBarDockState(*s, true);
+            return TopBarLinkStateOf(*s);
+        }
+
         // 固定区拖拽重排（低层钩子按钮态采集 → UI 线程执行）：
         //   Move：推进拖拽（阈值判定/重排/幽灵由帧布局自愈）
         //   Up：收尾 —— 拖拽则重排持久化，未拖拽则执行点击
@@ -5383,6 +5434,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             UninstallDockWinEventHook();
             UninstallShowDesktopHook();
             ShowTaskbar();  // 恢复 Windows 任务栏
+            // 顶栏联动收尾：Dock 退出后顶栏不再受联动约束，恢复默认桌面层
+            // （否则 Dock 展开态退出会留下一个悬浮置顶的顶栏）
+            {
+                HWND bar = FindWindowW(L"DesktopTopBarWindow", nullptr);
+                if (bar && IsWindow(bar)) {
+                    PostMessageW(bar, kMsgTopBarDockState, 0, 0);
+                }
+            }
             PostQuitMessage(0);
             return 0;
 
