@@ -3880,11 +3880,73 @@ bool ClickTrayInVisible(IUIAutomation* uia, const std::wstring& nameHint,
     return false;
 }
 
+// 溢出窗（「隐藏的图标」弹窗）不存在时把它创建出来。
+//
+// 这是「点 Dock 图标打不开托盘驻留应用」的真正原因所在：
+// 第三方托盘图标（Clash Verge 等）默认全部落在溢出区，而溢出窗
+// TopLevelWindowForOverflowXamlIsland 是 shell **惰性创建**的 —— 本会话只要
+// 还没展开过一次隐藏图标，这个窗口就不存在。此时 ClickTrayInOverflow 一进门
+// 就因为 FindWindowW 为空而整段跳过，可见区又只放系统自身的网络/音量/时钟，
+// 于是「可见 → 溢出 → 直接 UIA」三条路全空，日志只剩：
+//     托盘图标触发失败：<应用>
+//     托盘触发失败：<应用> 不再外部显示窗口（避免影子窗口）
+// TrayList 里有对应的 OpenOverflowWindow()，但只声明没接线；Dock 移植时
+// 连这一步也没有，所以只能靠用户自己先点一次任务栏的 ^ 才“偶然”能用。
+//
+// 实测结论（本机 Win11 24H2，决定了下面用 UIA Invoke 而不是坐标点击）：
+//   · Shell_TrayWnd 自身被 SW_HIDE 时它的 UIA 子树为空，但它下面的
+//     DesktopWindowContentBridge 子树照常有内容（任务栏 14 个元素、
+//     展开按钮 '显示隐藏的图标' 在里面）→ 创建溢出窗**全程不需要显示任务栏**；
+//   · 溢出窗自身隐藏时其 bridge 子树也照常有内容（7 个图标按钮），
+//     但所有图标的 bounds 都是 0×0 → 只能靠 UIA Invoke，坐标点击无从下手。
+bool EnsureOverflowIslandWindow(IUIAutomation* uia) {
+    if (FindWindowW(kOverflowXamlIslandCls, nullptr)) return true;  // 已存在
+    if (!uia) return false;
+    HWND hTray = FindWindowW(kShellTrayWndCls, nullptr);
+    if (!hTray) return false;
+    HWND hBridge = FindWindowExW(hTray, nullptr, kDesktopContentBridgeCls,
+                                 nullptr);
+
+    std::vector<HWND> roots;
+    if (hBridge) roots.push_back(hBridge);  // 任务栏隐藏时只有这棵树有内容
+    roots.push_back(hTray);
+    for (HWND hRoot : roots) {
+        ComPtr<IUIAutomationElement> root;
+        IUIAutomationElement* rawRoot = nullptr;
+        if (FAILED(uia->ElementFromHandle(hRoot, &rawRoot)) || !rawRoot) {
+            continue;
+        }
+        root.Attach(rawRoot);
+        for (auto& el : UiaFindAll(uia, root, TreeScope_Descendants)) {
+            // 必须限定 Button：同名「显示隐藏的图标」还有一个 ToolTip 元素，
+            // 它的矩形是按钮上方的气泡，对它 Invoke 什么都不会发生。
+            if (UiaElementControlType(el) != UIA_ButtonControlTypeId) continue;
+            const std::wstring name = UiaElementName(el);
+            if (name.empty()) continue;
+            if (name.find(L"隐藏的图标") == std::wstring::npos &&
+                !ContainsCaseInsensitive(name, L"hidden icon")) {
+                continue;
+            }
+            if (!InvokeTrayElement(el)) continue;
+            for (int i = 0; i < 30; ++i) {  // ≤1.5s：XAML island 首次装配较慢
+                Sleep(50);
+                if (FindWindowW(kOverflowXamlIslandCls, nullptr)) {
+                    Logf(L"托盘触发：溢出窗不存在，已点开「显示隐藏的图标」创建它");
+                    return true;
+                }
+            }
+        }
+    }
+    Logf(L"托盘触发：溢出窗不存在，且点不开「显示隐藏的图标」（任务栏不可用？）");
+    return false;
+}
+
 // 溢出区（隐藏托盘）：先尝试直接枚举，失败则临时显示溢出窗口后按名称点击。
 bool ClickTrayInOverflow(IUIAutomation* uia, const std::wstring& nameHint,
                          const std::wstring& appKey,
                          const std::vector<DWORD>& pids) {
     if (!uia) return false;
+    EnsureOverflowIslandWindow(uia);  // shell 没建过就先建出来（否则下面整段跳过）
     HWND hOuter = FindWindowW(kOverflowXamlIslandCls, nullptr);
     if (hOuter) {
         HWND hInner = FindWindowExW(hOuter, nullptr,
