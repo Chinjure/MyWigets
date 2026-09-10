@@ -3147,6 +3147,49 @@ bool IsMainShapeWindow(HWND hwnd) {
     return w > 0 && h > 0 && w * h >= kMainWindowMinArea;
 }
 
+// 点击 Dock 图标时把某应用的“整组主窗口”带到最前（target 为焦点窗口）。
+//
+// 为什么必须整组处理：SetForegroundWindow 只把 target 自己（连同属主链上的
+// 阴影/水印窗）提到最前，同进程的其它顶级窗口 Z 序原地不动。钉钉这类
+// “主窗 + 图片/文档查看窗”的应用于是出现：点击 Dock 图标后一个窗口升到
+// Edge 之上，另一个仍留在 Edge 之下。用户语义（与 macOS Dock 一致）是
+// 点击图标 = 该应用的全部窗口一起上前。
+//
+// 两处顺序都不能颠倒（实测结论，见 probe_insert_below.ps1）：
+//   1) 必须先激活 target 再动其它窗口。窗口管理器只允许把窗口抬到
+//      “当前前台窗口”之上：Edge 在前台时，Dock 作为后台进程怎么
+//      SetWindowPos(HWND_TOP) 都只能排到 Edge 之下（对 target 也无效，
+//      这正是旧实现“另一个窗口留在 Edge 下”的直接原因）；而先把 target
+//      激活成前台，它的同进程窗口才允许继续往上排。
+//   2) 其它窗口必须“插到 target 正下方”而不是 HWND_TOP：实测 HWND_TOP 会
+//      把它们顶到前台窗口（target）之上，导致 target 失去最上层视觉位置；
+//      以 target 作 hwndInsertAfter 则整组窗口连成一片：target 在最上，
+//      其余主窗紧随其下，全部压在原前台应用（Edge 等）之上。
+// 逆序插入（windows 按 Z 序上→下收集）以保留应用内部原有的前后次序。
+//
+// SWP_ASYNCWINDOWPOS：把重排请求投递给目标线程而不是同步等待
+// WM_WINDOWPOSCHANGING 处理完 —— 目标应用忙/未响应时不会卡住 Dock 的
+// UI 线程（低层鼠标钩子就跑在这个线程上）。SWP_NOACTIVATE 不夺焦点。
+void BringAppWindowGroupToFront(const std::vector<HWND>& windows, HWND target) {
+    if (!target || !IsWindow(target)) return;
+
+    // 第一步：激活 target（内部已含 ALT 注入，能拿到设置前台的权限）
+    ForceForegroundWindow(target);
+
+    // 第二步：其余主窗逐个插到 target 正下方
+    const UINT flags =
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
+    for (auto it = windows.rbegin(); it != windows.rend(); ++it) {
+        HWND w = *it;
+        if (!w || w == target) continue;
+        if (!IsWindow(w) || !IsWindowVisible(w) || IsIconic(w) ||
+            IsCloaked(w)) {
+            continue;  // 隐藏/最小化/在别的虚拟桌面：抬起无意义
+        }
+        SetWindowPos(w, target, 0, 0, 0, 0, flags);
+    }
+}
+
 void LaunchItem(AppState& s, size_t idx) {
     if (idx >= s.items.size()) return;
     DockItem& item = s.items[idx];
@@ -4278,8 +4321,9 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
         }
     }
 
-    // 选一个主窗口抢前台（不抢的话用户可能以为没反应）；
-    // 其余窗口已经在 Z 序顶部，用户可见。
+    // 选一个主窗口做焦点窗口（不抢的话用户可能以为没反应），并把该应用
+    // 的全部主窗口整组带到最前：只调 ForceForegroundWindow 是不够的，
+    // 它只抬 target 自己，钉钉的另一个主窗仍会留在 Edge 之下。
     HWND target = PickMainWindow(mains);
     if (!target) {
         for (HWND w : mains) {
@@ -4291,7 +4335,7 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
     }
     if (!target && !mains.empty()) target = mains.front();
     if (target) {
-        ForceForegroundWindow(target);
+        BringAppWindowGroupToFront(mains, target);
         NotifyTopBarFocus(target);
         Logf(L"打开全部窗口：%ls（共 %zu 个，恢复 %d 个）",
              item.displayName.c_str(), mains.size(), restored);
@@ -4357,6 +4401,10 @@ void ToggleFocusOrLaunch(AppState& s, size_t idx) {
             }
         }
 
+        // 把该应用的全部主窗口整组带到最前（内部先激活 target，再把其余
+        // 主窗插到 target 下方）。只 SetForegroundWindow 的话同进程的其它
+        // 主窗 Z 序不动 —— 钉钉会出现“一个窗口在 Edge 之上、另一个还在
+        // Edge 之下”。
         HWND target = PickMainWindow(mains);
         if (!target) {
             for (HWND w : mains) {
@@ -4368,7 +4416,7 @@ void ToggleFocusOrLaunch(AppState& s, size_t idx) {
         }
         if (!target && !mains.empty()) target = mains.front();
         if (target) {
-            ForceForegroundWindow(target);
+            BringAppWindowGroupToFront(mains, target);
             NotifyTopBarFocus(target);
         }
         Logf(L"打开全部窗口：%ls（共 %zu 个，恢复 %d 个）",
