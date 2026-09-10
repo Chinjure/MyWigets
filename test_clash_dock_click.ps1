@@ -178,9 +178,11 @@ Write-Host ("[3] Dock 静止 rect=({0},{1})-({2},{3}) w={4}（日志 winW={5}）
     $rr.L, $rr.T, $rr.R, $rr.B, ($rr.R - $rr.L), $winW)
 Write-Host ("    点击坐标 = ({0},{1})" -f $clickX, $clickY)
 
-# 先把光标移到 Dock 底边触发展开，再点图标。
-# 注意：Dock 有展开动画，动画期间图标位置还在变 —— 必须等 Dock 窗口尺寸
-# 稳定下来再点，否则点击会落在图标之间的空隙上（实测过这种假失败）。
+# 先把光标移到底部触发条让 Dock 展开，等它真的展开（窗口顶边回到屏内）再点图标。
+# 两条实测坑：
+#   1) Dock 自动收起时窗口整体被推到屏幕下方（top ≈ 屏高），此时在屏内坐标点击
+#      必然打空 —— 必须等到窗口顶边回到屏内；
+#   2) 展开有动画，动画期间图标位置还在变 —— 等窗口位置稳定后再点。
 $rectCode2 = @'
 using System; using System.Runtime.InteropServices;
 public class RH2 {
@@ -189,6 +191,22 @@ public class RH2 {
 }
 '@
 Add-Type -TypeDefinition $rectCode2
+$screenH = [ClashTest]::GetSystemMetrics(1)
+$r0 = New-Object RH2+RECT
+[void][RH2]::GetWindowRect($dock, [ref]$r0)
+$dockCenterX = [int](($r0.L + $r0.R) / 2)
+[ClashTest]::SetCursorPos($dockCenterX, $screenH - 3) | Out-Null   # 贴屏幕底边的触发条
+$expanded = $false
+$waitExpand = [Diagnostics.Stopwatch]::StartNew()
+while ($waitExpand.ElapsedMilliseconds -lt 3000) {
+    Start-Sleep -Milliseconds 80
+    $r1 = New-Object RH2+RECT
+    [void][RH2]::GetWindowRect($dock, [ref]$r1)
+    if ($r1.T -lt ($screenH - 50)) { $expanded = $true; break }
+}
+Write-Host ("    Dock 已展开={0}（{1}ms）" -f $expanded, $waitExpand.ElapsedMilliseconds)
+if (-not $expanded) { Write-Warning 'Dock 3s 内未展开，本次点击很可能落空' }
+
 [ClashTest]::SetCursorPos($clickX, $clickY) | Out-Null
 Start-Sleep -Milliseconds $HoverSettleMs
 $stable = 0; $last = ''
@@ -200,7 +218,7 @@ while ($settle.ElapsedMilliseconds -lt 2500 -and $stable -lt 3) {
     $sig = "$($r2.L),$($r2.T),$($r2.R),$($r2.B)"
     if ($sig -eq $last) { $stable++ } else { $stable = 0; $last = $sig }
 }
-Write-Host ("    Dock 展开稳定于 rect=$last（等待 {0}ms）" -f $settle.ElapsedMilliseconds)
+Write-Host ("    Dock 稳定于 rect=$last（等待 {0}ms）" -f $settle.ElapsedMilliseconds)
 [ClashTest]::Click($clickX, $clickY)
 
 # ---- 4) 断言：主窗口变可见 ----
