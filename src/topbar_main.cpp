@@ -2,8 +2,11 @@
 //
 // 功能：
 //   1. 固定在桌面顶部的一条半透明顶栏，外观与其他组件一致（GDI+ 逐像素透明）
-//   2. 通过 Progman 属主 + HWND_BOTTOM 挂在桌面层，与其它三个组件一样
-//      只展现在桌面上：不覆盖任何普通窗口，也不出现在任务栏/Alt-Tab 中
+//   2. 层级：默认只不遮挡"当前聚焦窗口"（顶栏自己的聚焦目标，见 UpdateTarget）——
+//      目标窗口与顶栏矩形重叠时让位到它之下（被它盖住，仍高于其它非聚焦窗口）；
+//      不重叠（含无目标/目标最小化/目标在别的虚拟桌面）时置顶，
+//      覆盖除目标外的所有窗口。不再挂 Progman 属主贴桌面层：
+//      顶栏是独立顶层窗口，WS_EX_TOOLWINDOW 保证不进任务栏/Alt-Tab
 //   3. 从音量键右侧到右侧三键之间显示 Chrome 风格标签：
 //      - 普通应用：标签为聚焦窗口所属应用打开的全部窗口，名字为对应窗口名
 //      - Chrome/Edge（安装了 chrome-tab-sync 扩展并连接后）：标签为浏览器内
@@ -17,9 +20,9 @@
 //      点击打开/收起系统"日期和时间"日历浮出窗口
 //   6. 高度等于 Chrome 浏览器标签栏的高度（约 40px，随 DPI 缩放）
 //   7. 与 Dock 自动收起联动：Dock 开启自动收起时，顶栏层级跟随 Dock ——
-//      Dock 展开：顶栏与 Dock 一样提升为置顶层，不被任何应用窗口覆盖；
-//      Dock 收起：恢复默认桌面层（只在桌面显示、被应用窗口覆盖，
-//      与时钟/日历/启动台一致）。Dock 未开启自动收起时顶栏行为不变。
+//      Dock 展开：顶栏与 Dock 一样提升为置顶层，覆盖所有窗口
+//      （含当前聚焦窗口，此时不让位）；
+//      Dock 收起：回到默认策略（只不遮挡当前聚焦窗口）。
 
 #ifndef UNICODE
 #define UNICODE
@@ -41,6 +44,7 @@
 #include <shellapi.h>
 #include <objidl.h>  // GDI+ 需要 IStream 等 COM 类型，先于 gdiplus.h 包含
 #include <gdiplus.h>
+#include <dwmapi.h>  // DWMWA_CLOAKED：判断目标窗口是否被系统隐藏（虚拟桌面/最小化 UWP）
 
 // Core Audio：按进程设置应用音量（类似 Windows 音量合成器）
 #include <mmdeviceapi.h>
@@ -76,6 +80,7 @@
 #pragma comment(lib, "Mmdevapi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "dwmapi.lib")  // 目标窗口 cloaked（被系统隐藏）判定
 
 using namespace Gdiplus;
 using Microsoft::WRL::ComPtr;
@@ -157,13 +162,14 @@ constexpr UINT kDockFocusMsg = WM_APP + 12;
 // 与 dock_main.cpp 的 kMsgTopBarVolumePanel 同值。
 constexpr UINT kDockVolumePanelMsg = WM_APP + 13;
 // Dock 顶栏联动：Dock 开启自动收起时，顶栏层级跟随 Dock 展开/收起 ——
-// Dock 展开时顶栏与 Dock 一样提升为置顶层（不被任何应用窗口覆盖），
-// Dock 收起时恢复默认桌面层（只在桌面显示、被应用窗口覆盖，与
-// 时钟/日历/启动台一致）。自动收起关闭 / Dock 退出时收到 0 = 恢复常层。
-// wParam = 1 置顶显示 / 0 桌面层。与 dock_main.cpp 同值。
+// Dock 展开时顶栏与 Dock 一样提升为置顶层并覆盖所有窗口（含当前
+// 聚焦窗口，此时不让位）；Dock 收起时回到默认策略（只不遮挡当前
+// 聚焦窗口）。自动收起关闭 / Dock 退出时收到 0 = 回到默认策略。
+// wParam = 1 覆盖所有窗口 / 0 默认策略。与 dock_main.cpp 同值。
 constexpr UINT kDockStateMsg = WM_APP + 14;
 // 顶栏启动查询：向 Dock 询问当前联动展开态（SendMessageTimeout 的返回值 =
-// 1 置顶 / 0 桌面层；Dock 未运行/超时则按桌面层处理）。与 dock_main.cpp 同值。
+// 1 覆盖所有窗口 / 0 默认策略；Dock 未运行/超时则按默认策略处理）。
+// 与 dock_main.cpp 同值。
 constexpr UINT kDockStateQueryMsg = WM_APP + 15;
 
 constexpr int kMenuExit = 1001;
@@ -232,9 +238,19 @@ struct AppState {
     int hoverTab = -1;                   // 当前悬停的 Chrome 标签索引
     bool trackingMouse = false;
     // Dock 顶栏联动：Dock 是否处于展开态（true = 与 Dock 一致提升置顶层，
-    // 不被应用窗口覆盖；false = 恢复默认桌面层，只在桌面显示、被应用窗口
-    // 覆盖）。Dock 未运行/自动收起关闭时恒为 false（行为不变）。
+    // 覆盖所有窗口，含当前聚焦窗口，此时不做让位）。
+    // Dock 未运行/自动收起关闭时恒为 false（走默认策略）。
     bool dockLinkExpanded = false;
+    // 默认层级策略（Dock 未联动展开时）：只不遮挡当前聚焦窗口 ——
+    //   barYielding = true  让位态：目标窗口与顶栏矩形重叠，顶栏摘掉置顶位
+    //       并紧贴 barAnchorHwnd 之下（被它盖住），仍高于其它非聚焦窗口；
+    //   barYielding = false 覆盖态：置顶层，覆盖除目标外的所有窗口。
+    // 让位判定只看顶栏自己的聚焦目标（targetHwnd），与按钮/标签同源。
+    bool barYielding = false;
+    HWND barAnchorHwnd = nullptr;   // 让位态锚点：顶栏紧贴其下（= 目标窗口）
+    // 已应用的层级（-1 未应用 / 0 覆盖态 / 1 让位态）：启动时强制对齐一次，
+    // 之后状态未变就不做任何 Z 序操作（LOCATIONCHANGE 事件高频触发）
+    int barLayerApplied = -1;
 
     // Win11 风格任务栏时钟（显示在最小化键左侧：时间在上、日期在下两行）
     std::wstring clockTimeText;          // 当前时间文本（如 "21:45"）
@@ -586,7 +602,11 @@ void VolumePanelInner(AppState& s, RectF& panel, RectF& mute, RectF& track);
 void ApplyVolume(AppState& s, float value);
 void ToggleMute(AppState& s);
 void DrawBarAndPresent(AppState& s);        // 前置声明（定义在下方）
-void ReassertDesktopLayer(HWND hwnd);       // 前置声明（定义在下方）
+// 顶栏层级：默认只不遮挡当前聚焦窗口（见文件头说明），定义在下方
+bool TargetOverlapsBar(AppState& s);
+void ApplyBarLayer(AppState& s, bool force);
+void HealBarLayer(AppState& s);
+void RetargetLocationHook(HWND target);
 void SetVolumeOpen(AppState& s, bool open);
 
 // 独立音量面板窗口相关前置声明
@@ -615,6 +635,11 @@ void ApplyTargetInfo(AppState& s, HWND hwnd) {
 
     // 刷新 Chrome 风格标签：显示该应用打开的全部窗口
     RefreshTabs(s);
+
+    // 跟着目标走：移动/缩放事件只订阅目标进程（拖动时每秒上百条，
+    // 全系统订阅会把噪音灌进本线程消息队列），并立即重估让位层级
+    RetargetLocationHook(hwnd);
+    ApplyBarLayer(s, false);
 }
 
 // 轮询前台窗口，更新目标与 Chrome 标签。轮询而不是事件绑定，
@@ -690,6 +715,9 @@ void UpdateTarget(AppState& s) {
             s.volumeTargetHwnd = nullptr;
             ResolveVolumeSession(s);
         }
+        // 没有聚焦目标 = 无需让位：退回覆盖态（置顶），并退订移动事件
+        RetargetLocationHook(nullptr);
+        ApplyBarLayer(s, false);
     }
 }
 
@@ -1876,6 +1904,11 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 // 均由系统事件驱动，不再用常驻定时器轮询。
 HWINEVENTHOOK g_winEventHook[5] = {nullptr, nullptr, nullptr,
                                    nullptr, nullptr};
+// 目标窗口移动/缩放（EVENT_OBJECT_LOCATIONCHANGE）钩子：按目标进程订阅，
+// 只用来驱动让位判定的即时重估（拖动/贴边/最大化动画跟手），
+// 目标变化时用 RetargetLocationHook 重新订阅（pid=0 表示已退订）
+HWINEVENTHOOK g_locationHook = nullptr;
+DWORD g_locationHookPid = 0;
 
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
                            LONG idObject, LONG idChild, DWORD, DWORD) {
@@ -1913,7 +1946,19 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
     case EVENT_SYSTEM_RESTORE:
         if (top == s->targetHwnd || top == GetForegroundWindow()) {
             UpdateTarget(*s);
+            // 最小化/最大化/还原都会改变目标窗口矩形：重估让位层级
+            // （最小化不再占屏面 → 退回覆盖态；最大化通常压住顶栏 → 让位）
+            ApplyBarLayer(*s, false);
             DrawBarAndPresent(*s);
+        }
+        break;
+    case EVENT_OBJECT_LOCATIONCHANGE:
+        // 目标窗口移动/缩放：让位判定只取决于目标窗口矩形与顶栏是否相交，
+        // 所以这里幂等重估（状态未变不做任何 Z 序操作）。
+        // 钩子已按目标进程订阅（见 RetargetLocationHook），噪音有限
+        if (s->hasTarget && s->targetHwnd && IsWindow(s->targetHwnd) &&
+            GetAncestor(hwnd, GA_ROOT) == s->targetHwnd) {
+            ApplyBarLayer(*s, false);
         }
         break;
     case EVENT_OBJECT_CREATE:
@@ -1945,6 +1990,29 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
         break;
     default:
         break;
+    }
+}
+
+// 目标窗口移动/缩放订阅：EVENT_OBJECT_LOCATIONCHANGE 是全系统高频事件，
+// 直接全量订阅会把每个窗口的每次移动都灌进本线程消息队列；它只用于
+// 让位判定的即时重估，因此按目标进程订阅，目标一变就换订阅。
+void RetargetLocationHook(HWND target) {
+    DWORD pid = 0;
+    if (target && IsWindow(target)) {
+        GetWindowThreadProcessId(target, &pid);
+    }
+    if (pid == g_locationHookPid && (pid == 0) == (g_locationHook == nullptr)) {
+        return;  // 订阅未变
+    }
+    if (g_locationHook) {
+        UnhookWinEvent(g_locationHook);
+        g_locationHook = nullptr;
+    }
+    g_locationHookPid = pid;
+    if (pid) {
+        g_locationHook = SetWinEventHook(
+            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
+            nullptr, WinEventProc, pid, 0, WINEVENT_OUTOFCONTEXT);
     }
 }
 
@@ -1997,6 +2065,11 @@ void UninstallVolumeHook() {
             h = nullptr;
         }
     }
+    if (g_locationHook) {
+        UnhookWinEvent(g_locationHook);
+        g_locationHook = nullptr;
+    }
+    g_locationHookPid = 0;
     g_volumeHookHwnd = nullptr;
     g_lastClickWindow = nullptr;
     g_altTabPressed = false;
@@ -2817,22 +2890,6 @@ void DrawBarAndPresent(AppState& s) {
     PresentBar(s);
 }
 
-// 顶栏固定：挂到 Progman 并置于桌面层底部，
-// 与其它组件一样不覆盖任何普通窗口。固定位置由调用方给出.
-bool AttachToDesktop(HWND hwnd, int screenX, int screenY,
-                     int width, int height) {
-    HWND hProgman = FindWindowW(L"Progman", nullptr);
-    if (!hProgman) {
-        return false;
-    }
-
-    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT,
-                      reinterpret_cast<LONG_PTR>(hProgman));
-    SetWindowPos(hwnd, HWND_BOTTOM, screenX, screenY, width, height,
-                 SWP_NOACTIVATE);
-    return true;
-}
-
 void ShowExitMenu(HWND hwnd) {
     POINT pt{};
     GetCursorPos(&pt);
@@ -2853,52 +2910,103 @@ void ShowExitMenu(HWND hwnd) {
     }
 }
 
-// 在 Win+D / 显示桌面之后，把顶栏重新贴回桌面层底部（防御性，怕被抬升）
-void ReassertDesktopLayer(HWND hwnd) {
-    HWND hProgman = FindWindowW(L"Progman", nullptr);
-    if (hProgman) {
-        SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+// 窗口是否被系统 cloaked（隐藏）：最小化到后台的 UWP 应用、以及位于
+// 其它虚拟桌面上的窗口都会保留原矩形但实际不可见。这类窗口不该被当成
+// "占着屏幕"而让顶栏让位（否则切到别的虚拟桌面后顶栏会莫名消失）。
+bool IsCloaked(HWND hwnd) {
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked,
+                                        sizeof(cloaked)))) {
+        return cloaked != 0;
     }
+    return false;
 }
 
-// Dock 顶栏联动层级切换（幂等，按 s.dockLinkExpanded 对齐窗口层级与风格）：
-//   dockLinkExpanded = true  → 与 Dock 一致：WS_EX_TOPMOST + HWND_TOPMOST，
-//      不被任何应用窗口覆盖（顶栏全程保持显示，只是提升层级）；
-//   dockLinkExpanded = false → 默认桌面层：去掉置顶风格并贴回 HWND_BOTTOM，
-//      只在桌面显示、被应用窗口覆盖（与时钟/日历/启动台一致）。
-// 只切层级不动位置/可见性；Z 序由 WM_WINDOWPOSCHANGING 的防御逻辑兜底。
-void ApplyDockLinkLayer(AppState& s) {
+// 顶栏当前聚焦目标是否正与顶栏矩形重叠（= 需要让位）。
+// 目标与顶栏同源：就是标签/最小化按钮操作的那个窗口（targetHwnd），
+// 含"目标最小化后粘住"的语义。
+// 不占屏面的目标（最小化 / 隐藏 / cloaked / 已销毁）一律视为不重叠：
+// 它们没有可见矩形，顶栏不必为它们让位。
+bool TargetOverlapsBar(AppState& s) {
+    if (!s.hasTarget || !s.targetHwnd || !IsWindow(s.targetHwnd) ||
+        s.targetHwnd == s.hwnd) {
+        return false;
+    }
+    if (IsIconic(s.targetHwnd) || !IsWindowVisible(s.targetHwnd) ||
+        IsCloaked(s.targetHwnd)) {
+        return false;
+    }
+    RECT bar{};
+    RECT target{};
+    if (!GetWindowRect(s.hwnd, &bar) || !GetWindowRect(s.targetHwnd, &target)) {
+        return false;
+    }
+    RECT inter{};
+    return IntersectRect(&inter, &bar, &target) != FALSE;
+}
+
+// 顶栏层级对齐（幂等；只切层级与风格，不动位置/尺寸/可见性）：
+//   1. Dock 联动展开（dockLinkExpanded）：置顶层，覆盖所有窗口 ——
+//      包含当前聚焦窗口，此时不让位（Dock 展开是用户显式召唤）；
+//   2. 默认 + 目标窗口与顶栏重叠：让位态 —— 摘掉置顶位，紧贴目标窗口
+//      之下（被它盖住，不遮挡当前聚焦窗口），但仍高于其它非聚焦窗口
+//      （只重叠一部分时，其余部分照常可见可点）；
+//   3. 默认 + 不重叠（含无目标 / 目标最小化 / 目标在别的虚拟桌面）：
+//      置顶层，覆盖除目标外的所有窗口。
+// force=true 强制重设一次（启动、DPI 变化后确认风格位与 Z 序真的生效）；
+// 状态未变且非 force 时直接返回 —— LOCATIONCHANGE 事件高频触发，不能每次都动窗口。
+void ApplyBarLayer(AppState& s, bool force) {
+    const bool yield = !s.dockLinkExpanded && TargetOverlapsBar(s);
+    const HWND anchor = yield ? s.targetHwnd : nullptr;
+    const int applied = yield ? 1 : 0;
+
+    if (!force && applied == s.barLayerApplied &&
+        (!yield || anchor == s.barAnchorHwnd)) {
+        return;
+    }
+    s.barLayerApplied = applied;
+    s.barYielding = yield;
+    s.barAnchorHwnd = anchor;
+
+    // 属主窗口无法独立置顶：带 Progman 属主时系统会把 HWND_TOPMOST 请求
+    // 撤销并清掉 WS_EX_TOPMOST（实测）。顶栏现在全程是独立顶层窗口，
+    // 因此统一脱离属主（WS_EX_TOOLWINDOW 依旧保证不进任务栏/Alt-Tab）。
+    if (GetWindow(s.hwnd, GW_OWNER) != nullptr) {
+        SetWindowLongPtrW(s.hwnd, GWLP_HWNDPARENT, 0);
+    }
+
     const LONG_PTR style = GetWindowLongPtrW(s.hwnd, GWL_EXSTYLE);
-    const bool isTopmost = (style & WS_EX_TOPMOST) != 0;
-    const bool hasOwner = GetWindow(s.hwnd, GW_OWNER) != nullptr;
-    if (s.dockLinkExpanded) {
-        // 置顶模式：先脱离 Progman 属主 —— 属主窗口无法独立置顶，系统会把
-        // HWND_TOPMOST 请求撤销并清掉 WS_EX_TOPMOST（实测：带 Progman 属主时
-        // SetWindowPos 后风格位被系统回退）。脱离后即与 Dock 一样是无属主
-        // 顶层窗口，置顶稳定。
-        if (hasOwner) {
-            SetWindowLongPtrW(s.hwnd, GWLP_HWNDPARENT, 0);
+    if (yield) {
+        if ((style & WS_EX_TOPMOST) != 0) {
+            // 先摘置顶位再定位：置顶窗口永远压在所有普通窗口之上，
+            // 不摘掉就无法落到目标窗口下面
+            SetWindowLongPtrW(s.hwnd, GWL_EXSTYLE, style & ~WS_EX_TOPMOST);
         }
-        if (!isTopmost) {
+        // SetWindowPos 的 hwndInsertAfter = "排在本窗口之前的窗口"，
+        // 传目标窗口即表示顶栏紧贴它下面一位（不遮挡它）
+        SetWindowPos(s.hwnd, anchor, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    } else {
+        if ((style & WS_EX_TOPMOST) == 0) {
             SetWindowLongPtrW(s.hwnd, GWL_EXSTYLE, style | WS_EX_TOPMOST);
         }
         SetWindowPos(s.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    } else {
-        // 桌面层：清置顶位并重新挂回 Progman 属主（与时钟/日历/启动台一致），
-        // 贴回 HWND_BOTTOM。
-        if (!hasOwner) {
-            HWND hProgman = FindWindowW(L"Progman", nullptr);
-            if (hProgman) {
-                SetWindowLongPtrW(s.hwnd, GWLP_HWNDPARENT,
-                                  reinterpret_cast<LONG_PTR>(hProgman));
-            }
-        }
-        if (isTopmost) {
-            SetWindowLongPtrW(s.hwnd, GWL_EXSTYLE, style & ~WS_EX_TOPMOST);
-        }
-        SetWindowPos(s.hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+    }
+}
+
+// 低频自愈（时钟定时器每秒调用一次）：
+//   让位态下若顶栏上方不再是锚点窗口（被别的窗口插了队，或系统重排了 Z 序），
+//   重新贴回锚点之下；层级状态与目标窗口几何不一致时重新评估。
+// 事件驱动正常时这里是空转（全部幂等判定，不动窗口）。
+void HealBarLayer(AppState& s) {
+    ApplyBarLayer(s, false);
+    // 锚点自身是置顶窗口时不折腾：置顶窗口恒定压在非置顶窗口之上，
+    // 顶栏（非置顶）本来就在它下面，反复 SetWindowPos 也贴不到它下面
+    if (s.barYielding && s.barAnchorHwnd && IsWindow(s.barAnchorHwnd) &&
+        (GetWindowLongPtrW(s.barAnchorHwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0 &&
+        GetWindow(s.hwnd, GW_HWNDPREV) != s.barAnchorHwnd) {
+        SetWindowPos(s.hwnd, s.barAnchorHwnd, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 }
@@ -2954,17 +3062,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_WINDOWPOSCHANGING: {
         // 防御：任何 Z 序变化都强制回到本模式应处的层级 ——
-        // 默认（桌面层）强制 HWND_BOTTOM 防止覆盖普通窗口；
-        // Dock 联动展开（置顶层）强制 HWND_TOPMOST 防止被应用窗口覆盖。
+        // 默认让位态（目标窗口压着顶栏）：强制紧贴目标窗口之下，
+        //   绝不覆盖当前聚焦窗口；
+        // 其余情况（Dock 联动展开 / 目标未与顶栏重叠）：强制置顶，
+        //   覆盖除当前聚焦窗口外的窗口。
         auto* wp = reinterpret_cast<WINDOWPOS*>(lParam);
         if ((wp->flags & SWP_NOZORDER) == 0) {
-            if (s && s->dockLinkExpanded) {
-                if (wp->hwndInsertAfter != HWND_TOPMOST) {
-                    wp->hwndInsertAfter = HWND_TOPMOST;
+            const bool yieldNow = s && !s->dockLinkExpanded && s->barYielding &&
+                                  s->barAnchorHwnd &&
+                                  IsWindow(s->barAnchorHwnd);
+            if (yieldNow) {
+                if (wp->hwndInsertAfter != s->barAnchorHwnd) {
+                    wp->hwndInsertAfter = s->barAnchorHwnd;
                     wp->flags |= SWP_NOACTIVATE;
                 }
-            } else if (wp->hwndInsertAfter != HWND_BOTTOM) {
-                wp->hwndInsertAfter = HWND_BOTTOM;
+            } else if (wp->hwndInsertAfter != HWND_TOPMOST) {
+                wp->hwndInsertAfter = HWND_TOPMOST;
                 wp->flags |= SWP_NOACTIVATE;
             }
         }
@@ -3310,9 +3423,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case kDockStateMsg: {
         // Dock 顶栏联动：自动收起开启期间，Dock 展开 → 顶栏与 Dock 一样
-        // 提升为置顶层（不被应用窗口覆盖）；Dock 收起 → 恢复默认桌面层
-        // （只在桌面显示、被应用窗口覆盖，与时钟/日历/启动台一致）。
-        // 自动收起关闭 / Dock 退出时收到 0 → 保持默认桌面层（行为不变）。
+        // 提升为置顶层并覆盖所有窗口（含当前聚焦窗口，不让位）；
+        // Dock 收起 → 回到默认策略：只不遮挡当前聚焦窗口。
+        // 自动收起关闭 / Dock 退出时收到 0 → 默认策略（行为不变）。
         if (!s) {
             return 0;
         }
@@ -3321,7 +3434,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         s->dockLinkExpanded = expanded;
-        ApplyDockLinkLayer(*s);
+        ApplyBarLayer(*s, true);  // 模式切换：强制对齐一次（含置顶位）
         return 0;
     }
 
@@ -3374,6 +3487,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
             }
         } else if (wParam == kClockTimerId) {
+            // 层级低频自愈：让位态下被别的窗口插队时贴回目标窗口之下；
+            // 事件驱动正常时全部幂等判定，不动窗口
+            HealBarLayer(*s);
             // 时钟：每秒检查一次，仅时间/日期文本变化时重绘
             if (UpdateClock(*s)) {
                 DrawBarAndPresent(*s);
@@ -3395,9 +3511,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int x = suggested ? suggested->left : 0;
         const int y = suggested ? suggested->top : 0;
 
-        ReassertDesktopLayer(hwnd);
-        SetWindowPos(hwnd, HWND_BOTTOM, x, y, w, h,
+        // 先按建议矩形落位，再强制对齐层级：置顶/让位风格位与 Z 序
+        // 在 DPI 迁移后必须重设一次（窗口可能被系统塞回默认层）
+        SetWindowPos(hwnd, HWND_TOP, x, y, w, h,
                      SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        ApplyBarLayer(*s, true);
         if (CreateBacking(*s, w, h)) {
             DrawBarAndPresent(*s);
         }
@@ -3505,14 +3623,6 @@ DWORD WINAPI TopbarThreadProc(LPVOID param) {
 
     g_topbarHwnd.store(hwnd);  // 先发布窗口句柄，宿主可立即隐藏/关闭
 
-    RECT initial{};
-    GetWindowRect(hwnd, &initial);
-    if (!AttachToDesktop(hwnd, initial.left, initial.top, width, height)) {
-        // 找不到桌面窗口时退化为普通底层窗口
-        SetWindowPos(hwnd, HWND_BOTTOM, initial.left, initial.top, width, height,
-                     SWP_NOACTIVATE);
-    }
-
     if (!CreateBacking(state, width, height)) {
         GdiplusShutdown(gdiplusToken);
         if (SUCCEEDED(comInit)) CoUninitialize();
@@ -3525,7 +3635,7 @@ DWORD WINAPI TopbarThreadProc(LPVOID param) {
     DrawBarAndPresent(state);
 
     // Dock 顶栏联动：启动即查询 Dock 当前展开态，联动展开时顶栏以置顶层
-    // 启动（与 Dock 一致，不被应用窗口覆盖）。Dock 未运行/未应答 → 默认桌面层。
+    // 启动并覆盖所有窗口。Dock 未运行/未应答 → 走默认策略。
     {
         HWND dock = FindWindowW(L"DesktopDockWindow", nullptr);
         if (dock && IsWindow(dock)) {
@@ -3536,8 +3646,10 @@ DWORD WINAPI TopbarThreadProc(LPVOID param) {
                 state.dockLinkExpanded = linkState != 0;
             }
         }
-        ApplyDockLinkLayer(state);  // 幂等：仅做层级/风格对齐（含置顶起步场景）
     }
+    // 启动强制对齐一次层级：默认策略下要么置顶（只不遮挡当前聚焦窗口），
+    // 要么（启动时前台窗口已压着顶栏）直接让位到它下面
+    ApplyBarLayer(state, true);
 
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 

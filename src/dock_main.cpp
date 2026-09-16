@@ -148,12 +148,12 @@ constexpr UINT kMsgTopBarFocus = WM_APP + 12;
 // → 顶栏:左上角触发角点击,请求展开/收起顶栏当前应用的音量面板
 constexpr UINT kMsgTopBarVolumePanel = WM_APP + 13;
 // → 顶栏:自动收起联动。自动收起开启期间,顶栏层级跟随 Dock 展开/收起
-// (Dock 展开=顶栏与 Dock 一样置顶、不被应用窗口覆盖,wParam=1;
-// Dock 收起=顶栏恢复桌面层、只在桌面显示,wParam=0)。自动收起关闭时
-// 状态恒为 0,顶栏行为不变(默认桌面层)。
+// (Dock 展开=顶栏与 Dock 一样置顶并覆盖所有窗口,含当前聚焦窗口,wParam=1;
+// Dock 收起=顶栏回到默认策略"只不遮挡当前聚焦窗口",wParam=0)。自动收起
+// 关闭时状态恒为 0,顶栏行为不变。
 constexpr UINT kMsgTopBarDockState = WM_APP + 14;
 // ← 顶栏:启动/重置时查询当前联动状态(通过 SendMessageTimeout 的返回值应答,
-// 返回值 = 1 置顶/0 桌面层;同时按需补投递一次 kMsgTopBarDockState)。
+// 返回值 = 1 覆盖所有窗口/0 默认策略;同时按需补投递一次 kMsgTopBarDockState)。
 constexpr UINT kMsgTopBarDockQuery = WM_APP + 15;
 
 // 固定区拖拽重排消息子类型（wParam）
@@ -1816,8 +1816,9 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
                 wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONDBLCLK;
             if (isDown && InTopLeftCornerZone(pt)) {
                 // 左上角触发角：展开/收起顶栏当前应用的音量面板。
-                // 顶栏窗口是桌面底层（普通窗口可覆盖其上），只有角部全局
-                // 钩子才能保证"窗口盖住顶栏也能触发"（与左下/右下角一致）。
+                // 顶栏让位时（当前聚焦窗口压着它）角区被应用窗口盖住，
+                // 只有角部全局钩子才能保证"窗口盖住顶栏也能触发"
+                // （与左下/右下角一致）。
                 // 仅当顶栏在运行时才吞掉点击（顶栏关闭时角区下方窗口可点，
                 // 避免吃掉一个无声无息的 12×48 区域）。
                 HWND bar = FindWindowW(L"DesktopTopBarWindow", nullptr);
@@ -4981,9 +4982,9 @@ float CollapseTargetOf(const AppState& s) {
                : 0.f;
 }
 
-// 顶栏联动派生状态：1=置顶（顶栏与 Dock 一样不被应用窗口覆盖）/ 0=桌面层
-// （顶栏只在桌面显示、被应用窗口覆盖，与时钟/日历/启动台一致）。
-// 自动收起关闭时恒为 0 → 顶栏行为不变（默认桌面层）。
+// 顶栏联动派生状态：1=顶栏置顶并覆盖所有窗口（与 Dock 一样，含当前聚焦窗口）
+// / 0=顶栏默认策略（只不遮挡当前聚焦窗口，让位其余情况照旧）。
+// 自动收起关闭时恒为 0 → 顶栏行为不变（默认策略）。
 int TopBarLinkStateOf(const AppState& s) {
     return (s.autoCollapse && CollapseTargetOf(s) == 0.0f) ? 1 : 0;
 }
@@ -5544,8 +5545,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             UninstallDockWinEventHook();
             UninstallShowDesktopHook();
             ShowTaskbar();  // 恢复 Windows 任务栏
-            // 顶栏联动收尾：Dock 退出后顶栏不再受联动约束，恢复默认桌面层
-            // （否则 Dock 展开态退出会留下一个悬浮置顶的顶栏）
+            // 顶栏联动收尾：Dock 退出后顶栏不再受联动约束，回到默认策略
+            // （否则 Dock 展开态退出会留下一个"覆盖所有窗口"的顶栏，
+            //  含压住当前聚焦窗口）
             {
                 HWND bar = FindWindowW(L"DesktopTopBarWindow", nullptr);
                 if (bar && IsWindow(bar)) {
