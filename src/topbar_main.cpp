@@ -12,6 +12,12 @@
 //      - Chrome/Edge（安装了 chrome-tab-sync 扩展并连接后）：标签为浏览器内
 //        当前聚焦窗口的真实标签页（标题同步、点击切换、中键关闭、
 //        右键新建标签页）。未连接扩展时回退为窗口枚举。
+//      - 收录与聚焦只认"任务栏中看得见的窗口"（判据见 IsTaskbarWindow）：
+//        隐藏窗、工具窗、属主浮层、其它虚拟桌面上的 cloaked 窗都不算。
+//        子进程的隐藏消息窗与托盘图标应用的驻留窗因此既不会成为标签，
+//        也不可能被聚焦（聚焦它们等于把幽灵窗口"打开"），更不会被顶栏
+//        收作"当前聚焦目标" —— 否则层级会跟着它重估，被最大化窗口遮住的
+//        顶栏会凭空弹出来（如 hotspot 的 WS_EX_TOOLWINDOW 启动器弹出窗）
 //   4. 顶栏右侧提供 Chrome 浏览器风格的 最小化 / 最大化 / 关闭 三个按钮，
 //      用于控制当前聚焦窗口；双击顶栏空白处最大化/还原当前聚焦窗口；
 //      按住顶栏空白处拖动可移动当前聚焦窗口（等同标题栏拖动）
@@ -536,6 +542,43 @@ HWND g_lastClickWindow = nullptr;
 bool g_altTabPressed = false;
 HHOOK g_keyHook = nullptr;
 
+bool IsCloaked(HWND hwnd);  // 前置声明（定义在让位判定节）
+
+// 窗口是否"在任务栏中看得见"（= 系统任务栏会给它一个按钮）。
+//
+// 这是顶栏标签收录与聚焦动作的统一准入判据，判据与 Windows 任务栏一致：
+//   1. 可见：隐藏窗口没有任务栏按钮（最小化窗口 IsWindowVisible 仍为真，
+//      仍算任务栏可见，因此最小化的窗口照常可被顶栏聚焦/还原）；
+//   2. 顶层且无属主：属主的对话框/浮层不单独占任务栏按钮。
+//      例外：WS_EX_APPWINDOW 是应用显式要求"进任务栏"的风格，带属主也算；
+//   3. 非 WS_EX_TOOLWINDOW：工具窗（托盘图标应用的辅助窗、子进程的消息窗、
+//      应用的浮动调色板）永远不进任务栏；
+//   4. 非 DWM cloaked：位于其它虚拟桌面、或被应用自己藏起来的 UWP 窗口
+//      在当前桌面的任务栏里看不见。
+//
+// 为什么顶栏必须只认这类窗口：聚焦一个任务栏里看不见的窗口时，
+// SetForegroundWindow 会把它"显示出来"（隐藏窗被激活即现身），
+// 表现就是点在顶栏标签上突然冒出一个没头没尾的窗口 —— 子进程的
+// 隐藏消息窗、托盘图标应用的驻留窗都属于这一类。任务栏看不见的一律
+// 不收录、不可聚焦，这类误开窗就不可能发生。
+bool IsTaskbarWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd) || !IsWindowVisible(hwnd)) {
+        return false;
+    }
+    const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if ((ex & WS_EX_APPWINDOW) == 0) {
+        // GA_ROOTOWNER 顺属主链上溯：带属主的窗口返回属主（≠ 自身），
+        // 子窗口同样返回其顶层窗口，二者都不单独占任务栏按钮
+        if (GetAncestor(hwnd, GA_ROOTOWNER) != hwnd) {
+            return false;
+        }
+        if ((ex & WS_EX_TOOLWINDOW) != 0) {
+            return false;
+        }
+    }
+    return !IsCloaked(hwnd);
+}
+
 // 判断一个窗口是否应视为"可控制的有效目标窗口"
 bool IsControlTarget(HWND hwnd, HWND self) {    if (!hwnd || hwnd == self) {
         return false;
@@ -573,6 +616,14 @@ bool IsControlTarget(HWND hwnd, HWND self) {    if (!hwnd || hwnd == self) {
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
     if (pid == GetCurrentProcessId()) {
+        return false;
+    }
+    // 任务栏中看不见的窗口不作为顶栏目标：托盘图标应用的启动器/工具窗
+    // （如 hotspot 的 WS_EX_TOPMOST|WS_EX_TOOLWINDOW 弹出窗）、子进程消息窗、
+    // cloaked 窗都属于此类。它们不是任务栏级的应用窗口，标签栏里也不会有
+    // 它们的标签；一旦被顶栏接管，顶栏就会为"只不遮挡聚焦窗口"重排层级 ——
+    // 从被最大化窗口遮住的让位态顶回最前，凭空弹出一条没有标签的顶栏。
+    if (!IsTaskbarWindow(hwnd)) {
         return false;
     }
     return true;
@@ -704,6 +755,17 @@ void UpdateTarget(AppState& s) {
         if (fg && IsWindow(fg) && !IsWindowVisible(fg)) {
             return;
         }
+        // 前台是"任务栏中看不见"的窗口（托盘应用的启动器/工具窗、子进程
+        // 消息窗、cloaked 窗，如 hotspot 弹出窗）：顶栏保持原目标与原层级
+        // 完全不动。它既不是任务栏级的应用窗口（没有标签可显示），也不该
+        // 触发层级重估 —— 否则这种临时弹窗一冒出来，顶栏就会从"被最大化
+        // 窗口遮住"的让位态顶回最前，凭空弹出一条空标签顶栏。
+        // 原目标已失效（应用已退出）时不能死守，继续走下面的清空逻辑。
+        const bool targetAlive =
+            s.hasTarget && s.targetHwnd && IsWindow(s.targetHwnd);
+        if (targetAlive && fg && IsWindow(fg) && !IsTaskbarWindow(fg)) {
+            return;
+        }
         s.targetHwnd = nullptr;
         s.hasTarget = false;
         s.targetSticky = false;
@@ -768,9 +830,17 @@ int HitTestTab(AppState& s, int x, int y) {
 // SetActiveWindow / SetFocus 跨进程调用必须依赖输入队列附加，否则直接失败；
 // 顶栏自身是 WS_EX_NOACTIVATE 背景窗口，单独调 SetForegroundWindow
 // 很容易被系统前台锁拦截。全程不做按键模拟。
+//
+// 准入前置条件（唯一的聚焦闸门）：任务栏中看不见的窗口一律不聚焦 ——
+// 隐藏窗/工具窗被 SetForegroundWindow 激活时会"现身"，等于把它打开。
+// 列表侧已由 IsTaskbarWindow 过滤，这里是兜底：标签列表可能残留
+// 枚举之后才隐藏/被藏起来的窗口，此时聚焦请求直接丢弃。
 // 返回窗口是否已成为前台窗口。
 bool ForceForegroundWindow(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd)) {
+        return false;
+    }
+    if (!IsTaskbarWindow(hwnd)) {
         return false;
     }
     if (IsIconic(hwnd)) {
@@ -1407,18 +1477,11 @@ BOOL CALLBACK EnumAppWindowsProc(HWND hwnd, LPARAM lParam) {
     if (!ctx || !ctx->tabs || !ctx->target || hwnd == ctx->self) {
         return TRUE;
     }
-    if (!IsWindowVisible(hwnd)) {
+    if (!IsTaskbarWindow(hwnd)) {
         return TRUE;
     }
     // 忽略桌面 / 任务栏等系统 Shell 窗口，避免资源管理器标签混入系统窗口
     if (IsShellSystemWindow(hwnd)) {
-        return TRUE;
-    }
-    // 只收集普通应用主窗口：忽略属主窗口（对话框/浮层）和工具窗口
-    if (GetWindow(hwnd, GW_OWNER) != nullptr) {
-        return TRUE;
-    }
-    if ((GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) {
         return TRUE;
     }
     DWORD pid = 0;
@@ -3217,6 +3280,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     break;
                 }
                 HWND tabHwnd = tab.hwnd;
+                // 任务栏中看不见的窗口不可聚焦（子进程消息窗 / 托盘图标应用的
+                // 驻留窗 / 已藏起来的窗口）：既不能聚焦，也不能被顶栏收作目标，
+                // 否则最小化/关闭等按钮会落到一个用户根本看不见的窗口上。
+                // 列表是上一次枚举的结果，窗口可能在枚举之后才隐藏，
+                // 故此处按同一判据复查；刷新一次后该残留标签即被剔除。
+                if (!IsTaskbarWindow(tabHwnd)) {
+                    RefreshTabs(*s);
+                    DrawBarAndPresent(*s);
+                    break;
+                }
                 if (IsIconic(tabHwnd)) {
                     ShowWindow(tabHwnd, SW_RESTORE);
                 }
