@@ -173,6 +173,15 @@ constexpr UINT kDockVolumePanelMsg = WM_APP + 13;
 // 聚焦窗口）。自动收起关闭 / Dock 退出时收到 0 = 回到默认策略。
 // wParam = 1 覆盖所有窗口 / 0 默认策略。与 dock_main.cpp 同值。
 constexpr UINT kDockStateMsg = WM_APP + 14;
+// ← Dock:查询"顶栏当前把哪个应用当作聚焦目标"。
+// Dock 原本只按系统前台(GetForegroundWindow)判断"点图标 = 最小化还是聚焦"，
+// 这与顶栏目标会打架：目标应用被最小化后 Windows 自动把前台让给别的应用、
+// 而顶栏按设计"粘住"仍盯着被最小化的应用，此时点 Dock 图标会被判定成
+// "该应用已在前台"→走最小化分支，顶栏继续停在旧应用上
+// （用户现象：开完 Windows Terminal 再点浏览器，顶栏聚焦仍在终端）。
+// 以顶栏目标为准，套件内语义才一致：wParam = 待判定的窗口 HWND，
+// 返回值 1 = 该窗口属于顶栏当前目标应用 / 0 = 否。与 dock_main.cpp 同值。
+constexpr UINT kDockFocusQueryMsg = WM_APP + 16;
 // 顶栏启动查询：向 Dock 询问当前联动展开态（SendMessageTimeout 的返回值 =
 // 1 覆盖所有窗口 / 0 默认策略；Dock 未运行/超时则按默认策略处理）。
 // 与 dock_main.cpp 同值。
@@ -540,6 +549,11 @@ void ToggleCalendarFlyout() {
 // 供目标跟踪区分系统自动转移焦点与用户主动切换窗口
 HWND g_lastClickWindow = nullptr;
 bool g_altTabPressed = false;
+// 用户点击了套件窗口（Dock/启动台/时钟等）——落点本身不能当目标（不是
+// 任务栏级应用窗），但它同样表明"用户在主动切换应用"：目标粘住态必须
+// 立即解除，否则顶栏会永久停在被最小化的旧目标上
+// （现象：最小化终端后从 Dock/启动台点浏览器，顶栏聚焦仍在终端）。
+bool g_suiteClickSwitch = false;
 HHOOK g_keyHook = nullptr;
 
 bool IsCloaked(HWND hwnd);  // 前置声明（定义在让位判定节）
@@ -717,12 +731,25 @@ void UpdateTarget(AppState& s) {
             } else if (g_altTabPressed && IsControlTarget(fg, s.hwnd)) {
                 explicitHwnd = fg;
             }
+            const bool suiteSwitch = g_suiteClickSwitch;
             g_lastClickWindow = nullptr;
             g_altTabPressed = false;
+            g_suiteClickSwitch = false;
 
             if (explicitHwnd) {
                 // 用户主动切到其他窗口：解除粘住并切换
                 ApplyTargetInfo(s, explicitHwnd);
+                s.targetSticky = false;
+            } else if (suiteSwitch && IsControlTarget(fg, s.hwnd) &&
+                       fg != s.targetHwnd) {
+                // 用户从套件窗口（Dock 图标 / 启动台）发起的切换：落点不是
+                // 应用窗口，但前台此刻已是用户要去的应用（如 Dock 点浏览器
+                // 时浏览器已在前台）→ 跟随当前前台，解除粘住
+                ApplyTargetInfo(s, fg);
+                s.targetSticky = false;
+            } else if (suiteSwitch) {
+                // 套件操作引发的前台切换可能尚未生效（如启动台正在拉起应用）：
+                // 先解除粘住，目标随后由前台事件 / Dock 通知自然接管
                 s.targetSticky = false;
             } else if (fg == s.targetHwnd) {
                 // 目标被恢复（win+↑ / 点击任务栏）
@@ -739,6 +766,7 @@ void UpdateTarget(AppState& s) {
     // 非粘住：正常跟随前台窗口；顺带清掉历史显式选择信号
     g_lastClickWindow = nullptr;
     g_altTabPressed = false;
+    g_suiteClickSwitch = false;
 
     if (IsControlTarget(fg, s.hwnd)) {
         ApplyTargetInfo(s, fg);
@@ -1909,6 +1937,14 @@ LRESULT CALLBACK VolumeLowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam
         // 不依赖 WinEvent 事件（事件可能延迟或不触发）
         if (s && s->targetSticky && clicked &&
             clicked != s->targetHwnd && IsControlTarget(clicked, hwnd)) {
+            PostMessageW(hwnd, kUserSwitchMsg, 0, 0);
+        } else if (s && s->targetSticky && clicked &&
+                   clicked != s->targetHwnd) {
+            // 落点是"不能当目标"的窗口（套件 Dock/启动台/时钟，或桌面等）：
+            // 用户仍在主动切换应用 —— 置套件切换信号并立即刷新，解除粘住。
+            // 少了这条，最小化目标后从 Dock/启动台切换应用，顶栏会永久
+            // 停留在被最小化的旧目标上。
+            g_suiteClickSwitch = true;
             PostMessageW(hwnd, kUserSwitchMsg, 0, 0);
         }
 
@@ -3493,6 +3529,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetVolumeOpen(*s, !s->volumeOpen);
         }
         return 0;
+
+    // ← Dock 查询：顶栏当前目标应用是否就是 wParam 那个窗口所属的应用。
+    // 用于让 Dock 的"点图标 = 最小化 / 聚焦"与用户看到的聚焦指示（顶栏目标）
+    // 保持一致，避免目标被最小化后前台自动转移造成的判断分歧。
+    case kDockFocusQueryMsg: {
+        if (!s || !s->hasTarget || !s->targetHwnd ||
+            !IsWindow(s->targetHwnd)) {
+            return 0;
+        }
+        HWND probe = reinterpret_cast<HWND>(wParam);
+        if (!probe || !IsWindow(probe)) {
+            return 0;
+        }
+        return IsSameApplication(probe, s->targetHwnd) ? 1 : 0;
+    }
 
     case kDockStateMsg: {
         // Dock 顶栏联动：自动收起开启期间，Dock 展开 → 顶栏与 Dock 一样

@@ -155,6 +155,16 @@ constexpr UINT kMsgTopBarDockState = WM_APP + 14;
 // ← 顶栏:启动/重置时查询当前联动状态(通过 SendMessageTimeout 的返回值应答,
 // 返回值 = 1 覆盖所有窗口/0 默认策略;同时按需补投递一次 kMsgTopBarDockState)。
 constexpr UINT kMsgTopBarDockQuery = WM_APP + 15;
+// → 顶栏:查询"顶栏当前把哪个应用当作聚焦目标"(wParam = 待判定窗口 HWND,
+// 返回值 1 = 该窗口属于顶栏当前目标应用 / 0 = 否)。与 topbar_main.cpp 同值。
+//
+// 为什么需要它:Dock 判断"点图标 = 最小化该应用 / 聚焦该应用"原本只看系统
+// 前台(GetForegroundWindow)。目标应用被最小化后,Windows 会把前台自动让给
+// 别的窗口,而顶栏按设计"粘住"仍盯着被最小化的应用 —— 两者不一致时,
+// 点浏览器图标会被判成"浏览器已在前台"从而走最小化分支,顶栏继续停在
+// 旧应用上(用户现象:开完 Windows Terminal 再点浏览器,顶栏聚焦仍在终端)。
+// 以顶栏目标(用户看到的聚焦指示)为准,套件内语义才自洽。
+constexpr UINT kMsgTopBarFocusQuery = WM_APP + 16;
 
 // 固定区拖拽重排消息子类型（wParam）
 constexpr WPARAM kDockDragMove = 1;  // 按下后仍在按住 → 移动（UI 自行读取物理光标）
@@ -3054,6 +3064,33 @@ int HitIndexAt(AppState& s, float x, float y) {
 // 等——都不达标，不会被当成“应用本体”）
 constexpr long kMainWindowMinArea = 400L * 300L;
 
+// 询问顶栏:它是否也认为"该窗口所属应用"就是当前聚焦应用。
+// 返回 1 = 顶栏确认 / 0 = 顶栏明确否认 / -1 = 顶栏未运行或未应答
+// (调用方退回系统前台判定,行为与旧版一致)。
+int QueryTopBarFocusAgreement(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return -1;
+    HWND bar = FindWindowW(L"DesktopTopBarWindow", nullptr);
+    if (!bar || !IsWindow(bar)) return -1;
+    DWORD_PTR answer = 0;
+    if (SendMessageTimeoutW(bar, kMsgTopBarFocusQuery,
+                            reinterpret_cast<WPARAM>(hwnd), 0,
+                            SMTO_ABORTIFHUNG | SMTO_BLOCK, 200,
+                            &answer) == 0) {
+        return -1;
+    }
+    return answer ? 1 : 0;
+}
+
+// 顶栏明确否认"前台窗口所属应用 = 当前聚焦应用"时返回 false：
+// 用户看到并操作的聚焦应用(顶栏目标)与系统前台不一致——典型场景是目标
+// 应用被最小化后顶栏粘住它、系统前台已自动让给别的应用。此时点 Dock 图标
+// 应走"聚焦该应用"分支,而不是把它当成"已在前台"去最小化。
+bool ForegroundAppConfirmedByTopBar(HWND fg) {
+    if (QueryTopBarFocusAgreement(fg) != 0) return true;
+    Logf(L"前台应用与顶栏聚焦目标不一致 → 按“未聚焦”处理（点图标 = 聚焦）");
+    return false;
+}
+
 bool AppOwnsForeground(const DockItem& item) {
     HWND fg = GetForegroundWindow();
     if (!fg) return false;
@@ -3073,7 +3110,7 @@ bool AppOwnsForeground(const DockItem& item) {
     if (area < kMainWindowMinArea) return false;
     for (HWND w : item.windows) {
         if (!IsWindow(w)) continue;
-        if (fg == w) return true;
+        if (fg == w) return ForegroundAppConfirmedByTopBar(fg);
     }
     // 同进程多顶级窗口：前台属于同 exe 即算聚焦态。
     // 但对 explorer.exe 这个“shell + 文件管理器”双身份进程做特判：
@@ -3086,7 +3123,7 @@ bool AppOwnsForeground(const DockItem& item) {
     }
     for (HWND w : item.windows) {
         if (!IsWindow(w)) continue;
-        if (PidOf(w) == fgPid) return true;
+        if (PidOf(w) == fgPid) return ForegroundAppConfirmedByTopBar(fg);
     }
     return false;
 }
@@ -3204,6 +3241,9 @@ void LaunchItem(AppState& s, size_t idx) {
     }
     Logf(L"启动请求：%ls → %ls", item.displayName.c_str(),
          item.launchPath.c_str());
+    // 启动新应用会抢走前台：先让顶栏解除"目标粘住"，否则顶栏会继续停在
+    // 上一个（可能已最小化的）应用上，不跟随新启动的应用。
+    NotifyTopBarFocus(nullptr);
     s.pendingLaunches.push_back(PendingLaunch{item.key, GetTickCount64()});
     s.needsRedraw = true;
     SetFrameCadence(s, true);  // 空闲已停帧：启动弹跳动画需要帧驱动
