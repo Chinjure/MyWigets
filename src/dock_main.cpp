@@ -25,6 +25,23 @@
 //      Dock 展开时顶栏与 Dock 一样置顶（不被应用窗口覆盖），Dock 收起时
 //      顶栏恢复桌面层（只在桌面显示、被应用窗口覆盖）；关闭自动收起时
 //      顶栏行为不变（默认桌面层）
+//   7. 全屏应用让位（游戏全屏 / 全屏视频 / 演示模式）：前台出现铺满显示器
+//      的应用时，Dock 立即完全滑出并隐藏窗口、屏蔽下缘触发条与屏幕角部
+//      隐形按钮（低层鼠标钩子全程放行，不吞任何点击），宿主托盘同时忽略
+//      Dock 开关热键（见 mywigets_main.cpp）；全屏退出后自动恢复常驻。
+//      判定口径见 fullscreen_guard.h（几何 + SHQueryUserNotificationState）。
+//   8. 「保持顶栏」模式（右键菜单 / 宿主托盘菜单勾选，注册表持久化，
+//      语义与几何见 keep_top.h）：本进程是工作区的唯一写入者 ——
+//        开启：工作区顶部让出顶栏高度（最大化窗口只填顶栏以下）；
+//              自动收起关闭（Dock 常驻可见）时再让出 Dock 所在高度带，
+//              最大化窗口底边停在 Dock 顶边之上；
+//              自动收起开启时不预留（Dock 收在屏幕外，窗口填满到屏幕底）。
+//        关闭：工作区恢复整屏。
+//      切换时会把「已最大化」的窗口重排到新工作区（实测直接改工作区系统
+//      不会动它们，且对最大化窗口 SetWindowPos 会被弹回，唯一有效顺序是
+//      SW_RESTORE → SetWindowPos → SW_MAXIMIZE）。
+//      Dock 自身的贴底摆放/命中判定一律以整幅画面为准（不是工作区），
+//      否则会被自己预留出来的空间顶上去（越让越高的正反馈）。
 //
 // 日志写入 ..\logs\dock.log
 
@@ -70,6 +87,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "fullscreen_guard.h"  // 全屏应用让位判定（与宿主托盘共用）
+#include "keep_top.h"         // 「保持顶栏」模式（注册表开关 + 预留区计算）
 #include "widgets.h"
 
 #pragma comment(lib, "gdiplus.lib")
@@ -105,8 +124,8 @@ constexpr float kShadowMargin = 14.0f;  // 窗口边缘阴影预留（顶/左/�
 constexpr float kShadowBottom = 7.0f;   // 底部阴影预留（贴底外观，为顶部的一半）
 constexpr float kCornerRadius = 20.0f;
 constexpr float kSepGap = 14.0f;        // 分隔线两侧额外间距
-constexpr int kBottomGapBase = 0;       // 底栏距工作区底部（0=贴底；悬停放大向上生高）
-
+constexpr int kBottomGapBase = 0;       // 毛玻璃底边距屏幕底部的间隙（0=贴底；
+                                        // 悬停放大向上生高，不影响底边）
 // 悬停放大时窗口宽度随内容实时展宽（经 UpdateLayeredWindow 的
 // pptDst/psize 每帧应用，静止时精确贴合内容）。缓冲位图额外预留的
 // 放大宽度预算，超出时才重建 DIB（正常情况永不触发）：
@@ -128,6 +147,7 @@ constexpr int kMenuBaseId = 4000;
 constexpr int kMenuExit = 1001;
 constexpr int kMenuToggleAutoCollapse = 1002;  // 空白区右键：自动收起开关
 constexpr int kMenuToggleLog = 1003;           // 右键菜单：运行日志开关
+constexpr int kMenuToggleKeepTop = 1004;       // 右键菜单：「保持顶栏」模式开关
 constexpr int kDockStripHeightLogical = 2;     // 展开触发条高度（逻辑像素，与 Dock 同宽）
 constexpr UINT_PTR kTooltipTimerId = 4;        // 悬停提示一次性定时器（停帧模式下到期踢帧）
 constexpr UINT_PTR kCollapseWatchTimerId = 5;  // 收起状态监视（诊断专用：本应收起未收起）
@@ -165,6 +185,15 @@ constexpr UINT kMsgTopBarDockQuery = WM_APP + 15;
 // 旧应用上(用户现象:开完 Windows Terminal 再点浏览器,顶栏聚焦仍在终端)。
 // 以顶栏目标(用户看到的聚焦指示)为准,套件内语义才自洽。
 constexpr UINT kMsgTopBarFocusQuery = WM_APP + 16;
+// ← WinEvent(EVENT_SYSTEM_FOREGROUND)：前台切换 → 复核全屏应用让位状态
+// （游戏全屏/退出全屏多数伴随前台切换，事件级延迟 <10ms；另有 2s 保底与
+// 下缘触发前的当场复核，见 UpdateFullscreenState）
+constexpr UINT kMsgFullscreen = WM_APP + 17;
+// ← 宿主托盘「保持顶栏」菜单项：请求立即按注册表重读开关并生效。
+// 开关的持久化由发起方（宿主托盘 / 顶栏）写注册表，Dock 只负责重读并
+// 重算工作区（工作区的唯一写入者，见 UpdateKeepTopWorkArea）。
+// wParam = 0 仅重读 / 1 强制打开 / 2 强制关闭。与 mywigets_main.cpp 同值。
+constexpr UINT kMsgDockKeepTopSet = WM_APP + 18;
 
 // 固定区拖拽重排消息子类型（wParam）
 constexpr WPARAM kDockDragMove = 1;  // 按下后仍在按住 → 移动（UI 自行读取物理光标）
@@ -345,7 +374,34 @@ struct AppState {
     uint64_t lastSignature = 0;  // 内容签名（FNV-1a），状态无变化时跳过重绘
 
     ULONGLONG taskbarShowUntil = 0;  // 托盘图标触发期间：任务栏临时可见的截止时刻
+
+    // ---- 全屏应用让位（游戏全屏 / 全屏视频 / 演示模式）----
+    // 前台出现铺满本 Dock 所在显示器的应用时：Dock 无条件完全滑出屏幕底，
+    // 滑出后连窗口一起隐藏（不留一个像素、不抢 Z 序），下缘触发条与角部
+    // 隐形按钮在低层钩子里全程放行；全屏退出后恢复常驻（保持收起态）。
+    bool fullscreenActive = false;       // 当前是否处于全屏让位（本 Dock 的显示器）
+    bool winHiddenByFullscreen = false;  // 窗口因全屏让位被 SW_HIDE（退出时要还原）
+
+    // ---- 「保持顶栏」模式（见 keep_top.h）----
+    // 开启后：工作区顶部让出顶栏高度（最大化窗口只填顶栏以下），顶栏恒置顶；
+    // 自动收起关闭（Dock 常驻可见）时还要让出 Dock 所在高度带。
+    // 开关持久化在注册表；Dock 是工作区的唯一写入者（见 UpdateKeepTopWorkArea）。
+    bool keepTopEnabled = false;    // 模式开关（注册表读入，随消息/轮询刷新）
+    RECT workAreaApplied{};         // 最近一次写入系统的工作区（幂等去重）
+    ULONGLONG lastKeepTopPoll = 0;  // 上次重读注册表开关与顶栏几何的时刻
+    int keepTopReserve = 0;         // 本模式下让出的 Dock 高度带（0=不让），
+                                    // 供布局日志对账毛玻璃顶边（见 UpdateLayoutOneFrame）
 };
+
+// Dock 窗口在毛玻璃下方还留着 kShadowBottom 的阴影留白（透明像素）。
+// 窗口 y 必须把这部分补回来，否则「BottomGap=4」实际得到的是
+// 「窗口底边距屏幕 4px → 看得见的玻璃底边距屏幕 4+7=11px」——
+// 实测 diff 位图：窗口底 1076、玻璃底 1069、屏幕底 1080（差 11px）。
+// 用户的直觉口径就是"看得见的那条玻璃离屏幕多远"，所以这里按玻璃底边算。
+float DockBarBottomMargin(const AppState& s) {
+    const float k = (s.scale > 0.f) ? s.scale : 1.f;
+    return kShadowBottom * k;
+}
 
 AppState g_state;
 
@@ -1415,6 +1471,268 @@ RECT VirtualScreenRect() {
     return rc;
 }
 
+// ============================== 「保持顶栏」模式 ==============================
+// 见 keep_top.h 的模式语义。本段负责：按模式计算并写入工作区、重排已最大化的
+// 窗口、以及把开关状态同步给顶栏。
+//
+// 为什么不注册 AppBar：本套件常驻期间隐藏系统任务栏并自行改写工作区，
+// explorer 的 AppBar 协商会把这份自管工作区覆盖回去（互相打架）；
+// 因此工作区一律由 Dock 单点写入，顶栏只管层级与全屏让位。
+
+// 主屏整幅画面缓存：Dock 的贴底摆放/命中判定一律以它为准，绝不用工作区 ——
+// 「保持顶栏」开启后工作区会被抬高（让出顶栏与 Dock 高度带），若还按工作区
+// 摆放，Dock 会被自己预留出来的空间顶上去，越让越高（正反馈）。
+RECT g_primaryScreen{};
+
+void RefreshPrimaryScreen() {
+    const RECT v = VirtualScreenRect();
+    g_primaryScreen = v;
+    // 多显示器时取主屏（Dock 常驻在带任务栏的那块屏）
+    POINT origin{0, 0};
+    const HMONITOR mon = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (mon && GetMonitorInfoW(mon, &mi)) {
+        g_primaryScreen = mi.rcMonitor;
+    }
+    (void)v;
+}
+
+RECT PrimaryScreenRect() {
+    if (g_primaryScreen.right <= g_primaryScreen.left ||
+        g_primaryScreen.bottom <= g_primaryScreen.top) {
+        RefreshPrimaryScreen();
+    }
+    return g_primaryScreen;
+}
+
+bool EnsurePrimaryScreenCached() {
+    if (g_primaryScreen.right <= g_primaryScreen.left ||
+        g_primaryScreen.bottom <= g_primaryScreen.top) {
+        RefreshPrimaryScreen();
+    }
+    return g_primaryScreen.right > g_primaryScreen.left;
+}
+
+// 顶栏窗口高度：顶栏未运行时退回 DPI 基准值（keep_top.h）
+int TopBarHeightForWorkArea() {
+    HWND bar = FindWindowW(L"DesktopTopBarWindow", nullptr);
+    if (bar && IsWindow(bar)) {
+        RECT rc{};
+        if (GetWindowRect(bar, &rc) && rc.bottom > rc.top) {
+            return rc.bottom - rc.top;
+        }
+    }
+    return keeptop::DefaultBarHeightForDpi(g_state.dpi > 0 ? g_state.dpi : 96);
+}
+
+// 毛玻璃主体矩形（摆放/绘制阶段定义在下方）：保持顶栏让出的高度带必须与
+// 真实绘制同源 —— 手写常量和公式曾经漏算悬停峰值项，算出的顶边比实际低 17px
+RectF BodyRectForPeak(float k, int winW, int winH, float peak);
+
+// 毛玻璃主体（body）在客户区内的顶边 y：直接取 BodyRectForPeak 的 Y，
+// 与绘制/命中用同一份几何，避免「预留算出 64、实际画在 47」这类漂移。
+// peak 固定按静止态 1.0 计算：悬停放大只让毛玻璃向上生长，间距在视觉上
+// 变大，不跟着每帧抖动（否则工作区会随悬停反复改写、最大化窗口被反复重排）。
+int KeepTopGlassTopLocal(const AppState& s) {
+    const int winH = (s.winH > 0) ? s.winH : 0;
+    if (winH <= 0) return 0;
+    const float k = (s.scale > 0.f) ? s.scale : 1.f;
+    const RectF body = BodyRectForPeak(k, s.winW, winH, 1.0f);
+    const int top = static_cast<int>(body.Y + 0.5f);
+    return (top > 0 && top < winH) ? top : 0;
+}
+
+// 前置声明（定义在下方）：毛玻璃本体判定要用当前悬停峰值与触发条几何
+float CurrentPeakScale(const AppState& s);
+bool InDockStrip(POINT pt);
+
+// 悬停判定区：毛玻璃本体在屏幕上的矩形（含极小容差）。
+// 为什么不用整个窗口矩形：窗口比毛玻璃大一圈（左右各 14px 阴影预留 + 顶部
+// 留白），而且旧实现把命中区一路延伸到屏幕底边 —— 用窗口矩形（或"窗口矩形
+// ∪ 底边整段"）判「在 Dock 上」时，光标离毛玻璃还有十几像素、甚至还在玻璃
+// 上方时就会触发悬停放大，用户看到的现象就是"还没碰到图形就 hover 了"。
+// 这里以绘制用几何为准：只有光标真进了毛玻璃本体（含 2px 容差）才算在 Dock 上。
+// 屏幕下缘那条 2px 展开触发条另有 InDockStrip 负责（收起态召唤），不在此放宽。
+bool PointInGlassBody(const AppState& s, POINT pt, int winYOverride = -1) {
+    if (!s.hwnd || s.winW <= 0 || s.winH <= 0) return false;
+    const float k = (s.scale > 0.f) ? s.scale : 1.f;
+    const RectF body =
+        BodyRectForPeak(k, s.winW, s.winH, CurrentPeakScale(s));
+    const int winY = (winYOverride >= 0) ? winYOverride : s.winY;
+    const LONG tolX = 0;  // 左右不留余量：只认画出来的毛玻璃本体
+    const LONG left = s.winX + static_cast<LONG>(body.X) - tolX;
+    const LONG right = s.winX + static_cast<LONG>(body.X + body.Width) + tolX;
+    const LONG top = winY + static_cast<LONG>(body.Y) - 1;  // 上边缘容差 1px
+    // 下边缘取毛玻璃底边：窗口底部还留着 kShadowBottom 的阴影留白，不算"Dock"
+    const LONG bottom =
+        winY + static_cast<LONG>(body.Y + body.Height) + 1;
+    return pt.x >= left && pt.x <= right && pt.y >= top && pt.y <= bottom;
+}
+
+// 光标是否算「在 Dock 上」= 在毛玻璃本体上，或碰到屏幕下缘的展开触发条。
+// 悬停放大、悬停提示、展开保持三者共用这一个口径（钩子线程与帧自愈同源）。
+// winYOverride：帧自愈路径传入「本帧目标窗口顶边」（含收起偏移），
+// 避免用上一帧的 winY 把刚离开的光标误判回玻璃上（收起被自愈荡回的老问题）。
+bool OnDockPointer(const AppState& s, POINT pt, int winYOverride = -1) {
+    return PointInGlassBody(s, pt, winYOverride) || InDockStrip(pt);
+}
+
+// 本模式下 Dock 应让出的高度带（物理像素）：
+//   自动收起开启 → Dock 平时收在屏幕外，不让（最大化窗口填满到屏幕底）；
+//   自动收起关闭 → Dock 常驻可见，让出 Dock 高度带，使最大化窗口底边距
+//                  **毛玻璃顶边** 恰好 keeptop::kMaxWindowToDockGapBase（2px）。
+//
+// 关键：让出的不是「窗口顶边以下」，而是「毛玻璃顶边 + 2px 以下」。
+// Dock 窗口比毛玻璃本体大一圈（四周阴影预留 kShadowMargin + 顶部留白
+// kPadTop，见 BodyRectForPeak）：按窗口顶边让位时，最大化窗口与看得见的
+// Dock 之间会空出 15px 以上（用户反馈「距离明显太远」的根因）。
+//
+// 毛玻璃顶边的屏幕坐标只与「窗口高 / DPI 缩放 / 悬停峰值」有关，与窗口
+// y 无关（body.Y = winH − 底边阴影 − 内容高 → glassTop = 底边阴影 + 内容高），
+// 所以即使 Dock 此刻正收在屏幕外也能算准（不需要实时矩形）。
+// 峰值固定取 1.0（静止态）：悬停放大时毛玻璃向上生长，间距只在视觉上变大，
+// 不跟着每帧抖动 —— 否则工作区会随悬停反复改写，最大化窗口被反复重排。
+int KeepTopDockReserve() {
+    if (g_state.autoCollapse) {
+        g_state.keepTopReserve = 0;
+        return 0;
+    }
+    const RECT full = PrimaryScreenRect();
+    const int gap = MulDiv(g_state.bottomGapBase, g_state.dpi, 96);
+    const int winH = (g_state.winH > 0) ? g_state.winH : 0;
+    if (winH <= 0) {
+        g_state.keepTopReserve = 0;
+        return 0;
+    }
+
+    // 毛玻璃顶边一律从 BodyRectForPeak 推（与真实绘制同源），不再手写一份
+    // 常量和公式 —— 曾经手写版漏算悬停峰值项，算出的顶边比真实值低 17px。
+    // 窗口顶边的公式必须与 UpdateDockPosition 完全一致（含阴影补回量）。
+    const int glassTopLocal = KeepTopGlassTopLocal(g_state);
+    if (glassTopLocal <= 0) return 0;
+    const float kScale = (g_state.scale > 0.f) ? g_state.scale : 1.f;
+    const int glassBottomLocalKeep =
+        winH - static_cast<int>(kShadowBottom * kScale + 0.5f);
+    const int winYKeep = (full.bottom - gap - 1) - glassBottomLocalKeep;
+    const int glassTopScreen = winYKeep + glassTopLocal;
+    const int reserveGap =
+        MulDiv(keeptop::kMaxWindowToDockGapBase, g_state.dpi, 96);
+
+    // 工作区底边 = 毛玻璃顶边 − 间距 → 让出高度 = 屏幕底 − 工作区底边
+    const int reserve = full.bottom - (glassTopScreen - reserveGap);
+    g_state.keepTopReserve = reserve;  // 布局日志对账用（见 UpdateLayoutOneFrame）
+    static int s_lastLoggedReserve = -1;
+    if (reserve != s_lastLoggedReserve) {
+        s_lastLoggedReserve = reserve;
+        Logf(L"[保持顶栏] Dock 高度带：dpi=%d scale=%.3f winH=%d bottomGap=%d "
+             L"毛玻璃顶边(局部)=%d 屏幕=%d 间距=%d → 让出=%d",
+             g_state.dpi, g_state.scale, winH, gap, glassTopLocal,
+             glassTopScreen, reserveGap, reserve);
+    }
+    if (reserve > 0 && reserve < (full.bottom - full.top) / 2) {
+        return reserve;
+    }
+    return 0;
+}
+
+// 模式目标工作区：关闭 → 整屏；开启 → 顶部让出顶栏高度（+ 视情况让出 Dock 带）
+RECT KeepTopTargetWorkArea() {
+    const RECT full = PrimaryScreenRect();
+    if (!g_state.keepTopEnabled) return full;
+    return keeptop::ReserveWorkArea(full, TopBarHeightForWorkArea(),
+                                    KeepTopDockReserve());
+}
+
+// 把已最大化的窗口重排到新工作区。
+// 实测（1920×1080 / Win11）：改工作区本身不会动已最大化的窗口，直接对它们
+// SetWindowPos 也会被系统按最大化几何弹回；唯一有效的顺序是
+// SW_RESTORE → SetWindowPos → SW_MAXIMIZE。
+// 只处理「本屏、可见、带标题/边框的常规窗口」：全屏应用、无标题浮层
+// （WS_EX_TOOLWINDOW）、子窗口、其它显示器上的窗口一律不碰。
+void RefitMaximizedWindowsToWorkArea(const RECT& wa) {
+    struct Ctx {
+        const RECT* wa;
+        int count;
+    } ctx{&wa, 0};
+
+    EnumWindows(
+        [](HWND hwnd, LPARAM lp) -> BOOL {
+            auto* c = reinterpret_cast<Ctx*>(lp);
+            if (!IsWindowVisible(hwnd) || IsIconic(hwnd) ||
+                !IsZoomed(hwnd)) {
+                return TRUE;
+            }
+            const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if ((ex & WS_EX_TOOLWINDOW) != 0) return TRUE;
+            if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+            if (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CHILD) return TRUE;
+            // 只认本屏（Dock 所在显示器）
+            HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+            if (!mon || mon != MonitorFromRect(c->wa, MONITOR_DEFAULTTONULL)) {
+                return TRUE;
+            }
+            RECT rc{};
+            if (!GetWindowRect(hwnd, &rc)) return TRUE;
+            // 已经贴合目标工作区（含 DWM 不可见边框的 ±16px 容差）：不动
+            const int tol = 16;
+            const bool fits =
+                rc.top >= c->wa->top - tol && rc.top <= c->wa->top + tol &&
+                rc.bottom >= c->wa->bottom - tol &&
+                rc.bottom <= c->wa->bottom + tol;
+            if (fits) return TRUE;
+
+            Logf(L"[保持顶栏] 重排最大化窗口 hwnd=0x%X 原矩形=(%d,%d,%d,%d) → "
+                 L"工作区=(%d,%d,%d,%d)",
+                 static_cast<unsigned>(reinterpret_cast<UINT_PTR>(hwnd)),
+                 rc.left, rc.top, rc.right, rc.bottom, c->wa->left, c->wa->top,
+                 c->wa->right, c->wa->bottom);
+            ShowWindow(hwnd, SW_RESTORE);
+            SetWindowPos(hwnd, nullptr, c->wa->left, c->wa->top,
+                         c->wa->right - c->wa->left,
+                         c->wa->bottom - c->wa->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            ShowWindow(hwnd, SW_MAXIMIZE);
+            ++c->count;
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&ctx));
+    if (ctx.count > 0) {
+        Logf(L"[保持顶栏] 已重排 %d 个最大化窗口", ctx.count);
+    }
+}
+
+// 幂等写入工作区：只在目标值与系统现值不同、或与上次写入值不同时才写。
+// 不带 SPIF_SENDCHANGE（与本文件既有做法一致：广播 WM_SETTINGCHANGE 会
+// 让 explorer 按任务栏占位重算工作区，把刚设置的值覆盖回去）。
+void ApplyWorkArea(const RECT& wa, bool refitMaximized) {
+    RECT cur{};
+    const bool got =
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &cur, 0) != FALSE;
+    const bool changed = !got || !keeptop::SameRect(cur, wa) ||
+                         !keeptop::SameRect(g_state.workAreaApplied, wa);
+    if (!changed) return;
+
+    SystemParametersInfoW(SPI_SETWORKAREA, 0, const_cast<RECT*>(&wa), 0);
+    g_state.workAreaApplied = wa;
+    RefreshPrimaryWorkArea();  // 工作区缓存同步（Dock 摆放另用屏幕矩形）
+    Logf(L"[保持顶栏] 工作区写入 = (%d,%d,%d,%d) 重排最大化窗口=%d", wa.left,
+         wa.top, wa.right, wa.bottom, refitMaximized ? 1 : 0);
+    if (refitMaximized) {
+        // 让窗口管理器先完成工作区切换，再重排（避免用旧工作区算出旧几何）
+        Sleep(60);
+        RefitMaximizedWindowsToWorkArea(wa);
+    }
+}
+
+// 模式工作区统一入口。两种模式都走这里（关闭时目标 = 整屏），因此退出模式
+// 时工作区自动还原，无需额外分支。
+void UpdateKeepTopWorkArea(AppState& s, bool refitMaximized) {
+    if (!s.hwnd || !EnsurePrimaryScreenCached()) return;
+    const RECT want = KeepTopTargetWorkArea();
+    ApplyWorkArea(want, refitMaximized);
+}
+
 void HideTaskbar() {
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &g_state.savedWorkArea, 0);
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
@@ -1476,20 +1794,12 @@ void EnsureTaskbarHidden(AppState& s) {
     // 临时显示任务栏等操作重新改回“任务栏占位”值（例如底边从 1080 变成 1032）。
     // 原实现只在“本次发现任务栏可见并隐藏”时扩充工作区，导致这种隐藏但工作区
     // 未恢复的情况不会自愈，Dock 就会停在任务栏原位置上方。
-    const RECT full = VirtualScreenRect();
-    RECT wa{};
-    const bool gotWorkArea =
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0) != FALSE;
-    const bool workAreaStale =
-        !gotWorkArea || wa.left != full.left || wa.top != full.top ||
-        wa.right != full.right || wa.bottom != full.bottom;
-
-    if (touched || workAreaStale) {
-        SystemParametersInfoW(SPI_SETWORKAREA, 0,
-                              const_cast<RECT*>(&full), 0);
-        RefreshPrimaryWorkArea();  // 工作区已改为全屏，同步缓存
-        RepositionDock(s, true);  // 任务栏隐藏，dock 重新贴底
-    }
+    //
+    // 「保持顶栏」模式下目标工作区不是整屏（顶部让出顶栏高度、视情况让出 Dock
+    // 高度带），因此这里统一交给 UpdateKeepTopWorkArea 计算 —— 它按目标值与
+    // 系统现值做幂等判定，关闭模式时目标即整屏，恢复路径同样覆盖。
+    UpdateKeepTopWorkArea(s, /*refitMaximized=*/true);
+    if (touched) RepositionDock(s, true);  // 任务栏隐藏，dock 重新贴底
 }
 
 // ============================== 显示桌面（右下角）+ 开始菜单（左下角）==============================
@@ -1513,6 +1823,9 @@ constexpr int kShowDesktopWLogical = 12;  // 隐形按钮宽（逻辑像素，�
 constexpr int kShowDesktopHLogical = 48;  // 隐形按钮高（逻辑像素，与 Windows 按钮一致）
 
 HHOOK g_showDesktopHook = nullptr;
+// 全屏应用让位（游戏全屏等）：UI 线程判定后置位，低层鼠标钩子线程每拍读取。
+// 置位期间钩子彻底不介入 —— 不判角部、不吞任何点击、不投递进出场。
+std::atomic<bool> g_fullscreenActive{false};
 bool g_hookLeftDownOnDock = false;         // 低层钩子吞掉过 Dock 左键按下：抬起也须吞掉
 bool g_hookMiddleDownOnDock = false;       // 低层钩子吞掉过 Dock 中键按下：抬起也须吞掉（配对防孤儿事件）
 bool g_hookPressOnDock = false;            // 左键在 Dock 上按下且未抬起（固定区拖拽重排的按钮态跟踪）
@@ -1707,6 +2020,10 @@ int HitIndexAt(AppState& s, float x, float y);
 void ToggleFocusOrLaunch(AppState& s, size_t idx);
 void SetFrameCadence(AppState& s, bool fast);
 void SyncTopBarDockState(AppState& s, bool force);  // 顶栏联动：展开/收起态同步（定义在下方）
+void UpdateKeepTopWorkArea(AppState& s, bool refitMaximized);  // 保持顶栏：工作区（定义在下方）
+bool ReloadDockConfigFromRegistry(AppState& s);  // 配置轮询：外部改动拉回（定义在下方）
+void ApplyKeepTopEnabled(AppState& s, bool enabled, bool refitMaximized);  // 定义在下方
+void ToggleKeepTopFromMenu(AppState& s);  // 右键菜单切换「保持顶栏」（定义在下方）
 void RequestCloseByIndex(AppState& s, size_t idx);  // 中键关闭：固定项隐藏圆点，临时项直接移除
 size_t FindItemByKey(AppState& s, const std::wstring& key);          // 按 key 定位条目
 void BeginDockPress(AppState& s, size_t idx, POINT pt);              // 固定区按下
@@ -1717,7 +2034,7 @@ void ProcessDockDragUp(AppState& s, POINT client);                   // 松手�
 // 屏幕下边缘区域；光标触碰即从收起状态升起
 bool InDockStrip(POINT pt) {
     const int h = MulDiv(kDockStripHeightLogical, g_state.dpi, 96);
-    const int bottom = g_primaryWorkArea.bottom;
+    const int bottom = PrimaryScreenRect().bottom;  // 贴底一律用整幅画面底边
     // 含 bottom 这一行：物理屏幕最底像素/贴边时系统可能报 sh-1、sh 或 sh+1，
     // 一律算 Dock 有效区，避免最低一列丢失悬停/点击。上界再放宽 2px，
     // 吸收光标贴底时坐标在 sh-1/sh/sh+1 之间的抖动（否则 onDock 每秒
@@ -1733,10 +2050,9 @@ bool PointInDockOrStrip(POINT pt) {
     // 低层鼠标钩子运行在专用线程上，这里只用 UI 线程维护的缓存几何，
     // 绝不调用 GetWindowRect / SystemParametersInfo 等可能等待 UI 线程的
     // 函数——否则 UI 线程一旦阻塞，钩子线程也会被拖住，全局鼠标再次卡死。
-    const RECT wa = g_primaryWorkArea;
+    const int bottom = PrimaryScreenRect().bottom;  // 屏幕底边（非工作区底边）
     const int gap = MulDiv(g_state.bottomGapBase, g_state.dpi, 96);
-    if (pt.y < wa.bottom - gap - g_state.winH) return false;
-    const int bottom = wa.bottom;
+    if (pt.y < bottom - gap - g_state.winH) return false;
     const int left = g_state.winX;
     const int right = left + g_state.winW;
     const int top = g_state.winY;
@@ -1782,6 +2098,29 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
             g_hookLeftDownGlobal = true;
         } else if (wParam == WM_LBUTTONUP) {
             g_hookLeftDownGlobal = false;
+        }
+
+        // 全屏应用（游戏全屏等）运行期间：钩子彻底不介入。
+        // 不判屏幕角部、不吞任何点击（按下/抬起/中键一并放行，全部交给
+        // 全屏应用自己处理），也不投递进出场；按钮配对与进场状态一并复位，
+        // 退出全屏后按光标实际位置重新判定进出场。
+        // 放行/恢复各记一条日志（每次让位只记一次，不刷屏）：这是"全屏期间
+        // 钩子确实在跑且确实没介入"的直接证据。
+        static bool s_bypassLogged = false;  // 钩子线程本地
+        if (g_fullscreenActive.load(std::memory_order_relaxed)) {
+            if (!s_bypassLogged) {
+                s_bypassLogged = true;
+                Logf(L"[全屏] 低层鼠标钩子进入放行态：不判角部/不吞点击/不投递进出场");
+            }
+            g_hookLeftDownOnDock = false;
+            g_hookMiddleDownOnDock = false;
+            g_hookPressOnDock = false;
+            g_hookLastOnDock = false;
+            return CallNextHookEx(nullptr, code, wParam, lParam);
+        }
+        if (s_bypassLogged) {
+            s_bypassLogged = false;
+            Logf(L"[全屏] 低层鼠标钩子恢复介入：全屏已退出，角部/触发条/点击采集照常");
         }
 
         // 右键菜单（TrackPopupMenu）打开期间，低层钩子必须完全放行鼠标事件，
@@ -2001,6 +2340,11 @@ void CALLBACK DockWinEventProc(HWINEVENTHOOK /*hook*/, DWORD event, HWND hwnd,
         }
         return;
     }
+    if (event == EVENT_SYSTEM_FOREGROUND) {
+        // 前台切换：全屏应用（游戏全屏）进出大多由此暴露，立即复核让位状态
+        PostMessageW(g_state.hwnd, kMsgFullscreen, 0, 0);
+        return;
+    }
     if (idObject != OBJID_WINDOW) return;  // 只关心窗口级事件
     PostMessageW(g_state.hwnd, kMsgRefresh, 0, 0);
 }
@@ -2015,8 +2359,14 @@ void InstallDockWinEventHook() {
         EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
         GetModuleHandleW(nullptr), DockWinEventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT);
+    // 前台切换：全屏应用（游戏全屏）让位复核（事件级，替代轮询前台窗口）
+    HWINEVENTHOOK h3 = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+        GetModuleHandleW(nullptr), DockWinEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT);
     if (h1) g_winEventHooks.push_back(h1);
     if (h2) g_winEventHooks.push_back(h2);
+    if (h3) g_winEventHooks.push_back(h3);
     if (g_winEventHooks.empty()) {
         Logf(L"WinEvent 钩子安装失败（回退 60s 保底轮询）");
     }
@@ -2491,8 +2841,8 @@ SIZE DesiredWindowSize(AppState& s) {
     const float hGrow = (kMaxScale - 1.0f) * kIconSize * k;  // 放大增高预算
     const float h = kShadowMargin * k + kShadowBottom * k + kPadTop * k +
                     kIconSize * k + hGrow + kPadBottom * k + 4.f * k;
-    RECT wa = PrimaryWorkArea();
-    const int capPx = static_cast<int>((wa.right - wa.left) * 0.92f);
+    const RECT screen = PrimaryScreenRect();  // 宽度上限同样以整幅画面为准
+    const int capPx = static_cast<int>((screen.right - screen.left) * 0.92f);
     SIZE sz{std::min(static_cast<int>(w + 0.5f), capPx),
             static_cast<int>(h + 0.5f)};
     return sz;
@@ -2503,10 +2853,21 @@ SIZE DesiredWindowSize(AppState& s) {
 // 全部使用同一位置源，避免"ULW 展示收起位、SetWindowPos 拉回展开位"的
 // 打架（此前导致窗口矩形跳变、几何事件风暴与展开不稳定）
 void UpdateDockPosition(AppState& s) {
-    RECT wa = PrimaryWorkArea();
+    // 一律以「本屏整幅画面」贴底居中：工作区在「保持顶栏」模式下会被抬高
+    // （让出顶栏与 Dock 高度带），用工作区定位会把 Dock 自己顶上去形成
+    // 正反馈（预留越多 → Dock 越高 → 预留更多）
+    const RECT screen = PrimaryScreenRect();
     const int gap = MulDiv(s.bottomGapBase, s.dpi, 96);
-    s.winX = wa.left + ((wa.right - wa.left) - s.winW) / 2;
-    s.winY = wa.bottom - gap - s.winH +
+    // BottomGap 量的是「看得见的毛玻璃底边」到屏幕底边之间的空隙，
+    // 且按空行数计：玻璃占据的最低一行 = 屏幕底边 - gap - 1。
+    // 由该约束反解窗口 y（不再靠 winH 相减，避免四舍五入差一行）：
+    //   玻璃底边(屏幕) = 窗口 y + winH - kShadowBottom*k
+    const float k = (s.scale > 0.f) ? s.scale : 1.f;
+    const int glassBottom = screen.bottom - gap - 1;
+    const int glassBottomLocal =
+        s.winH - static_cast<int>(kShadowBottom * k + 0.5f);
+    s.winX = screen.left + ((screen.right - screen.left) - s.winW) / 2;
+    s.winY = glassBottom - glassBottomLocal +
              static_cast<int>(s.collapseOffset + 0.5f);
 }
 
@@ -2531,7 +2892,7 @@ void EnsureWindowSize(AppState& s) {
 }
 
 // 当前峰值缩放（毛玻璃随之长高：macOS 风格，悬停时整条向上生高）
-float CurrentPeakScale(AppState& s) {
+float CurrentPeakScale(const AppState& s) {
     float peak = 1.0f;
     for (const auto& it : s.items) {
         if (it.scaleAnim > peak) peak = it.scaleAnim;
@@ -2598,29 +2959,44 @@ bool UpdateLayoutOneFrame(AppState& s) {
             // 或 GetWindowRect 的旧矩形：收起动画第一帧窗口尚未实际下移，
             // 旧矩形会把刚从顶边离开的光标误判回区内，立即撤销刚发起的收起
             // （17:15:27 事故：收起被“自愈”荡回，Dock 滞留展开 5.5 秒）。
-            const RECT wa = g_primaryWorkArea;
+            const RECT screen = g_primaryScreen;
             const int effGap = MulDiv(s.bottomGapBase, s.dpi, 96);
-            const int effTop = wa.bottom - effGap - s.winH +
+            const int effTop = screen.bottom - effGap - s.winH +
                                static_cast<int>(s.collapseOffset + 0.5f);
-            s.mouseOverDock =
-                (cp.x >= s.winX && cp.x < s.winX + s.winW &&
-                 cp.y >= effTop && cp.y <= wa.bottom + 2) ||
-                InDockStrip(cp);
-            if (s.mouseOverDock) {
-                if (!s.wasOnDock || s.hideRequested) {
-                    // 诊断：帧间自愈进场（钩子事件缺失/折返的旁证）
-                    Logf(L"[帧] 自愈进场 光标=(%d,%d) 目标顶边=%d wasOnDock=%d "
-                         L"hideRequested=%d → 复位收起请求",
-                         cp.x, cp.y, effTop, s.wasOnDock ? 1 : 0,
-                         s.hideRequested ? 1 : 0);
+            // 全屏让位期间不做进场自愈：Dock 已完全滑出/隐藏，光标位置不
+            // 构成"应展开"的理由（否则会立刻撤销收起请求、把 Dock 拉到全屏
+            // 画面上）；真值一律按"不在场内"处理
+            if (s.fullscreenActive) {
+                s.mouseOverDock = false;
+            } else {
+                // 只用「毛玻璃本体 ∪ 屏幕下缘触发条」判定，不再用整窗矩形
+                // 一路延伸到屏幕底边（那是"还没碰到图形就 hover"的根因）
+                s.mouseOverDock = OnDockPointer(s, cp, effTop);
+                if (s.mouseOverDock) {
+                    if (!s.wasOnDock || s.hideRequested) {
+                        // 诊断：帧间自愈进场（钩子事件缺失/折返的旁证）
+                        const float kNow = (s.scale > 0.f) ? s.scale : 1.f;
+                        const RectF bodyNow =
+                            BodyRectForPeak(kNow, s.winW, s.winH,
+                                            CurrentPeakScale(s));
+                        Logf(L"[帧] 自愈进场 光标=(%d,%d) 目标顶边=%d wasOnDock=%d "
+                             L"hideRequested=%d → 复位收起请求"
+                             L"（毛玻璃屏幕矩形=[%d,%d..%d,%d]）",
+                             cp.x, cp.y, effTop, s.wasOnDock ? 1 : 0,
+                             s.hideRequested ? 1 : 0,
+                             s.winX + static_cast<int>(bodyNow.X),
+                             effTop + static_cast<int>(bodyNow.Y),
+                             s.winX + static_cast<int>(bodyNow.X + bodyNow.Width),
+                             effTop + static_cast<int>(bodyNow.Y + bodyNow.Height));
+                    }
+                    s.wasOnDock = true;
+                    if (s.hideRequested) s.hideRequested = false;
                 }
-                s.wasOnDock = true;
-                if (s.hideRequested) s.hideRequested = false;
             }
             // 命中区覆盖到“屏幕底边”（含 Dock 与屏幕下边缘之间的整段空隙），
             // 不再把空隙坐标向上钳制到窗口内，最低一行也能直接命中。
             // +1 让“屏幕底边这一行”（y==bottom）也落入命中区间。
-            const int bottom = PrimaryWorkArea().bottom;
+            const int bottom = PrimaryScreenRect().bottom;  // 屏幕底边（非工作区）
             hitBottomY = static_cast<float>(bottom - wr.top + 1);
         }
     }
@@ -2730,6 +3106,28 @@ bool UpdateLayoutOneFrame(AppState& s) {
     float x = body.X + std::max((body.Width - used) * 0.5f, 0.f) +
               kBarPadX * k;
     const float iconBottom = body.Y + body.Height - kPadBottom * k;
+
+    // 「保持顶栏」模式：把毛玻璃顶边的真实屏幕坐标记一行日志（只在变化时写），
+    // 供让出的高度带对账：KeepTopDockReserve 必须让最大化窗口底边正好落在
+    // 这里 2px 之上（keep_top.h 的 kMaxWindowToDockGapBase）。
+    // 注意：此处 body 按当前悬停峰值算，悬停放大时毛玻璃顶边更高（顶部生长），
+    // 故「实际间距」只在静止态等于目标值，其余时候 ≥ 目标值。
+    if (s.keepTopReserve > 0) {
+        const int glassTopScreen = s.winY + static_cast<int>(body.Y + 0.5f);
+        const int reserveGapPx =
+            MulDiv(keeptop::kMaxWindowToDockGapBase, s.dpi, 96);
+        // 每个「让出高度带」只记一条：预留值一变（模式切换 / 自动收起切换 /
+        // 顶栏高度变化）就重新记一条，方便事后对账
+        static int s_lastGlassForReserve = -1;
+        if (s_lastGlassForReserve != s.keepTopReserve) {
+            s_lastGlassForReserve = s.keepTopReserve;
+            const int waBottom = PrimaryScreenRect().bottom - s.keepTopReserve;
+            Logf(L"[保持顶栏] 毛玻璃顶边对账：客户y=%.0f 屏幕y=%d 工作区底边=%d "
+                 L"实际间距=%d 目标间距=%d（winY=%d offset=%.1f winH=%d）",
+                 body.Y, glassTopScreen, waBottom, glassTopScreen - waBottom,
+                 reserveGapPx, s.winY, s.collapseOffset, s.winH);
+        }
+    }
 
     s.separatorX = -1.0f;
     bool animLeft = activeAny;
@@ -4886,6 +5284,9 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
                                  ? MF_CHECKED
                                  : MF_UNCHECKED),
                 kMenuToggleLog, L"运行日志（记录展开收起诊断）");
+    AppendMenuW(menu,
+                MF_STRING | (s.keepTopEnabled ? MF_CHECKED : MF_UNCHECKED),
+                kMenuToggleKeepTop, L"保持顶栏");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuExit, L"退出桌面 Dock");
 
@@ -4910,6 +5311,14 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
         Logf(s.autoCollapse ? L"自动收起：开启" : L"自动收起：关闭");
         // 顶栏联动即时生效：关闭自动收起 → 顶栏恢复默认桌面层；开启 → 按当前态同步
         SyncTopBarDockState(s, true);
+        // 「保持顶栏」模式：自动收起开关决定 Dock 高度带是否预留
+        // （常驻可见时让出，收在屏幕外时不让），切换即重算工作区
+        UpdateKeepTopWorkArea(s, /*refitMaximized=*/true);
+        return;
+    }
+    if (cmd == kMenuToggleKeepTop) {
+        Logf(L"右键菜单：选中「保持顶栏」（当前%s）", s.keepTopEnabled ? L"开启" : L"关闭");
+        ToggleKeepTopFromMenu(s);
         return;
     }
     if (cmd == kMenuToggleLog) {
@@ -4981,6 +5390,9 @@ void ShowBlankContextMenu(AppState& s) {
                                  ? MF_CHECKED
                                  : MF_UNCHECKED),
                 kMenuToggleLog, L"运行日志（记录展开收起诊断）");
+    AppendMenuW(menu,
+                MF_STRING | (s.keepTopEnabled ? MF_CHECKED : MF_UNCHECKED),
+                kMenuToggleKeepTop, L"保持顶栏");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuExit, L"退出桌面 Dock");
 
@@ -5002,6 +5414,13 @@ void ShowBlankContextMenu(AppState& s) {
         Logf(s.autoCollapse ? L"自动收起：开启" : L"自动收起：关闭");
         // 顶栏联动即时生效：关闭自动收起 → 顶栏恢复默认桌面层；开启 → 按当前态同步
         SyncTopBarDockState(s, true);
+        // 「保持顶栏」模式：自动收起开关决定 Dock 高度带是否预留
+        // （常驻可见时让出，收在屏幕外时不让），切换即重算工作区
+        UpdateKeepTopWorkArea(s, /*refitMaximized=*/true);
+    } else if (cmd == kMenuToggleKeepTop) {
+        Logf(L"空白区右键菜单：选中「保持顶栏」（当前%s）",
+             s.keepTopEnabled ? L"开启" : L"关闭");
+        ToggleKeepTopFromMenu(s);
     } else if (cmd == kMenuToggleLog) {
         ToggleLogEnabled();
     } else if (cmd == kMenuExit) {
@@ -5012,10 +5431,42 @@ void ShowBlankContextMenu(AppState& s) {
     SetFrameCadence(s, true);
 }
 
+// ============================== 「保持顶栏」模式开关 ==============================
+// 开关持久化在同一注册表键（keep_top.h），Dock 与顶栏读同一份值。
+// Dock 侧生效动作只有两件：重算工作区（唯一写入者）、把模式投递给顶栏。
+// refitMaximized：模式切换由用户显式触发，需要把已最大化的窗口一并重排；
+// 轮询/查询路径传 false，避免无谓地把人家的窗口 restore/maximize 一遍。
+void ApplyKeepTopEnabled(AppState& s, bool enabled, bool refitMaximized) {
+    if (!s.hwnd) return;
+    if (enabled == s.keepTopEnabled) {
+        // 状态没变也要对齐工作区（Dock 高度带/顶栏高度可能已变）
+        UpdateKeepTopWorkArea(s, refitMaximized);
+        return;
+    }
+    s.keepTopEnabled = enabled;
+    Logf(L"[保持顶栏] 模式%s（顶栏高度=%d 自动收起=%d Dock预留=%d）",
+         enabled ? L"开启" : L"关闭", TopBarHeightForWorkArea(),
+         s.autoCollapse ? 1 : 0, KeepTopDockReserve());
+    UpdateKeepTopWorkArea(s, /*refitMaximized=*/true);
+    SyncTopBarDockState(s, true);  // 顶栏层级立即对齐（模式变化优先级高于联动）
+}
+
+// 右键菜单 / 宿主托盘菜单共用：切换并持久化「保持顶栏」
+void ToggleKeepTopFromMenu(AppState& s) {
+    const bool enable = !s.keepTopEnabled;
+    if (!keeptop::SetEnabledInRegistry(enable)) {
+        Logf(L"[保持顶栏] 注册表写入失败（模式仅本次运行生效）");
+    }
+    ApplyKeepTopEnabled(s, enable, /*refitMaximized=*/true);
+}
+
 // ============================== 主循环一帧 ==============================
 
 // 收起目标偏移：0=展开；winH=完全滑出屏幕底（菜单打开/拖拽重排期间保持展开）
 float CollapseTargetOf(const AppState& s) {
+    // 全屏应用让位优先于一切：游戏/全屏视频在前台时 Dock 只许完全滑出，
+    // 不因菜单打开、拖拽重排等交互理由维持展开
+    if (s.fullscreenActive) return static_cast<float>(s.winH);
     return (s.autoCollapse && s.hideRequested && !s.menuOpen &&
             s.dragPhase == DockDragPhase::None)
                ? static_cast<float>(s.winH)
@@ -5025,7 +5476,9 @@ float CollapseTargetOf(const AppState& s) {
 // 顶栏联动派生状态：1=顶栏置顶并覆盖所有窗口（与 Dock 一样，含当前聚焦窗口）
 // / 0=顶栏默认策略（只不遮挡当前聚焦窗口，让位其余情况照旧）。
 // 自动收起关闭时恒为 0 → 顶栏行为不变（默认策略）。
-int TopBarLinkStateOf(const AppState& s) {
+int TopBarLinkStateOf(AppState& s) {
+    // 「保持顶栏」优先：开启即恒置顶层（不受 Dock 展开/收起联动影响）
+    if (s.keepTopEnabled) return 2;
     return (s.autoCollapse && CollapseTargetOf(s) == 0.0f) ? 1 : 0;
 }
 
@@ -5055,6 +5508,73 @@ void SetFrameCadence(AppState& s, bool fast) {
     }
 }
 
+// ===== 全屏应用让位（游戏全屏 / 全屏视频 / 演示模式）=====
+// 判定口径与排除规则见 fullscreen_guard.h。命中后：
+//   进入：取消拖拽、复位悬停真值、置收起请求 → 帧驱动把 Dock 完全滑出屏幕底，
+//         滑出收敛后由 FrameTick 把窗口 SW_HIDE（连一个像素都不留在屏上，
+//         也避免 WS_EX_TOPMOST 分层窗与独占全屏游戏抢 Z 序/抢画面）；
+//         低层钩子同时被 g_fullscreenActive 挡下（不吞点击、不判角部）；
+//         顶栏联动状态一并刷新（Dock 不再展开 → 顶栏回默认层）。
+//   退出：还原窗口显示（保持收起态，触碰下缘才升起），窗口与工作区重新对齐。
+// 调用点（三条互补路径，见各自注释）：
+//   1. WinEvent 前台切换（kMsgFullscreen，事件级、<10ms）；
+//   2. 2s 保底定时器 + 60s DoPoll（Alt+Enter 原地切全屏这类无前台切换的场景）；
+//   3. 低层钩子报告「光标进入下缘触发条」时当场复核（闭掉最长 2s 的判定窗口）。
+// immediate=true：不等滑出动画，直接落到完全滑出位并隐藏窗口（启动即全屏用）。
+void UpdateFullscreenState(AppState& s, bool immediate = false) {
+    if (!s.hwnd) return;
+
+    const fsguard::Result r = fsguard::Detect();
+    bool active = r.fullscreen;
+    // 只认本 Dock 所在显示器上的全屏应用：副屏全屏（如另一块屏放全屏视频）
+    // 不该收走主屏 Dock
+    if (active && r.monitor) {
+        RECT wa = PrimaryWorkArea();
+        const HMONITOR dockMon = MonitorFromRect(&wa, MONITOR_DEFAULTTONEAREST);
+        if (dockMon && dockMon != r.monitor) active = false;
+    }
+    if (active == s.fullscreenActive) return;
+
+    s.fullscreenActive = active;
+    g_fullscreenActive.store(active, std::memory_order_relaxed);
+
+    if (active) {
+        Logf(L"[全屏] 全屏应用占用本屏 → Dock 让位（%ls）hwnd=0x%X 几何=%d "
+             L"shell=%d",
+             r.note, static_cast<unsigned>(
+                         reinterpret_cast<UINT_PTR>(r.hwnd)),
+             r.byGeometry ? 1 : 0, r.byShell ? 1 : 0);
+        if (s.dragPhase != DockDragPhase::None) ResetDockDrag(s);
+        s.mouseOverDock = false;
+        s.mouseInside = false;
+        s.wasOnDock = false;
+        s.hideRequested = true;
+        if (immediate && s.winH > 0) {
+            s.collapseOffset = static_cast<float>(s.winH);
+            if (!s.winHiddenByFullscreen) {
+                s.winHiddenByFullscreen = true;
+                ShowWindow(s.hwnd, SW_HIDE);
+            }
+        }
+        s.needsRedraw = true;
+        SetFrameCadence(s, true);  // 滑出动画（immediate 时也已到位，收一拍）
+        SyncTopBarDockState(s, true);
+    } else {
+        Logf(L"[全屏] 全屏应用已退出 → Dock 恢复常驻（保持收起，触碰下缘展开）");
+        if (s.winHiddenByFullscreen) {
+            s.winHiddenByFullscreen = false;
+            ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+            RepositionDock(s, true);
+        }
+        s.hideRequested = true;  // 退出全屏后不自行升起，等光标触碰下缘
+        s.wasOnDock = false;
+        s.mouseOverDock = false;
+        s.needsRedraw = true;
+        SetFrameCadence(s, true);
+        SyncTopBarDockState(s, true);
+    }
+}
+
 // 全量刷新（事件驱动回调 + 60s 保底）：条目/尺寸/任务栏/组件自愈
 void DoPoll(AppState& s) {
     s.lastPollTick = GetTickCount64();
@@ -5064,6 +5584,7 @@ void DoPoll(AppState& s) {
     RefreshSuiteWindowCache();     // 组件可能重启/重建窗口，刷新自愈缓存
     HealMinimizedSuiteWindows();   // 保底（正常由 WinEvent 即时触发）
     RefreshPrimaryWorkArea();      // 保底刷新工作区缓存（分辨率/任务栏变化）
+    UpdateFullscreenState(s);      // 全屏让位保底复核（事件路径之外的兜底）
     // 停帧安全网：收起偏移与目标不一致说明事件路径漏踢帧，重启帧驱动
     if (s.collapseOffset != CollapseTargetOf(s)) SetFrameCadence(s, true);
     if (s.needsRedraw) {
@@ -5108,6 +5629,16 @@ void FrameTick(AppState& s) {
     const bool collapseAnimating =
         s.collapseOffset != 0.f && s.collapseOffset != static_cast<float>(s.winH);
 
+    // 全屏让位：滑出动画收敛后把窗口整体藏起来（连一个像素都不留在屏上，
+    // 避免 WS_EX_TOPMOST 分层窗与全屏游戏抢画面；退出全屏时由
+    // UpdateFullscreenState 还原显示）
+    if (s.fullscreenActive && !s.winHiddenByFullscreen &&
+        s.collapseOffset >= static_cast<float>(s.winH) - 0.5f) {
+        s.winHiddenByFullscreen = true;
+        ShowWindow(s.hwnd, SW_HIDE);
+        Logf(L"[全屏] 让位收尾：Dock 窗口已隐藏（winH=%d）", s.winH);
+    }
+
     // 顶栏联动：展开/收起意图翻转即同步给顶栏（去重投递，顶栏据此在
     // 置顶/桌面层之间切换）。所有能翻转状态的路径（钩子进出场、拖拽收尾、
     // 菜单切换、帧内自愈）都会踢帧，因此在帧上做一次集中同步即可覆盖，
@@ -5131,6 +5662,47 @@ void FrameTick(AppState& s) {
     SetFrameCadence(s, animating || collapseAnimating ||
                            !s.pendingLaunches.empty() ||
                            s.dragPhase == DockDragPhase::Dragging);
+}
+
+// 配置轮询（2s）：把注册表里被外部改动过的 Dock 配置拉回来。
+// 目前关注两项 ——
+//   BottomGap：Dock 距屏幕底部的间隙（用户改它 = 想调 Dock 站的高度）
+//   AutoCollapse：自动收起（同时决定「保持顶栏」是否让出 Dock 高度带）
+// 变化时立刻重摆位置/重算工作区并踢一帧；没变化就是 3 次注册表读取，零副作用。
+// 返回是否发生了变化。
+bool ReloadDockConfigFromRegistry(AppState& s) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegPath, 0, KEY_READ, &key) !=
+        ERROR_SUCCESS) {
+        return false;
+    }
+    const int gap = std::clamp<int>(
+        static_cast<int>(ReadRegDword(key, L"BottomGap",
+                                      static_cast<DWORD>(s.bottomGapBase))),
+        0, 200);
+    // 旧版本默认 6（悬空）→ 新版本默认 0（贴底）的迁移，与 LoadConfig 同口径
+    const int gapMigrated = (gap == 6) ? 0 : gap;
+    const bool autoCollapse =
+        ReadRegDword(key, L"AutoCollapse", s.autoCollapse ? 1 : 0) != 0;
+    RegCloseKey(key);
+
+    bool changed = false;
+    if (gapMigrated != s.bottomGapBase) {
+        Logf(L"配置变化：Dock 距屏幕底部间隙 %d → %d px", s.bottomGapBase,
+             gapMigrated);
+        s.bottomGapBase = gapMigrated;
+        changed = true;
+    }
+    if (autoCollapse != s.autoCollapse) {
+        Logf(L"[保持顶栏] 自动收起被外部改为 %d → 重算工作区"
+             L"（hideRequested=%d offset=%.1f winH=%d）",
+             autoCollapse ? 1 : 0, s.hideRequested ? 1 : 0, s.collapseOffset,
+             s.winH);
+        s.autoCollapse = autoCollapse;
+        if (!s.autoCollapse) s.hideRequested = false;
+        changed = true;
+    }
+    return changed;
 }
 
 // ===== 收起状态监视（诊断、只记录不干预）=====
@@ -5316,7 +5888,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case kMsgHookMouse: {
             const bool onDock = wParam != 0;
             const POINT hsPos{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-            s->mouseOverDock = onDock;
+            // 全屏让位第三条路径：光标真触到下缘触发条时当场复核一次全屏
+            // 状态（前台事件与 2s 保底之外，闭掉最长 2s 的判定窗口）——
+            // 命中则一步都不下发展开
+            if (onDock && !s->fullscreenActive) UpdateFullscreenState(*s);
+            if (s->fullscreenActive) {
+                s->mouseOverDock = false;
+                Logf(L"[全屏] 屏蔽下缘触发/进出场：全屏应用运行中（光标=(%d,%d) "
+                     L"进=%d）",
+                     hsPos.x, hsPos.y, onDock ? 1 : 0);
+                return 0;
+            }
+            // 钩子线程送来的位置同样按「毛玻璃本体 ∪ 触发条」复核一次：
+            // 窗口矩形里的阴影/留白不算碰到 Dock（悬停放大只认看得见的部分）
+            s->mouseOverDock = onDock && OnDockPointer(*s, hsPos);
             if (onDock) {
                 if (!s->wasOnDock || s->hideRequested) {
                     // 诊断：进场（含收起途中折返：收起-展开跳动即在此留下记录）
@@ -5430,9 +6015,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         // 顶栏启动/重置时查询联动状态：以返回值应答当前展开态（顶栏先行
         // 计算初始层级/风格），同时按需补投递一次状态消息对齐去重缓存。
+        // 返回值：2 = 「保持顶栏」模式（恒置顶）/ 1 = 联动展开 / 0 = 默认策略。
         case kMsgTopBarDockQuery: {
             SyncTopBarDockState(*s, true);
             return TopBarLinkStateOf(*s);
+        }
+
+        // 宿主托盘菜单「保持顶栏」：写注册表的是发起方，这里重读并生效。
+        // wParam = 0 仅重读（以注册表为准）/ 1 强制打开 / 2 强制关闭。
+        case kMsgDockKeepTopSet: {
+            bool enable = keeptop::IsEnabledFromRegistry();
+            if (wParam == 1) enable = true;
+            else if (wParam == 2) enable = false;
+            ApplyKeepTopEnabled(*s, enable, /*refitMaximized=*/true);
+            return 0;
         }
 
         // 固定区拖拽重排（低层钩子按钮态采集 → UI 线程执行）：
@@ -5503,6 +6099,38 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (wParam == kSafetyTimerId) {
                 DoPoll(*s);  // 事件失效保底（1 次/分钟）
             } else if (wParam == kCollapseWatchTimerId) {
+                // 2s 保底：全屏应用进出（如 Alt+Enter 原地切全屏、全屏窗口
+                // 原地退出，都不产生前台切换事件）必须在这里兜住
+                UpdateFullscreenState(*s);
+                // 「保持顶栏」保底：开关被注册表外部改动（脚本/重启前的残留）、
+                // 顶栏进程内重启后高度变化、Dock 高度带变化都要在 2s 内对齐
+                // （ApplyWorkArea 幂等，目标不变时零系统调用）
+                {
+                    // 先把外部改过的 Dock 配置（间隙 / 自动收起）拉回来
+                    const bool cfgChanged = ReloadDockConfigFromRegistry(*s);
+                    if (cfgChanged) {
+                        RepositionDock(*s, true);  // 间隙/收起态变化 → 重新贴底
+                        SetFrameCadence(*s, true);
+                        Logf(L"[保持顶栏] 配置变化后 Dock 屏幕位置=(%d,%d) "
+                             L"间隙=%dpx 自动收起=%d",
+                             s->winX, s->winY, s->bottomGapBase,
+                             s->autoCollapse ? 1 : 0);
+                    } else if (!s->autoCollapse &&
+                               s->collapseOffset != CollapseTargetOf(*s)) {
+                        // 关掉自动收起后 Dock 必须真的升起来：帧驱动若因
+                        // 空闲停摆，这里补一拍（外部改注册表的路径没有
+                        // 鼠标事件来踢帧）
+                        SetFrameCadence(*s, true);
+                    }
+                    const bool regOn = keeptop::IsEnabledFromRegistry();
+                    if (regOn != s->keepTopEnabled) {
+                        ApplyKeepTopEnabled(*s, regOn, /*refitMaximized=*/true);
+                    } else {
+                        // 「保持顶栏」让出的 Dock 高度带依赖间隙/自动收起，
+                        // 这里按新配置重算（幂等：目标不变时零系统调用）
+                        UpdateKeepTopWorkArea(*s, /*refitMaximized=*/true);
+                    }
+                }
                 CollapseWatchdog(*s);  // 诊断：2s 校验「应收未收」并自愈
             } else if (wParam == kTooltipTimerId) {
                 // 悬停名称提示到期：踢一帧完成绘制
@@ -5533,6 +6161,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // WinEvent 事件：套件组件被最小化（Win+D）→ 立即恢复
         case kMsgHeal:
             HealMinimizedSuiteWindows();
+            return 0;
+
+        // WinEvent(EVENT_SYSTEM_FOREGROUND)：前台切换 → 复核全屏让位
+        // （游戏全屏/退出全屏绝大多数伴随前台切换；原地 Alt+Enter 切全屏
+        //  由 2s 保底与下缘触发前复核兜住）
+        case kMsgFullscreen:
+            UpdateFullscreenState(*s);
             return 0;
 
         // 托盘图标触发完成（worker 线程）：确保任务栏保持隐藏并收尾
@@ -5625,6 +6260,7 @@ void ResetDockGlobalsForRestart() {
     g_hookLeftDownOnDock = false;
     g_hookMiddleDownOnDock = false;
     g_skipTrayTriggerOnce = false;
+    g_fullscreenActive.store(false, std::memory_order_relaxed);  // 新一轮运行重新判定
 }
 
 }  // namespace
@@ -5636,6 +6272,7 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
 
     EnableDpiAwareness();
     RefreshPrimaryWorkArea();  // DPI 感知就绪后建立工作区缓存（后续热路径零系统调用）
+    RefreshPrimaryScreen();    // 屏幕整幅画面缓存（Dock 贴底/命中判定基准）
 
     // Shell API（SHGetFileInfo 解析 .lnk / jumbo 图标）需要 STA COM
     HRESULT comInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -5654,6 +6291,8 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
 
     bool configExists = false;
     LoadConfig(s, &configExists);  // 先读配置（含持久化的日志开关），再开日志
+    // 「保持顶栏」开关（与顶栏共用同一注册表键，见 keep_top.h）
+    s.keepTopEnabled = keeptop::IsEnabledFromRegistry();
     if (!configExists) {
         SeedDefaultPinsIfEmpty(s);
         SaveConfig(s);
@@ -5721,6 +6360,13 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
              s.autoCollapse ? 1 : 0, s.collapseOffset, s.winH, cp.x, cp.y,
              PointInDockOrStrip(cp) ? 1 : 0);
     }
+    // 启动即全屏（用户在全屏游戏里启动本套件）：立即让位，不闪一帧
+    UpdateFullscreenState(s, true);
+    // 「保持顶栏」模式：启动时把开关投递给顶栏（顶栏启动早于 Dock 时它已按
+    // 注册表自行生效，此处只是对齐 Dock 侧去重缓存），并把工作区按模式重算
+    // 一次（含已最大化窗口的重排：删除顶栏高度那一段被覆盖的区域）
+    SyncTopBarDockState(s, true);
+    UpdateKeepTopWorkArea(s, /*refitMaximized=*/true);
     // 事件驱动接管（替代定时轮询）：空暇零唤醒
     s.taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
     InstallDockWinEventHook();   // 窗口集合变化 / Win+D 最小化自愈

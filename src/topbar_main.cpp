@@ -29,6 +29,12 @@
 //      Dock 展开：顶栏与 Dock 一样提升为置顶层，覆盖所有窗口
 //      （含当前聚焦窗口，此时不让位）；
 //      Dock 收起：回到默认策略（只不遮挡当前聚焦窗口）。
+//   8. 「保持顶栏」模式（托盘图标右键菜单勾选，注册表持久化，见 keep_top.h）：
+//      顶栏恒贴在屏幕最上方、恒为置顶层，不再为当前聚焦窗口让位；
+//      工作区由 Dock 统一让出顶栏高度（最大化窗口只填充顶栏以下），
+//      因此本模式下顶栏与最大化窗口天然不重叠；
+//      全屏应用（游戏全屏 / 全屏视频 / 演示模式，判定见 fullscreen_guard.h）
+//      占用本屏时顶栏整体隐藏，退出全屏自动恢复。
 
 #ifndef UNICODE
 #define UNICODE
@@ -74,6 +80,8 @@
 #include <vector>
 
 // Chrome 标签同步：纯逻辑层（JSON / SHA-1 / Base64 / WS 帧 / 同步模型）
+#include "fullscreen_guard.h"  // 保持顶栏：全屏应用让位判定（与 Dock 共用口径）
+#include "keep_top.h"          // 「保持顶栏」模式（注册表开关，与 Dock 共用）
 #include "topbar_ws_proto.h"
 #include "widgets.h"
 
@@ -186,6 +194,13 @@ constexpr UINT kDockFocusQueryMsg = WM_APP + 16;
 // 1 覆盖所有窗口 / 0 默认策略；Dock 未运行/超时则按默认策略处理）。
 // 与 dock_main.cpp 同值。
 constexpr UINT kDockStateQueryMsg = WM_APP + 15;
+// ← 宿主托盘菜单「保持顶栏」：请求立即按注册表重读开关并生效（顶栏层级、
+// 全屏让位）。wParam = 0 仅重读（以注册表为准）。与 mywigets_main.cpp 同值。
+constexpr UINT kKeepTopRefreshMsg = WM_APP + 18;
+// 「保持顶栏」模式下的全屏让位复核周期（ms）。全屏应用占用本屏时顶栏整体
+// 隐藏（用户要求：全屏游戏等场景顶栏不参与显示）；SHQueryUserNotificationState
+// 约 75µs，只在模式开启期间按 2s 复核，不进任何高频路径。
+constexpr UINT kKeepTopFullscreenCheckMs = 2000;
 
 constexpr int kMenuExit = 1001;
 
@@ -256,6 +271,13 @@ struct AppState {
     // 覆盖所有窗口，含当前聚焦窗口，此时不做让位）。
     // Dock 未运行/自动收起关闭时恒为 false（走默认策略）。
     bool dockLinkExpanded = false;
+    // 「保持顶栏」模式（见 keep_top.h）：恒置顶层 + 从不为聚焦窗口让位。
+    // 由托盘菜单切换（注册表持久化），Dock 侧消息与启动时读注册表两路同步。
+    bool keepTopEnabled = false;
+    // 模式下的全屏让位：前台出现铺满本屏的应用（游戏全屏等）时整体隐藏，
+    // 退出全屏恢复显示。keepTopHidden 记录"是本功能把顶栏藏起来的"。
+    bool keepTopHidden = false;
+    ULONGLONG lastKeepTopFullscreenCheck = 0;
     // 默认层级策略（Dock 未联动展开时）：只不遮挡当前聚焦窗口 ——
     //   barYielding = true  让位态：目标窗口与顶栏矩形重叠，顶栏摘掉置顶位
     //       并紧贴 barAnchorHwnd 之下（被它盖住），仍高于其它非聚焦窗口；
@@ -671,6 +693,9 @@ void DrawBarAndPresent(AppState& s);        // 前置声明（定义在下方）
 bool TargetOverlapsBar(AppState& s);
 void ApplyBarLayer(AppState& s, bool force);
 void HealBarLayer(AppState& s);
+// 「保持顶栏」模式：开关落地与全屏让位复核（定义在下方）
+void SetKeepTopEnabled(AppState& s, bool enabled);
+bool CheckKeepTopFullscreen(AppState& s, bool force);
 void RetargetLocationHook(HWND target);
 void SetVolumeOpen(AppState& s, bool open);
 
@@ -3045,6 +3070,8 @@ bool TargetOverlapsBar(AppState& s) {
 }
 
 // 顶栏层级对齐（幂等；只切层级与风格，不动位置/尺寸/可见性）：
+//   0. 「保持顶栏」模式（keepTopEnabled）：恒置顶层，任何情况都不让位 ——
+//      工作区已由 Dock 让出顶栏高度，最大化窗口不会压到顶栏；
 //   1. Dock 联动展开（dockLinkExpanded）：置顶层，覆盖所有窗口 ——
 //      包含当前聚焦窗口，此时不让位（Dock 展开是用户显式召唤）；
 //   2. 默认 + 目标窗口与顶栏重叠：让位态 —— 摘掉置顶位，紧贴目标窗口
@@ -3055,7 +3082,8 @@ bool TargetOverlapsBar(AppState& s) {
 // force=true 强制重设一次（启动、DPI 变化后确认风格位与 Z 序真的生效）；
 // 状态未变且非 force 时直接返回 —— LOCATIONCHANGE 事件高频触发，不能每次都动窗口。
 void ApplyBarLayer(AppState& s, bool force) {
-    const bool yield = !s.dockLinkExpanded && TargetOverlapsBar(s);
+    const bool yield =
+        !s.keepTopEnabled && !s.dockLinkExpanded && TargetOverlapsBar(s);
     const HWND anchor = yield ? s.targetHwnd : nullptr;
     const int applied = yield ? 1 : 0;
 
@@ -3110,6 +3138,73 @@ void HealBarLayer(AppState& s) {
     }
 }
 
+// ===== 「保持顶栏」模式 =====
+// 模式语义与注册表定义见 keep_top.h；工作区（让出顶栏高度、视模式让出 Dock
+// 高度带）由 Dock 统一写入，顶栏侧只负责两件事：
+//   1. 层级：恒置顶、从不让位（ApplyBarLayer / WM_WINDOWPOSCHANGING 已按开关分支）；
+//   2. 全屏让位：前台出现铺满本屏的应用（游戏全屏 / 全屏视频 / 演示模式）时
+//      整体隐藏，退出全屏自动恢复 —— 用户要求"全屏除外"。
+// 判定口径与 Dock 完全一致（fullscreen_guard.h + 只认本屏），避免两者分歧。
+
+// 全屏让位复核：返回是否发生了变化（调用方据此决定要不要重绘）。
+// immediateOnly=false 时按时间节流（默认 2s），避免每秒调 SHQueryUserNotificationState。
+bool CheckKeepTopFullscreen(AppState& s, bool force) {
+    if (!s.keepTopEnabled) {
+        // 模式关闭：若此前因全屏隐藏过，恢复显示
+        if (s.keepTopHidden) {
+            s.keepTopHidden = false;
+            ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+            ApplyBarLayer(s, true);
+        }
+        return false;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (!force && now - s.lastKeepTopFullscreenCheck < kKeepTopFullscreenCheckMs) {
+        return false;
+    }
+    s.lastKeepTopFullscreenCheck = now;
+
+    const fsguard::Result r = fsguard::Detect();
+    bool fullscreen = r.fullscreen;
+    // 只认本屏（主屏）上的全屏应用：副屏全屏不影响主屏顶栏
+    if (fullscreen && r.monitor) {
+        const HMONITOR primary = fsguard::PrimaryMonitor();
+        if (primary && r.monitor != primary) fullscreen = false;
+    }
+    // 顶栏自己在前台不算全屏（保险：Detect 已排除套件窗口）
+    if (fullscreen && r.hwnd == s.hwnd) fullscreen = false;
+
+    if (fullscreen == s.keepTopHidden) return false;  // 状态未变
+    if (fullscreen) {
+        s.keepTopHidden = true;
+        ShowWindow(s.hwnd, SW_HIDE);  // 全屏应用期间顶栏整体不显示
+    } else {
+        s.keepTopHidden = false;
+        ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+        ApplyBarLayer(s, true);  // 恢复显示后强制对齐一次层级（恒置顶）
+    }
+    return true;
+}
+
+// 应用「保持顶栏」开关（幂等）。调用点：启动读注册表、Dock 状态消息
+// （wParam=2）、宿主托盘 kKeepTopRefreshMsg。
+// 关闭时恢复默认层级策略（按 Dock 联动/聚焦目标重新判定）。
+void SetKeepTopEnabled(AppState& s, bool enabled) {
+    if (enabled == s.keepTopEnabled) {
+        if (enabled) CheckKeepTopFullscreen(s, /*force=*/true);
+        return;
+    }
+    s.keepTopEnabled = enabled;
+    s.barLayerApplied = -1;  // 层级策略变化：强制重新应用一次
+    if (!enabled && s.keepTopHidden) {
+        // 关闭模式时若正被全屏藏起：恢复显示（默认策略下全屏本就压着顶栏）
+        s.keepTopHidden = false;
+        ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+    }
+    ApplyBarLayer(s, true);
+    if (enabled) CheckKeepTopFullscreen(s, /*force=*/true);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     AppState* s = nullptr;
     if (msg == WM_NCCREATE) {
@@ -3161,13 +3256,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_WINDOWPOSCHANGING: {
         // 防御：任何 Z 序变化都强制回到本模式应处的层级 ——
+        // 「保持顶栏」模式：恒置顶，绝不让位；
         // 默认让位态（目标窗口压着顶栏）：强制紧贴目标窗口之下，
         //   绝不覆盖当前聚焦窗口；
         // 其余情况（Dock 联动展开 / 目标未与顶栏重叠）：强制置顶，
         //   覆盖除当前聚焦窗口外的窗口。
         auto* wp = reinterpret_cast<WINDOWPOS*>(lParam);
         if ((wp->flags & SWP_NOZORDER) == 0) {
-            const bool yieldNow = s && !s->dockLinkExpanded && s->barYielding &&
+            const bool yieldNow = s && !s->keepTopEnabled &&
+                                  !s->dockLinkExpanded && s->barYielding &&
                                   s->barAnchorHwnd &&
                                   IsWindow(s->barAnchorHwnd);
             if (yieldNow) {
@@ -3550,15 +3647,40 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // 提升为置顶层并覆盖所有窗口（含当前聚焦窗口，不让位）；
         // Dock 收起 → 回到默认策略：只不遮挡当前聚焦窗口。
         // 自动收起关闭 / Dock 退出时收到 0 → 默认策略（行为不变）。
+        // wParam = 2 = 「保持顶栏」模式（恒置顶层 + 从不让位 + 全屏让位），
+        // 优先级高于联动：Dock 是模式开关的消息中枢（自己菜单 + 宿主托盘都
+        // 经它转发）；Dock 退出时回落到本地注册表读数，用户勾的勾不会掉。
         if (!s) {
             return 0;
         }
-        const bool expanded = wParam != 0;
+        const int state = static_cast<int>(wParam);
+        if (state == 2) {
+            if (!s->keepTopEnabled) SetKeepTopEnabled(*s, true);
+            return 0;
+        }
+        if (s->keepTopEnabled) {
+            const bool regOn = keeptop::IsEnabledFromRegistry();
+            if (regOn) return 0;  // Dock 说"未开启"但注册表仍勾选：以注册表为准
+            SetKeepTopEnabled(*s, false);
+        }
+        const bool expanded = state != 0;
         if (expanded == s->dockLinkExpanded) {
             return 0;
         }
         s->dockLinkExpanded = expanded;
         ApplyBarLayer(*s, true);  // 模式切换：强制对齐一次（含置顶位）
+        return 0;
+    }
+
+    // ← 宿主托盘菜单「保持顶栏」：重读注册表并立即生效
+    case kKeepTopRefreshMsg: {
+        if (!s) {
+            return 0;
+        }
+        const bool enabled = (wParam == 1) ? true
+                            : (wParam == 2) ? false
+                                            : keeptop::IsEnabledFromRegistry();
+        SetKeepTopEnabled(*s, enabled);
         return 0;
     }
 
@@ -3614,6 +3736,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // 层级低频自愈：让位态下被别的窗口插队时贴回目标窗口之下；
             // 事件驱动正常时全部幂等判定，不动窗口
             HealBarLayer(*s);
+            // 「保持顶栏」模式：全屏应用（游戏全屏等）进出复核（内部按 2s
+            // 节流；模式关闭时是空转的快速返回）
+            CheckKeepTopFullscreen(*s, /*force=*/false);
             // 时钟：每秒检查一次，仅时间/日期文本变化时重绘
             if (UpdateClock(*s)) {
                 DrawBarAndPresent(*s);
@@ -3760,6 +3885,9 @@ DWORD WINAPI TopbarThreadProc(LPVOID param) {
 
     // Dock 顶栏联动：启动即查询 Dock 当前展开态，联动展开时顶栏以置顶层
     // 启动并覆盖所有窗口。Dock 未运行/未应答 → 走默认策略。
+    // 「保持顶栏」开关先按注册表落地（用户勾选的模式必须重启后依然生效），
+    // 再由 Dock 的应答/推送校正（返回值 2 = 模式开启）。
+    state.keepTopEnabled = keeptop::IsEnabledFromRegistry();
     {
         HWND dock = FindWindowW(L"DesktopDockWindow", nullptr);
         if (dock && IsWindow(dock)) {
@@ -3767,7 +3895,11 @@ DWORD WINAPI TopbarThreadProc(LPVOID param) {
             if (SendMessageTimeoutW(dock, kDockStateQueryMsg, 0, 0,
                                     SMTO_ABORTIFHUNG | SMTO_BLOCK, 500,
                                     &linkState) != 0) {
-                state.dockLinkExpanded = linkState != 0;
+                const int st = static_cast<int>(linkState);
+                if (st == 2) {
+                    state.keepTopEnabled = true;
+                }
+                state.dockLinkExpanded = (st == 1);
             }
         }
     }
