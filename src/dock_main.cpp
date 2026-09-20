@@ -1570,13 +1570,7 @@ bool PointInGlassBody(const AppState& s, POINT pt, int winYOverride = -1) {
     return pt.x >= left && pt.x <= right && pt.y >= top && pt.y <= bottom;
 }
 
-// 光标是否算「在 Dock 上」= 在毛玻璃本体上，或碰到屏幕下缘的展开触发条。
-// 悬停放大、悬停提示、展开保持三者共用这一个口径（钩子线程与帧自愈同源）。
-// winYOverride：帧自愈路径传入「本帧目标窗口顶边」（含收起偏移），
-// 避免用上一帧的 winY 把刚离开的光标误判回玻璃上（收起被自愈荡回的老问题）。
-bool OnDockPointer(const AppState& s, POINT pt, int winYOverride = -1) {
-    return PointInGlassBody(s, pt, winYOverride) || InDockStrip(pt);
-}
+
 
 // 本模式下 Dock 应让出的高度带（物理像素）：
 //   自动收起开启 → Dock 平时收在屏幕外，不让（最大化窗口填满到屏幕底）；
@@ -2043,25 +2037,28 @@ bool InDockStrip(POINT pt) {
     return pt.x >= g_state.winX && pt.x < g_state.winX + g_state.winW;
 }
 
-// 点是否位于 Dock 有效交互区 = 窗口矩形 ∪ 底部触发条（与 Dock 同宽、
-// 2px 高的屏幕下缘）。窗口矩形与屏幕底边之间有间隙/透明区，触发条位于
-// 其下——光标在这些区域（含渲染区下方边缘）都属于“在 Dock 上”
+// 光标是否算「在 Dock 上」= 在毛玻璃本体上，或碰到屏幕下缘的展开触发条。
+// 悬停放大、悬停提示、点击采集/吞掉、展开保持共用这一个口径（钩子线程与
+// 帧自愈同源）。winYOverride：帧自愈路径传入「本帧目标窗口顶边」（含收起
+// 偏移），避免用上一帧的 winY 把刚离开的光标误判回玻璃上。
+bool OnDockPointer(const AppState& s, POINT pt, int winYOverride = -1) {
+    return PointInGlassBody(s, pt, winYOverride) || InDockStrip(pt);
+}
+
+// 点是否位于 Dock 有效交互区。
+//
+// 注意：这里**不能**用整个 Dock 窗口矩形。窗口比毛玻璃本体大一圈（上方
+// 阴影/留白、左右阴影预留），而且矩形还一直延伸到屏幕底边；低层鼠标钩子
+// 用它来决定「吞掉点击」时，那圈看不见的区域会把点击从下方窗口手里抢走。
+// 实测（Dock 静止、BottomGap=4）：窗口 y=971..1082，看得见的毛玻璃只有
+// y=1018..1075 —— 于是毛玻璃上方 47px 整条带内的点击（正好压在下方窗口的
+// 底栏按钮上）全部被 Dock 吞掉，按钮点不动。
+// 因此口径与悬停一致：毛玻璃本体 ∪ 屏幕下缘 2px 触发条。
+// 钩子线程只读 UI 线程维护的缓存几何，绝不调用 GetWindowRect /
+// SystemParametersInfo 等可能等待 UI 线程的函数（否则 UI 线程一阻塞，
+// 钩子线程被拖住，全局鼠标卡死）。
 bool PointInDockOrStrip(POINT pt) {
-    // 低层鼠标钩子运行在专用线程上，这里只用 UI 线程维护的缓存几何，
-    // 绝不调用 GetWindowRect / SystemParametersInfo 等可能等待 UI 线程的
-    // 函数——否则 UI 线程一旦阻塞，钩子线程也会被拖住，全局鼠标再次卡死。
-    const int bottom = PrimaryScreenRect().bottom;  // 屏幕底边（非工作区底边）
-    const int gap = MulDiv(g_state.bottomGapBase, g_state.dpi, 96);
-    if (pt.y < bottom - gap - g_state.winH) return false;
-    const int left = g_state.winX;
-    const int right = left + g_state.winW;
-    const int top = g_state.winY;
-    // 下界同 InDockStrip：吸收屏幕最底行坐标抖动（sh-1/sh/sh+1），
-    // 避免贴底时光标在“在 Dock”与“不在 Dock”之间高频切换。
-    if (pt.x >= left && pt.x < right && pt.y >= top && pt.y <= bottom + 2) {
-        return true;
-    }
-    return InDockStrip(pt);
+    return OnDockPointer(g_state, pt);
 }
 
 // 低层钩子收到的光标坐标是"未裁剪"的原始位置：光标贴住屏幕外缘（如贴底）
@@ -2193,8 +2190,39 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
                 return 1;  // 吞掉：点击不穿透到下方窗口
             }
 
-            // 只采集 Dock/透明底部空隙/贴底边缘的点击，动作由 UI 线程执行。
+            // 只采集 Dock/透明底部缝隙/贴底边缘的点击，动作由 UI 线程执行。
+            // 诊断：每次被吞掉的按下都记一行（含窗口矩形与毛玻璃矩形），
+            // 用来对账「哪个区域偷走了点击」——窗口底栏按钮点不动时可据此定位。
             if (isDown && PointInDockOrStrip(pt)) {
+                // 诊断（只记毛玻璃外的吞点，每次位置变化记一条，不刷屏）：
+                // 毛玻璃内的点击本来就是 Dock 自己的，无需记录；毛玻璃外仍被
+                // 吞掉才是「偷走下方窗口点击」的证据。
+                {
+                    const float kLog = (g_state.scale > 0.f) ? g_state.scale : 1.f;
+                    const RectF bodyLog = BodyRectForPeak(
+                        kLog, g_state.winW, g_state.winH,
+                        CurrentPeakScale(g_state));
+                    const int bL = g_state.winX + static_cast<int>(bodyLog.X);
+                    const int bT = g_state.winY + static_cast<int>(bodyLog.Y);
+                    const int bR = bL + static_cast<int>(bodyLog.Width);
+                    const int bB = bT + static_cast<int>(bodyLog.Height);
+                    const bool onGlass = pt.x >= bL && pt.x <= bR &&
+                                         pt.y >= bT && pt.y <= bB;
+                    static int s_lastOutsideX = -1;
+                    static int s_lastOutsideY = -1;
+                    if (!onGlass &&
+                        (pt.x != s_lastOutsideX || pt.y != s_lastOutsideY)) {
+                        s_lastOutsideX = pt.x;
+                        s_lastOutsideY = pt.y;
+                        Logf(L"[吞点] 毛玻璃外吞掉按下 光标=(%d,%d) "
+                             L"毛玻璃=(%d,%d..%d,%d) 窗口=(%d,%d..%d,%d) "
+                             L"触发条=%d —— 若非期望请上报",
+                             pt.x, pt.y, bL, bT, bR, bB, g_state.winX,
+                             g_state.winY, g_state.winX + g_state.winW,
+                             g_state.winY + g_state.winH,
+                             InDockStrip(pt) ? 1 : 0);
+                    }
+                }
                 float mx = static_cast<float>(pt.x - g_state.winX);
                 float my = static_cast<float>(pt.y - g_state.winY);
                 // 空隙处于窗口矩形下方时，按最近有效边缘处理
