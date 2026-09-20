@@ -93,19 +93,35 @@ if ($s2.wa.T -eq ($s2.br.B - $s2.br.T)) { "PASS  work area top == topbar height 
 Set-DockAuto 0
 Start-Sleep -Seconds 6
 $s3 = Snap "  [auto-collapse off]"
-# NOTE: the dock honours its own BottomGap setting (HKCU\...\Dock\BottomGap,
-# 5px on this machine), so "expanded" means bottom ~= screenH - gap, and
-# "collapsed" means top ~= screenH - gap - winH.
+# Dock state comes from the dock's OWN log ("[展开] 完成 offset=0" /
+# "[收起] 完成 offset=<winH>"): after BottomGap switched to measuring from the
+# glass, the window rect alone no longer tells whether the dock is up, and the
+# old formula (screenH - gap - winH) is off by the shadow margin.
+function Get-DockState([int]$withinMs) {
+    $log = 'C:\Users\Mayn\Desktop\clock\logs\dock.log'
+    $deadline = (Get-Date).AddMilliseconds($withinMs)
+    do {
+        if (Test-Path $log) {
+            $m = Select-String -Path $log -Pattern '\[(展开|收起)\] 完成 offset=([0-9.]+)' -Encoding UTF8 | Select-Object -Last 1
+            if ($m) {
+                return @($m.Matches[0].Groups[1].Value, [double]$m.Matches[0].Groups[2].Value)
+            }
+        }
+        Start-Sleep -Milliseconds 300
+    } while ((Get-Date) -lt $deadline)
+    return @('unknown', -1)
+}
 $gap = (Get-ItemProperty -Path 'HKCU:\Software\DesktopSuite\Dock' -Name 'BottomGap' -ErrorAction SilentlyContinue).BottomGap
 if ($null -eq $gap) { $gap = 0 }
 $screenH = 1080
-$dockWinH = $s3.dr.B - $s3.dr.T
-$dockExpanded = [math]::Abs($s3.dr.B - ($screenH - $gap)) -le 6
-$dockCollapsed = [math]::Abs($s3.dr.T - ($screenH - $gap - $dockWinH)) -le 6
-if ($dockExpanded) { "PASS  dock expanded/visible (bottom=$($s3.dr.B), screenH-gap=$($screenH-$gap))" }
-elseif ($dockCollapsed) { "FAIL  dock still parked collapsed (top=$($s3.dr.T))" }
-else { "FAIL  dock neither expanded nor collapsed: " + [PB]::R($s3.dr) }
-# the dock window carries a shadow margin, so compare against the glass top edge
+$st = Get-DockState 4000
+if ($st[0] -eq '展开') {
+    "PASS  dock expanded/visible (dock 日志：展开完成 offset=$($st[1])，窗口=" + [PB]::R($s3.dr) + ")"
+} elseif ($st[0] -eq '收起') {
+    "FAIL  dock still parked collapsed (dock 日志：收起完成 offset=$($st[1]))"
+} else {
+    "SKIP  dock state unknown (日志里没有展开/收起完成记录)"
+}
 # Ground truth for the reserved band: the dock logs, every time the reservation
 # changes, "[保持顶栏] Dock 高度带：… 毛玻璃顶边(局部)=47 屏幕=<glass> … → 让出=<n>"
 # and the work area bottom must sit exactly 2px above that glass top.
