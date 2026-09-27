@@ -1528,17 +1528,17 @@ int TopBarHeightForWorkArea() {
 
 // 毛玻璃主体矩形（摆放/绘制阶段定义在下方）：保持顶栏让出的高度带必须与
 // 真实绘制同源 —— 手写常量和公式曾经漏算悬停峰值项，算出的顶边比实际低 17px
-RectF BodyRectForPeak(float k, int winW, int winH, float peak);
+RectF BodyRectFixed(float k, int winW, int winH);
 
-// 毛玻璃主体（body）在客户区内的顶边 y：直接取 BodyRectForPeak 的 Y，
+// 毛玻璃主体（body）在客户区内的顶边 y：直接取 BodyRectFixed 的 Y，
 // 与绘制/命中用同一份几何，避免「预留算出 64、实际画在 47」这类漂移。
-// peak 固定按静止态 1.0 计算：悬停放大只让毛玻璃向上生长，间距在视觉上
-// 变大，不跟着每帧抖动（否则工作区会随悬停反复改写、最大化窗口被反复重排）。
+// 框体高度恒定（悬停放大只让图标向上生长，边框不动），所以顶边不随悬停
+// 抖动，工作区预留天然稳定，不会被每帧改写。
 int KeepTopGlassTopLocal(const AppState& s) {
     const int winH = (s.winH > 0) ? s.winH : 0;
     if (winH <= 0) return 0;
     const float k = (s.scale > 0.f) ? s.scale : 1.f;
-    const RectF body = BodyRectForPeak(k, s.winW, winH, 1.0f);
+    const RectF body = BodyRectFixed(k, s.winW, winH);
     const int top = static_cast<int>(body.Y + 0.5f);
     return (top > 0 && top < winH) ? top : 0;
 }
@@ -1554,11 +1554,13 @@ bool InDockStrip(POINT pt);
 // 上方时就会触发悬停放大，用户看到的现象就是"还没碰到图形就 hover 了"。
 // 这里以绘制用几何为准：只有光标真进了毛玻璃本体（含 2px 容差）才算在 Dock 上。
 // 屏幕下缘那条 2px 展开触发条另有 InDockStrip 负责（收起态召唤），不在此放宽。
+// 框体高度恒定（BodyRectFixed）：悬停时图标会顶出玻璃上沿，越界的那一小截
+// 不算 Dock 本体；但下缘触发条仍算在有效区内，而"真离开"由钩子按窗口上边
+// 兜底（见 ShowDesktopHookProc 的 topExit），所以不会因为图标顶出去就误收起。
 bool PointInGlassBody(const AppState& s, POINT pt, int winYOverride = -1) {
     if (!s.hwnd || s.winW <= 0 || s.winH <= 0) return false;
     const float k = (s.scale > 0.f) ? s.scale : 1.f;
-    const RectF body =
-        BodyRectForPeak(k, s.winW, s.winH, CurrentPeakScale(s));
+    const RectF body = BodyRectFixed(k, s.winW, s.winH);
     const int winY = (winYOverride >= 0) ? winYOverride : s.winY;
     const LONG tolX = 0;  // 左右不留余量：只认画出来的毛玻璃本体
     const LONG left = s.winX + static_cast<LONG>(body.X) - tolX;
@@ -1579,13 +1581,13 @@ bool PointInGlassBody(const AppState& s, POINT pt, int winYOverride = -1) {
 //
 // 关键：让出的不是「窗口顶边以下」，而是「毛玻璃顶边 + 2px 以下」。
 // Dock 窗口比毛玻璃本体大一圈（四周阴影预留 kShadowMargin + 顶部留白
-// kPadTop，见 BodyRectForPeak）：按窗口顶边让位时，最大化窗口与看得见的
+// kPadTop，见 BodyRectFixed）：按窗口顶边让位时，最大化窗口与看得见的
 // Dock 之间会空出 15px 以上（用户反馈「距离明显太远」的根因）。
 //
-// 毛玻璃顶边的屏幕坐标只与「窗口高 / DPI 缩放 / 悬停峰值」有关，与窗口
+// 毛玻璃顶边的屏幕坐标只与「窗口高 / DPI 缩放」有关，与窗口
 // y 无关（body.Y = winH − 底边阴影 − 内容高 → glassTop = 底边阴影 + 内容高），
 // 所以即使 Dock 此刻正收在屏幕外也能算准（不需要实时矩形）。
-// 峰值固定取 1.0（静止态）：悬停放大时毛玻璃向上生长，间距只在视觉上变大，
+// 框体高度恒定（悬停不改边框高度）：顶边在任何时刻都等于静止态顶边，
 // 不跟着每帧抖动 —— 否则工作区会随悬停反复改写，最大化窗口被反复重排。
 int KeepTopDockReserve() {
     if (g_state.autoCollapse) {
@@ -1600,7 +1602,7 @@ int KeepTopDockReserve() {
         return 0;
     }
 
-    // 毛玻璃顶边一律从 BodyRectForPeak 推（与真实绘制同源），不再手写一份
+    // 毛玻璃顶边一律从 BodyRectFixed 推（与真实绘制同源），不再手写一份
     // 常量和公式 —— 曾经手写版漏算悬停峰值项，算出的顶边比真实值低 17px。
     // 窗口顶边的公式必须与 UpdateDockPosition 完全一致（含阴影补回量）。
     const int glassTopLocal = KeepTopGlassTopLocal(g_state);
@@ -2199,9 +2201,9 @@ LRESULT CALLBACK ShowDesktopHookProc(int code, WPARAM wParam, LPARAM lParam) {
                 // 吞掉才是「偷走下方窗口点击」的证据。
                 {
                     const float kLog = (g_state.scale > 0.f) ? g_state.scale : 1.f;
-                    const RectF bodyLog = BodyRectForPeak(
-                        kLog, g_state.winW, g_state.winH,
-                        CurrentPeakScale(g_state));
+                    // 与命中/绘制同源：框体恒定，不再按当前峰值算
+                    const RectF bodyLog =
+                        BodyRectFixed(kLog, g_state.winW, g_state.winH);
                     const int bL = g_state.winX + static_cast<int>(bodyLog.X);
                     const int bT = g_state.winY + static_cast<int>(bodyLog.Y);
                     const int bR = bL + static_cast<int>(bodyLog.Width);
@@ -2919,7 +2921,7 @@ void EnsureWindowSize(AppState& s) {
     s.needsRedraw = true;
 }
 
-// 当前峰值缩放（毛玻璃随之长高：macOS 风格，悬停时整条向上生高）
+// 当前峰值缩放（只用于图标自身的缓动判定/日志；不再参与毛玻璃高度）
 float CurrentPeakScale(const AppState& s) {
     float peak = 1.0f;
     for (const auto& it : s.items) {
@@ -2928,12 +2930,22 @@ float CurrentPeakScale(const AppState& s) {
     return peak;
 }
 
-RectF BodyRectForPeak(float k, int winW, int winH, float peak) {
+// 毛玻璃本体（边框）矩形：尺寸**恒定**，与悬停峰值无关。
+//
+// 为什么钉死不动：悬停放大是「图标自己长高」，边框只是一层壳。壳跟着峰值
+// 长高时，整条毛玻璃会在鼠标掠过的每一帧上下伸缩（顶边随峰值抖动），既让
+// 贴着 Dock 上沿的窗口看到边框"呼吸"，也让工作区预留/命中判定跟着一起漂。
+// 现在框体一律按静止态（peak = 1.0）排版：底边贴 kShadowBottom 阴影留白，
+// 高度 = kPadTop + kIconSize + kPadBottom，恒等于静止态高度。图标放大后其
+// 顶部允许越过玻璃顶边向上生长（窗口高度早已留出 kMaxScale 的生长预算，
+// 见 DesiredWindowSize，因此不会被裁掉），视觉上就像图标冲出壳外。
+//
+// 所有「看得见的边框」相关判定（悬停命中、点击吞掉、悬停提示定位、绘制）
+// 都必须用这一份几何，避免出现两套口径。
+RectF BodyRectFixed(float k, int winW, int winH) {
     const float margin = kShadowMargin * k;
     const float bottomMargin = kShadowBottom * k;
-    const float grow = (peak - 1.0f) * kIconSize * k;
-    const float contentH =
-        kPadTop * k + grow + kIconSize * k + kPadBottom * k;
+    const float contentH = kPadTop * k + kIconSize * k + kPadBottom * k;
     return RectF(margin, static_cast<float>(winH) - bottomMargin - contentH,
                  static_cast<float>(winW) - margin * 2.f, contentH);
 }
@@ -2958,7 +2970,9 @@ float BounceOffsetFor(AppState& s, const std::wstring& key) {
 
 // 一帧布局：
 //   1. 以上一帧各图标中心为参考计算高斯放大目标并缓动 scaleAnim
-//   2. 以缓动后的宽度重摆槽位（底端对齐），记录命中框/图框/中心
+//   2. 以缓动后的宽度重摆槽位（底端对齐到恒定的毛玻璃底边），记录命中框/图框/中心
+// 注意：悬停只改图标自身尺寸（scaleAnim）与整窗宽度，毛玻璃框体高度恒定
+// （BodyRectFixed），窗口高度因此不随悬停变化。
 // 返回是否有动画仍在进行。
 bool UpdateLayoutOneFrame(AppState& s) {
     const size_t n = s.items.size();
@@ -3005,8 +3019,7 @@ bool UpdateLayoutOneFrame(AppState& s) {
                         // 诊断：帧间自愈进场（钩子事件缺失/折返的旁证）
                         const float kNow = (s.scale > 0.f) ? s.scale : 1.f;
                         const RectF bodyNow =
-                            BodyRectForPeak(kNow, s.winW, s.winH,
-                                            CurrentPeakScale(s));
+                            BodyRectFixed(kNow, s.winW, s.winH);
                         Logf(L"[帧] 自愈进场 光标=(%d,%d) 目标顶边=%d wasOnDock=%d "
                              L"hideRequested=%d → 复位收起请求"
                              L"（毛玻璃屏幕矩形=[%d,%d..%d,%d]）",
@@ -3129,8 +3142,11 @@ bool UpdateLayoutOneFrame(AppState& s) {
         UpdateDockPosition(s);
     }
 
-    const float peak = CurrentPeakScale(s);
-    const RectF body = BodyRectForPeak(k, s.winW, s.winH, peak);
+    // 框体几何恒定：槽位、图标基线、命中区全部以 BodyRectFixed 为基准。
+    // 悬停时 scaleAnim 只放大图标自身（宽高同步），图标底边不动 → 视觉上
+    // 图标从壳内向上长，壳（边框）高度一格不变。
+    const RectF body = BodyRectFixed(k, s.winW, s.winH);
+
     float x = body.X + std::max((body.Width - used) * 0.5f, 0.f) +
               kBarPadX * k;
     const float iconBottom = body.Y + body.Height - kPadBottom * k;
@@ -3138,8 +3154,8 @@ bool UpdateLayoutOneFrame(AppState& s) {
     // 「保持顶栏」模式：把毛玻璃顶边的真实屏幕坐标记一行日志（只在变化时写），
     // 供让出的高度带对账：KeepTopDockReserve 必须让最大化窗口底边正好落在
     // 这里 2px 之上（keep_top.h 的 kMaxWindowToDockGapBase）。
-    // 注意：此处 body 按当前悬停峰值算，悬停放大时毛玻璃顶边更高（顶部生长），
-    // 故「实际间距」只在静止态等于目标值，其余时候 ≥ 目标值。
+    // 框体恒定后，这里的顶边在任何时刻都等于静止态顶边（预留值与实际间距
+    // 不再有"悬停时 ≥ 目标值"的偏差）。
     if (s.keepTopReserve > 0) {
         const int glassTopScreen = s.winY + static_cast<int>(body.Y + 0.5f);
         const int reserveGapPx =
@@ -3150,10 +3166,14 @@ bool UpdateLayoutOneFrame(AppState& s) {
         if (s_lastGlassForReserve != s.keepTopReserve) {
             s_lastGlassForReserve = s.keepTopReserve;
             const int waBottom = PrimaryScreenRect().bottom - s.keepTopReserve;
+            // 框体恒定：这里的顶边不随悬停变化（ActualGap 任何时刻都等于
+            // 目标间距）。日志附上当前峰值仅作参考——峰值只影响图标高度。
             Logf(L"[保持顶栏] 毛玻璃顶边对账：客户y=%.0f 屏幕y=%d 工作区底边=%d "
-                 L"实际间距=%d 目标间距=%d（winY=%d offset=%.1f winH=%d）",
+                 L"实际间距=%d 目标间距=%d 当前峰值=%.2f 框体高=%.0f "
+                 L"（winY=%d offset=%.1f winH=%d）",
                  body.Y, glassTopScreen, waBottom, glassTopScreen - waBottom,
-                 reserveGapPx, s.winY, s.collapseOffset, s.winH);
+                 reserveGapPx, CurrentPeakScale(s), body.Height, s.winY,
+                 s.collapseOffset, s.winH);
         }
     }
 
@@ -3326,8 +3346,9 @@ void DrawFrame(Graphics& g, AppState& s) {
     g.Clear(Color(0, 0, 0, 0));
 
     const float k = s.scale;
-    const float peak = CurrentPeakScale(s);
-    const RectF body = BodyRectForPeak(k, s.winW, s.winH, peak);
+    // 框体（毛玻璃 + 边框）用恒定几何：悬停放大只作用在图标上，边框高度
+    // 一格不变（这是本文件"悬停不改边框高度"的唯一出口）。
+    const RectF body = BodyRectFixed(k, s.winW, s.winH);
     const float radius = kCornerRadius * k;
     const float iconBottom = body.Y + body.Height - kPadBottom * k;
     const float dotCy = iconBottom + kDotDrop * k;
