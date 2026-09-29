@@ -2878,27 +2878,44 @@ SIZE DesiredWindowSize(AppState& s) {
     return sz;
 }
 
-// 依据当前呈现宽度计算窗口应处位置（底部对齐、水平居中）
-// 收起偏移并入 winY：ULW 呈现、SetWindowPos、GetWindowRect、命中检测
-// 全部使用同一位置源，避免"ULW 展示收起位、SetWindowPos 拉回展开位"的
-// 打架（此前导致窗口矩形跳变、几何事件风暴与展开不稳定）
-void UpdateDockPosition(AppState& s) {
+// 窗口顶边（屏幕坐标）的**唯一出口**：给定收起偏移，算 Dock 窗口应在的 y。
+//
+// BottomGap 量的是「看得见的毛玻璃底边」到屏幕底边之间的空隙，且按空行数计：
+// 玻璃占据的最低一行 = 屏幕底边 - gap - 1。由该约束反解窗口 y（不靠 winH
+// 相减，避免四舍五入差一行）：
+//     玻璃底边(屏幕) = 窗口 y + winH - kShadowBottom*k
+//
+// 为什么必须只有这一份公式：UpdateLayoutOneFrame 的「帧内自愈」曾经自己写
+// 了一份 `screen.bottom - gap - winH`（漏掉 -1 与 kShadowBottom*k），算出的
+// 窗口顶边比真实值高 kShadowBottom*k（150% DPI 下 10px）。而自愈每帧都覆盖
+// 钩子的判定结果，于是整条悬停命中矩形被抬高 10px：
+//   · 毛玻璃底边往上 10px（**看得见的玻璃内**）判成「不在 Dock」→ 悬停放大
+//     在贴近屏幕底边的一整条带里彻底失效（1591..1596 实测无 hover，
+//     1597 起才被 2px 触发条救回）；
+//   · 毛玻璃顶边往上 10px 又判成「在 Dock」→ 没碰到玻璃就 hover 的幽灵带。
+// 因此位置只有一个出口，两处调用同一份。
+int DockWindowYAt(const AppState& s, float collapseOffset) {
     // 一律以「本屏整幅画面」贴底居中：工作区在「保持顶栏」模式下会被抬高
     // （让出顶栏与 Dock 高度带），用工作区定位会把 Dock 自己顶上去形成
     // 正反馈（预留越多 → Dock 越高 → 预留更多）
     const RECT screen = PrimaryScreenRect();
     const int gap = MulDiv(s.bottomGapBase, s.dpi, 96);
-    // BottomGap 量的是「看得见的毛玻璃底边」到屏幕底边之间的空隙，
-    // 且按空行数计：玻璃占据的最低一行 = 屏幕底边 - gap - 1。
-    // 由该约束反解窗口 y（不再靠 winH 相减，避免四舍五入差一行）：
-    //   玻璃底边(屏幕) = 窗口 y + winH - kShadowBottom*k
     const float k = (s.scale > 0.f) ? s.scale : 1.f;
     const int glassBottom = screen.bottom - gap - 1;
     const int glassBottomLocal =
         s.winH - static_cast<int>(kShadowBottom * k + 0.5f);
+    return glassBottom - glassBottomLocal +
+           static_cast<int>(collapseOffset + 0.5f);
+}
+
+// 依据当前呈现宽度计算窗口应处位置（底部对齐、水平居中）
+// 收起偏移并入 winY：ULW 呈现、SetWindowPos、GetWindowRect、命中检测
+// 全部使用同一位置源，避免"ULW 展示收起位、SetWindowPos 拉回展开位"的
+// 打架（此前导致窗口矩形跳变、几何事件风暴与展开不稳定）
+void UpdateDockPosition(AppState& s) {
+    const RECT screen = PrimaryScreenRect();
     s.winX = screen.left + ((screen.right - screen.left) - s.winW) / 2;
-    s.winY = glassBottom - glassBottomLocal +
-             static_cast<int>(s.collapseOffset + 0.5f);
+    s.winY = DockWindowYAt(s, s.collapseOffset);
 }
 
 void RepositionDock(AppState& s, bool forceZOrder) {
@@ -2996,15 +3013,13 @@ bool UpdateLayoutOneFrame(AppState& s) {
             s.mouseY = static_cast<float>(cp.y - wr.top);
             // 每帧用物理光标位置自愈 mouseOverDock：不依赖 LL 钩子是否
             // 正好送达最底一行，贴底/空隙悬停更稳定。
-            // 注意：判定必须用「本帧目标几何」—— 顶边 = 工作区底 − 窗口高 +
-            // 当前收起偏移（FrameTick 已先行推进 offset）。绝不能用缓存 winY
-            // 或 GetWindowRect 的旧矩形：收起动画第一帧窗口尚未实际下移，
-            // 旧矩形会把刚从顶边离开的光标误判回区内，立即撤销刚发起的收起
-            // （17:15:27 事故：收起被“自愈”荡回，Dock 滞留展开 5.5 秒）。
-            const RECT screen = g_primaryScreen;
-            const int effGap = MulDiv(s.bottomGapBase, s.dpi, 96);
-            const int effTop = screen.bottom - effGap - s.winH +
-                               static_cast<int>(s.collapseOffset + 0.5f);
+            // 注意：判定必须用「本帧目标几何」—— 顶边 = 本帧目标窗口顶边
+            // （DockWindowYAt：与 UpdateDockPosition 同一份公式，FrameTick 已
+            // 先行推进 offset）。绝不能用缓存 winY 或 GetWindowRect 的旧矩形：
+            // 收起动画第一帧窗口尚未实际下移，旧矩形会把刚从顶边离开的光标
+            // 误判回区内，立即撤销刚发起的收起（17:15:27 事故：收起被“自愈”
+            // 荡回，Dock 滞留展开 5.5 秒）。
+            const int effTop = DockWindowYAt(s, s.collapseOffset);
             // 全屏让位期间不做进场自愈：Dock 已完全滑出/隐藏，光标位置不
             // 构成"应展开"的理由（否则会立刻撤销收起请求、把 Dock 拉到全屏
             // 画面上）；真值一律按"不在场内"处理
