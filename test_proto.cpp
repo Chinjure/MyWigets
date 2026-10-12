@@ -223,12 +223,83 @@ static void TestModel() {
           "command closeTab");
     CHECK(ChromeSyncBuildCommand(L"newTab") == "{\"type\":\"newTab\"}",
           "command newTab");
+    CHECK(ChromeSyncBuildMoveTabCommand(11, 2) ==
+              "{\"type\":\"moveTab\",\"tabId\":11,\"index\":2}",
+          "command moveTab");
 
     // 中文标题经命令/模型往返
     m.tabs.clear();
     std::wstring zh = L"{\"type\":\"tabCreated\",\"tab\":{\"id\":1,\"index\":0,\"title\":\"\u684c\u9762\u9876\u680f\",\"url\":\"\",\"active\":true,\"pinned\":false}}";
     ChromeSyncApplyMessage(m, JsonParse(zh));
     CHECK(m.tabs[0].title == L"\u684c\u9762\u9876\u680f", "model CJK title");
+}
+
+// 标签拖动重排（顶栏交互用的纯逻辑）
+static void TestTabDragReorder() {
+    // 4 个等宽 100px 的标签：中心 50 / 150 / 250 / 350
+    const std::vector<float> centers{50.0f, 150.0f, 250.0f, 350.0f};
+
+    // 光标没越过任何相邻中点：位置不动
+    CHECK(TabDragNextIndex(centers, 1, 150.0f) == 1, "drag hold position");
+    CHECK(TabDragNextIndex(centers, 1, 200.0f) == 1,
+          "drag within own slot (no crossing)");
+    // 向右越过右邻居中点 -> 交换一格
+    CHECK(TabDragNextIndex(centers, 1, 250.5f) == 2, "drag swap right one");
+    // 向左越过左邻居中点 -> 交换一格
+    CHECK(TabDragNextIndex(centers, 2, 149.5f) == 1, "drag swap left one");
+    // 一次只走一格（长距离甩动由后续 mousemove 逐格推进）
+    CHECK(TabDragNextIndex(centers, 0, 400.0f) == 1,
+          "drag one step per event (right end)");
+    CHECK(TabDragNextIndex(centers, 3, 0.0f) == 2,
+          "drag one step per event (left end)");
+    // 到头不再越界
+    CHECK(TabDragNextIndex(centers, 3, 999.0f) == 3, "drag stops at last");
+    CHECK(TabDragNextIndex(centers, 0, -50.0f) == 0, "drag stops at first");
+    // 非法输入原样返回
+    CHECK(TabDragNextIndex(centers, -1, 100.0f) == -1, "drag invalid index");
+    CHECK(TabDragNextIndex({}, 0, 100.0f) == 0, "drag empty list");
+
+    // 固定标签约束：前 2 个是固定标签
+    //   普通标签（lo=2）不能拖到固定区
+    CHECK(TabDragNextIndex(centers, 2, 100.0f, 2, -1) == 2,
+          "drag unpinned cannot enter pinned zone");
+    //   固定标签（hi=1）不能拖出固定区
+    CHECK(TabDragNextIndex(centers, 1, 300.0f, 0, 1) == 1,
+          "drag pinned cannot leave pinned zone");
+    //   固定区内/普通区内正常交换
+    CHECK(TabDragNextIndex(centers, 0, 200.0f, 0, 1) == 1,
+          "drag pinned swaps inside pinned zone");
+    CHECK(TabDragNextIndex(centers, 2, 350.5f, 2, -1) == 3,
+          "drag unpinned swaps inside normal zone");
+
+    // 下发给浏览器的落点夹取（固定标签恒在最前）
+    CHECK(ChromeClampTabIndex(0, 2, 5, false) == 2,
+          "clamp unpinned above pinned zone");
+    CHECK(ChromeClampTabIndex(4, 2, 5, false) == 4, "clamp unpinned in range");
+    CHECK(ChromeClampTabIndex(3, 2, 5, true) == 1, "clamp pinned to pinned zone");
+    CHECK(ChromeClampTabIndex(-3, 0, 5, false) == 0, "clamp negative index");
+    CHECK(ChromeClampTabIndex(99, 0, 5, false) == 4, "clamp beyond last index");
+    CHECK(ChromeClampTabIndex(0, 0, 0, false) == 0, "clamp empty window");
+
+    // 顶栏顺序写回同步模型：重排 + 重写 index（否则后续 upsert 会弹回旧顺序）
+    ChromeSyncModel m;
+    m.connected = true;
+    ChromeSyncApplyMessage(
+        m, JsonParse(L"{\"type\":\"hello\",\"windowId\":3,\"tabs\":["
+                     L"{\"id\":1,\"index\":0,\"title\":\"A\",\"url\":\"\",\"active\":true,\"pinned\":false},"
+                     L"{\"id\":2,\"index\":1,\"title\":\"B\",\"url\":\"\",\"active\":false,\"pinned\":false},"
+                     L"{\"id\":3,\"index\":2,\"title\":\"C\",\"url\":\"\",\"active\":false,\"pinned\":false}]}"));
+    CHECK(ChromeSyncApplyOrder(m, {3, 1, 2}), "apply order moves item");
+    CHECK(m.tabs.size() == 3 && m.tabs[0].id == 3 && m.tabs[0].index == 0 &&
+              m.tabs[1].id == 1 && m.tabs[1].index == 1 && m.tabs[2].id == 2 &&
+              m.tabs[2].index == 2,
+          "apply order rewrites index");
+    // 顺序没变时不算变化（避免无谓重绘）
+    CHECK(!ChromeSyncApplyOrder(m, {3, 1, 2}), "apply same order = no change");
+    // order 与模型不一致（缺项/重复/长度不符）时拒绝且不改动
+    CHECK(!ChromeSyncApplyOrder(m, {3, 1, 9}), "apply order rejects unknown id");
+    CHECK(!ChromeSyncApplyOrder(m, {3, 1}), "apply order rejects bad size");
+    CHECK(m.tabs.size() == 3 && m.tabs[0].id == 3, "rejected order keeps model");
 }
 
 int wmain() {
@@ -239,6 +310,7 @@ int wmain() {
     TestJson();
     TestFrames();
     TestModel();
+    TestTabDragReorder();
 
     if (g_failures == 0) {
         std::printf("\nALL TESTS PASSED\n");

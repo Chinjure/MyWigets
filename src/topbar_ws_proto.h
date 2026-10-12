@@ -749,6 +749,118 @@ inline std::string ChromeSyncBuildCommand(const wchar_t* type, int tabId = -1) {
     return WideToUtf8(s);
 }
 
+// 构造拖动重排命令：扩展侧执行 chrome.tabs.move(tabId, { index })
+inline std::string ChromeSyncBuildMoveTabCommand(int tabId, int index) {
+    std::wstring s = L"{\"type\":\"moveTab\",\"tabId\":";
+    s += std::to_wstring(tabId);
+    s += L",\"index\":";
+    s += std::to_wstring(index);
+    s += L"}";
+    return WideToUtf8(s);
+}
+
+// ---- 标签拖动重排（纯逻辑：顶栏交互与单元测试共用）----
+
+// 拖动让位一步：光标越过相邻标签的中点，就与它交换位置。
+//   slotCenters 当前顺序下每个标签的中心 x（升序）
+//   dragIndex   被拖标签当前所处位置
+//   cursorX     光标 x（客户区坐标）
+//   lo, hi      允许停留的索引区间（Chrome 固定标签恒在最前：普通标签不能
+//               拖进固定区、固定标签也不能拖出；窗口模式传 0 / n-1 即无约束）
+// 返回这一帧结束后被拖标签应处的位置。一次只走一格（而不是直接算到最终位置）：
+// 让位跟着光标逐格推进，长距离甩动不会来回抖动。
+inline int TabDragNextIndex(const std::vector<float>& slotCenters, int dragIndex,
+                            float cursorX, int lo = 0, int hi = -1) {
+    const int n = static_cast<int>(slotCenters.size());
+    if (n <= 0 || dragIndex < 0 || dragIndex >= n) {
+        return dragIndex;
+    }
+    if (hi < 0 || hi > n - 1) {
+        hi = n - 1;
+    }
+    if (lo < 0) {
+        lo = 0;
+    }
+    if (dragIndex + 1 < n && dragIndex + 1 <= hi &&
+        cursorX > slotCenters[dragIndex + 1]) {
+        return dragIndex + 1;
+    }
+    if (dragIndex - 1 >= 0 && dragIndex - 1 >= lo &&
+        cursorX < slotCenters[dragIndex - 1]) {
+        return dragIndex - 1;
+    }
+    return dragIndex;
+}
+
+// Chrome 固定标签永远排在最前（浏览器规则）：拖动落点夹到合法 index
+inline int ChromeClampTabIndex(int index, int pinnedCount, int tabCount,
+                               bool tabPinned) {
+    if (tabCount <= 0) {
+        return 0;
+    }
+    if (pinnedCount < 0) {
+        pinnedCount = 0;
+    }
+    if (pinnedCount > tabCount) {
+        pinnedCount = tabCount;
+    }
+    if (index < 0) {
+        index = 0;
+    }
+    if (index > tabCount - 1) {
+        index = tabCount - 1;
+    }
+    if (tabPinned) {
+        if (index > pinnedCount - 1) {
+            index = pinnedCount > 0 ? pinnedCount - 1 : 0;
+        }
+    } else if (index < pinnedCount) {
+        index = pinnedCount < tabCount ? pinnedCount : tabCount - 1;
+    }
+    return index;
+}
+
+// 把顶栏当前的展示顺序（order = 按新顺序排列的 tabId）写回同步模型：
+// 重排 tabs 并重写 index。index 必须跟着改写 —— 否则之后任何一条
+// tabUpdated 的 upsert 都会按浏览器推送的旧 index 重新排序，
+// 把用户刚拖好的顺序弹回去。order 与模型不一致（缺项/重复）时返回
+// false 且不改动模型。
+inline bool ChromeSyncApplyOrder(ChromeSyncModel& m,
+                                 const std::vector<int>& order) {
+    if (order.empty() || order.size() != m.tabs.size()) {
+        return false;
+    }
+    std::vector<ChromeTabModel> next;
+    next.reserve(order.size());
+    std::vector<bool> used(m.tabs.size(), false);
+    for (size_t k = 0; k < order.size(); ++k) {
+        bool found = false;
+        for (size_t i = 0; i < m.tabs.size(); ++i) {
+            if (!used[i] && m.tabs[i].id == order[k]) {
+                next.push_back(m.tabs[i]);
+                used[i] = true;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    bool changed = false;
+    for (size_t i = 0; i < next.size(); ++i) {
+        if (next[i].index != static_cast<int>(i)) {
+            next[i].index = static_cast<int>(i);
+            changed = true;
+        }
+        if (!changed && next[i].id != m.tabs[i].id) {
+            changed = true;
+        }
+    }
+    m.tabs.swap(next);
+    return changed;
+}
+
 }  // namespace wsproto
 
 #endif  // TOPBAR_WS_PROTO_H

@@ -18,12 +18,24 @@
 //        也不可能被聚焦（聚焦它们等于把幽灵窗口"打开"），更不会被顶栏
 //        收作"当前聚焦目标" —— 否则层级会跟着它重估，被最大化窗口遮住的
 //        顶栏会凭空弹出来（如 hotspot 的 WS_EX_TOOLWINDOW 启动器弹出窗）
+//      - 按住标签左右拖动即可随意重排（超过 4px 阈值才算拖动）：
+//        拖动中被拖标签浮在光标处、其余标签实时补位（原位置留空即落点提示），
+//        松手即生效。Chrome 同步模式下额外把新位置下发给扩展执行
+//        chrome.tabs.move —— 浏览器里的真实标签顺序一起变；窗口枚举模式
+//        只调整顶栏展示顺序（同一应用内保持到应用切走为止）。
+//        固定标签恒在最前：普通标签拖不进固定区、固定标签也拖不出。
 //   4. 顶栏右侧提供 Chrome 浏览器风格的 最小化 / 最大化 / 关闭 三个按钮，
-//      用于控制当前聚焦窗口；双击顶栏空白处最大化/还原当前聚焦窗口；
+//      用于控制当前聚焦窗口；双击顶栏空白处让当前聚焦窗口填充"顶栏以外"
+//      的区域（上缘压在顶栏下缘，顶栏保持可见；再次双击还原到填充前的
+//      位置），与最大化键的系统最大化（会连顶栏一起盖住）不同；
 //      按住顶栏空白处拖动可移动当前聚焦窗口（等同标题栏拖动）
 //   5. 最小化键左侧提供 Win11 风格任务栏时钟：时间/日期两行显示
 //      （跟随系统区域格式与"显示秒"设置），悬停有药丸高亮，
-//      点击打开/收起系统"日期和时间"日历浮出窗口
+//      左键打开/收起系统「快速设置」面板 —— 点击 Win11 任务栏右侧
+//      网络/音量/电池三合一按钮弹出的同一个系统面板（系统快捷键 Win+A）；
+//      面板由 shell 绘制、内容也全归系统，但顶栏会把它的宿主窗口挪到
+//      顶栏正下方，使面板上缘紧贴顶栏下缘（见 AlignQuickSettingsToBar）；
+//      右键打开/收起系统「日期和时间」日历浮出窗口（原来的左键行为）
 //   6. 高度等于 Chrome 浏览器标签栏的高度（约 40px，随 DPI 缩放）
 //   7. 与 Dock 自动收起联动：Dock 开启自动收起时，顶栏层级跟随 Dock ——
 //      Dock 展开：顶栏与 Dock 一样提升为置顶层，覆盖所有窗口
@@ -54,6 +66,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <dwmapi.h>  // 扩展边框：填充窗口时补偿不可见边缘（否则四周漏缝）
 #include <objidl.h>  // GDI+ 需要 IStream 等 COM 类型，先于 gdiplus.h 包含
 #include <gdiplus.h>
 #include <dwmapi.h>  // DWMWA_CLOAKED：判断目标窗口是否被系统隐藏（虚拟桌面/最小化 UWP）
@@ -93,6 +106,7 @@
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "Mmdevapi.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "dwmapi.lib")  // DwmGetWindowAttribute：可见边框换算
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "dwmapi.lib")  // 目标窗口 cloaked（被系统隐藏）判定
 
@@ -133,6 +147,10 @@ constexpr float kTabDividerInset = 8.0f;    // 未激活标签之间竖线的上
 // 不随标题长度变化；标签多到放不下时沿用自动缩小逻辑
 constexpr float kUniformTabWidth = 240.0f;   // 1.5 × 160 基准宽度
 
+// 拖动标签重排：按住标签横向拖动的启动阈值（96 DPI 基准，随 DPI 缩放）。
+// 阈值内松手依旧只是"点击切换标签"，避免手抖把标签拖乱。
+constexpr int kTabDragThreshold = 4;
+
 // 左上角音量按钮与展开面板
 constexpr int kVolumeButtonW = 46;      // 音量按钮宽度（与窗口控制按钮一致，便于点击）
 constexpr int kVolumePanelW = 260;      // 展开的音量面板宽度
@@ -165,6 +183,30 @@ constexpr UINT_PTR kSlowRefreshTimerId = 4;
 constexpr UINT kSlowRefreshMs = 10000;
 // 右键新建窗口后抢前台的失败重试次数（随挂起态短轮询触发，约每 200ms 一次）
 constexpr int kMaxPendingFocusAttempts = 5;
+// 扩展断连优雅期（一次性定时器）：短暂掉线（扩展热重载、宿主重启、SW 被
+// 系统回收后 alarm 复活）时不立刻丢弃已同步的浏览器标签、回退成窗口枚举
+// ——那会让顶栏"只剩当前标签页"，正是本次要修的现象。等到优雅期结束仍
+// 未重连才真正回退；期间一旦重连则取消。
+constexpr UINT_PTR kChromeSyncGraceTimerId = 7;
+constexpr UINT kChromeSyncGraceMs = 4000;
+// 系统「快速设置」面板对齐定时器（面板打开期间常驻，关闭即停）：
+// 轮询面板宿主的窗口区域，把面板上缘持续贴到顶栏下缘。
+// 面板位置由 shell 决定（任务栏上方），只能由顶栏把它的宿主窗口挪到位；
+// 面板内容变化（展开 Wi-Fi 等）会改变区域，故用轮询而非只对一次。
+// 详见 ToggleQuickSettings / AlignQuickSettingsToBar。
+constexpr UINT_PTR kQuickSettingsAlignTimerId = 8;
+// 等面板出现 / 刚出现时的高频节拍：面板由 shell 拉起，show 之后才轮到我们
+// 摆位置，节拍必须够快才抢在首帧之前；出现并稳定后再降到低频跟随。
+constexpr UINT kQuickSettingsAlignFastMs = 20;
+constexpr UINT kQuickSettingsAlignPollMs = 250;
+// 等面板出现的最长时间（期间高频重试），以及出现后保持高频的时长
+// （shell 可能在 show 之后再补一次定位，需要盯住）
+constexpr ULONGLONG kQuickSettingsAlignWaitMs = 3000;
+constexpr ULONGLONG kQuickSettingsAlignSettleMs = 800;
+// 宿主窗口区域上缘比"可见卡片上缘"高出的留白（卡片投影，8 逻辑像素；
+// 本机 150% DPI 实测 12px）。要对齐的是可见卡片，所以必须把这圈留白
+// 一并算进去，否则卡片上方会留一条与留白等宽的缝（0 间距 = 紧贴）。
+constexpr int kQuickSettingsCardInsetBase = 8;
 
 // Dock 点击"已打开的应用"并激活后,显式请求顶栏聚焦该应用窗口。
 // 顶栏的目标粘住逻辑不认 Dock 窗口上的点击(套件窗口),若不绕过,
@@ -211,11 +253,20 @@ constexpr int kChromeSyncPort = 9786;
 constexpr UINT kChromeSyncMsg = WM_APP + 10;
 // 扩展连接/断开状态通知（wParam = 1 连接 / 0 断开）
 constexpr UINT kChromeSyncStateMsg = WM_APP + 11;
-// 客户端 socket 接收超时：空闲时发 ping 探活，连续超时则断开。
-// 阈值必须大于扩展心跳间隔（60s）：4 × 25s = 100s 才判失联，
-// 扩展每 60s ping 一次时不会误断，同时把失联检测从 50s 放宽到 100s
-constexpr int kChromeSyncRecvTimeoutMs = 25000;
-constexpr int kChromeSyncMaxIdleTimeouts = 4;
+// 客户端 socket 接收超时：空闲时向扩展推送**应用层 JSON 心跳**探活。
+//
+// 为什么必须是应用层消息而不是 WS 协议层 ping：
+// MV3 的 Service Worker 空闲约 30s 会被回收（连接随之关闭，与省电模式无关），
+// 而只有「JS 收到一条 WS 消息」才会重置该回收计时器——WS 协议的 ping/pong
+// 由网络栈直接应答，不会派发到 JS，无法保活。因此探活间隔必须 < 30s；
+// 这里取 15s（2 倍余量），并按 8 次无应答（120s）才判失联。
+// 详见 chrome-tab-sync/background.js 文件头说明。
+constexpr int kChromeSyncRecvTimeoutMs = 15000;
+constexpr int kChromeSyncMaxIdleTimeouts = 8;
+// 应用层心跳负载：扩展侧 handleMessage 收到 ping 回 pong。
+// 两侧都必须走 JS 可见的文本帧，UI 线程无需处理（在帧层拦截，不惊动 UI）。
+constexpr char kChromeSyncPingJson[] = "{\"type\":\"ping\"}";
+constexpr char kChromeSyncPongJson[] = "{\"type\":\"pong\"}";
 // 握手阶段读取超时（5s）与请求头上限（8KB）
 constexpr int kChromeSyncHandshakeTimeoutMs = 5000;
 constexpr size_t kChromeSyncMaxHeaderBytes = 8192;
@@ -264,6 +315,13 @@ struct AppState {
     bool targetMaximized = false;        // 目标当前是否处于最大化
     bool targetSticky = false;           // 目标最小化后保持跟踪，不跟随系统自动转移的焦点
 
+    // 双击顶栏空白处：目标窗口"填充顶栏以外区域"（自定义缩放，非系统最大化，
+    // 故 IsZoomed() 不会为真），这里记录各窗口填充前的位置供再次双击还原。
+    // 用 HWND 映射而不是单槽位：用户可能先后填充多个窗口并在其间来回切换，
+    // 只记最后一个会让先填充的窗口丢失还原位置（第二次双击退化成"还原到
+    // 填充后的矩形"，看起来像没反应）。
+    std::unordered_map<HWND, WINDOWPLACEMENT> filledWindows;
+
     int hoverButton = kHitNone;          // 当前悬停的按钮
     int hoverTab = -1;                   // 当前悬停的 Chrome 标签索引
     bool trackingMouse = false;
@@ -294,12 +352,36 @@ struct AppState {
     std::wstring clockDateText;          // 当前日期文本（如 "2026/8/28"）
     bool clockShowSeconds = false;       // 是否显示秒（跟随系统"显示秒"设置）
 
+    // 系统「快速设置」面板对齐轮询（见 ToggleQuickSettings/对齐定时器）：
+    // quickAlignSeen 区分"面板还没被 shell 拉起来"与"面板已经关掉"——
+    // 前者要再等一会儿，后者要立刻停表（零轮询）
+    bool quickAlignSeen = false;
+    bool quickAlignSettled = false;        // 是否已从高频节拍降到低频
+    ULONGLONG quickAlignDeadline = 0;      // 等面板出现的截止时刻
+    ULONGLONG quickAlignFastUntil = 0;     // 出现后保持高频节拍的截止时刻
+
     // 按住空白处拖动（等同标题栏拖动，移动当前目标窗口）
     bool dragWindow = false;             // 正在拖动（按下空白处）
     bool dragMoving = false;             // 已超过阈值，真正移动窗口
     HWND dragHwnd = nullptr;             // 被拖动的窗口
     POINT dragStartPt{};                 // 按下点（屏幕坐标）
     POINT dragOffset{};                  // 光标相对窗口左上角的偏移
+
+    // 按住标签左右拖动重排（"随意拖动标签页"）：
+    //   按下标签 -> tabPressIndex 记住位置；超过阈值 -> tabDragging
+    //   拖动中按光标位置实时"让位"（被拖标签在 s.tabs 中逐格移动，
+    //   其余标签自动补位），松手时落定并重绘。
+    // 被拖标签用身份（Chrome tabId / 窗口句柄）跟踪而不是索引：
+    // 拖动途中扩展推送一条 tabUpdated 就会重建列表，索引会漂移。
+    int tabPressIndex = -1;      // 按住的标签索引（-1 = 没有按住）
+    bool tabDragging = false;    // 是否已超过阈值、进入拖动重排
+    int tabDragIndex = -1;       // 被拖标签当前所处索引
+    bool tabDragIsChrome = false;  // 被拖标签是否来自 Chrome 同步
+    int tabDragChromeId = 0;     // Chrome 模式：被拖标签的 tabId
+    HWND tabDragHwnd = nullptr;  // 窗口模式：被拖标签的窗口句柄
+    POINT tabPressPt{};          // 按下点（客户区坐标，判定阈值用）
+    POINT tabDragPt{};           // 拖动中的光标（客户区坐标，浮起标签跟随用）
+    float tabDragGrabDx = 0.0f;  // 按下点相对标签左边缘的偏移
 
     // Chrome 风格标签：聚焦窗口所属应用打开的全部顶层窗口
     std::vector<TabInfo> tabs;
@@ -549,23 +631,169 @@ bool UpdateClock(AppState& s) {
     return true;
 }
 
-// 模拟 Win+Alt+D（系统级注册快捷键）：与点击 Win11 任务栏时钟一致，
-// 打开/收起"日期和时间"日历浮出窗口。
-void ToggleCalendarFlyout() {
-    INPUT inputs[6] = {};
-    auto keyEvent = [&inputs](int idx, WORD vk, bool up) {
-        inputs[idx].type = INPUT_KEYBOARD;
-        inputs[idx].ki.wVk = vk;
-        inputs[idx].ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+// 模拟系统级 Win+<键> 组合快捷键。
+//
+// 为什么必须用 SendInput 而不是 PostMessage 投递给某个窗口：
+// 顶栏是 WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW 的置顶浮层，点击它不抢焦点
+// （前台仍是用户的应用窗口），而系统快捷键由 shell 在全局热键层处理，
+// 只有注入到全局输入流（SendInput）才会被系统当作真实的 Win 组合键。
+//
+//   Win+A → 系统「快速设置」面板（任务栏网络/音量/电池三合一按钮同一面板）
+//   Win+N → 系统「通知中心 / 日历」浮出窗口（= 点击 Win11 任务栏时钟的窗口）
+void SendWinChord(WORD vk) {
+    INPUT inputs[4] = {};
+    int count = 0;
+    auto keyEvent = [&inputs, &count](WORD key, bool up) {
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = key;
+        inputs[count].ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+        ++count;
     };
-    keyEvent(0, VK_LWIN, false);
-    keyEvent(1, VK_MENU, false);
-    keyEvent(2, 'D', false);
-    keyEvent(3, 'D', true);
-    keyEvent(4, VK_MENU, true);
-    keyEvent(5, VK_LWIN, true);
-    SendInput(6, inputs, sizeof(INPUT));
+    keyEvent(VK_LWIN, false);
+    keyEvent(vk, false);
+    keyEvent(vk, true);
+    keyEvent(VK_LWIN, true);
+    SendInput(static_cast<UINT>(count), inputs, sizeof(INPUT));
 }
+
+// 系统「快速设置」面板的宿主窗口判定（类名固定 ControlCenterWindow，
+// 窗口名"快速设置"）。面板由 shell 托管，可传任意候选窗口。
+bool IsQuickSettingsHost(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return false;
+    }
+    wchar_t cls[64] = {};
+    if (GetClassNameW(hwnd, cls, 63) <= 0) {
+        return false;
+    }
+    return wcscmp(cls, L"ControlCenterWindow") == 0;
+}
+
+// 宿主窗口是否在前台（= 面板当前打开）
+bool IsQuickSettingsForeground() {
+    return IsQuickSettingsHost(GetForegroundWindow());
+}
+
+// 把系统「快速设置」面板挪到"上缘紧贴顶栏下缘"。
+//
+// 为什么需要挪：面板的摆放由 shell 决定 —— 它把面板锚在任务栏上方（本机
+// 系统任务栏被 Dock 隐藏，于是落在屏幕右下角），顶栏无法通过任何公开接口
+// 指定锚点。能改的只有面板宿主的窗口位置：
+//   * 宿主是屏幕右侧一条高约整屏的透明浮层（本机 150% DPI 下 576x1528、
+//     位于 (1984,0)），可见卡片贴在宿主底部；
+//   * GetWindowRgn(宿主) 返回的窗口区域上缘在"可见卡片上缘"之上 8 逻辑
+//     像素（卡片投影留白；本机 150% DPI 实测 12px），且随内容变化移动；
+//   * 于是把宿主上移"区域上缘 + 留白 - 顶栏下缘"，可见卡片上缘正好落在
+//     顶栏下缘（严格 0 间距，不靠肉眼估）。
+// 代价：宿主区域会因此向上越过顶栏下缘 8 逻辑像素（那圈投影留白与顶栏
+// 下缘重叠）。那一条是半透明投影、可见卡片并未被遮住；期间点在那条里
+// 等同于"点在面板外"，shell 会把面板收起（与再点一次时钟同样的效果）。
+// 面板关闭/宿主不在前台时本函数不做任何事；取不到窗口区域时也保持系统
+// 原位（宁可不挪，也不猜一个位置乱放）。
+// 返回 true = 这次已把它摆到位（或本来就到位）。
+bool AlignQuickSettingsToBar(AppState& s, HWND host) {
+    if (!IsQuickSettingsHost(host)) {
+        return false;
+    }
+    RECT hostRc{};
+    RECT barRc{};
+    if (!GetWindowRect(host, &hostRc) || !GetWindowRect(s.hwnd, &barRc)) {
+        return false;
+    }
+
+    // 窗口区域（宿主是无边框弹窗，客户区原点与窗口原点一致）
+    HRGN rgn = CreateRectRgn(0, 0, 0, 0);
+    if (!rgn) {
+        return false;
+    }
+    const int kind = GetWindowRgn(host, rgn);
+    RECT rgnBox{};
+    const BOOL haveBox = GetRgnBox(rgn, &rgnBox) != 0;
+    DeleteObject(rgn);
+    if (kind == ERROR || kind == NULLREGION || !haveBox) {
+        return false;  // 区域还没就绪（刚 show）：下次高频节拍再来
+    }
+
+    const int targetTop = barRc.bottom - rgnBox.top -
+                          MulDiv(kQuickSettingsCardInsetBase, s.dpi, 96);
+    if (targetTop != hostRc.top) {
+        SetWindowPos(host, HWND_TOPMOST, hostRc.left, targetTop,
+                     hostRc.right - hostRc.left, hostRc.bottom - hostRc.top,
+                     SWP_NOACTIVATE);
+    }
+    return true;
+}
+
+// 起表：高频等面板出现（见 kQuickSettingsAlignFastMs）。时钟左键、
+// 以及 WinEvent 收到面板 show 时都会调用；重复调用只是重置节拍。
+void ArmQuickSettingsAlign(AppState& s, bool alreadyShown) {
+    const ULONGLONG now = GetTickCount64();
+    if (!alreadyShown) {
+        s.quickAlignSeen = false;
+        s.quickAlignDeadline = now + kQuickSettingsAlignWaitMs;
+    } else {
+        s.quickAlignSeen = true;
+    }
+    s.quickAlignSettled = false;
+    s.quickAlignFastUntil = now + kQuickSettingsAlignSettleMs;
+    SetTimer(s.hwnd, kQuickSettingsAlignTimerId, kQuickSettingsAlignFastMs,
+             nullptr);
+}
+
+void StopQuickSettingsAlign(AppState& s) {
+    KillTimer(s.hwnd, kQuickSettingsAlignTimerId);
+}
+
+// 打开/收起系统「快速设置」面板（Win+A）：就是点击 Win11 任务栏右侧
+// 网络/音量/电池三合一按钮弹出的那个面板。左键时钟即调用本函数。
+//
+// 位置由 kQuickSettingsAlignTimerId 对齐（见 AlignQuickSettingsToBar）。
+// 这里只"起表"；真正抢在首帧之前摆好位置的是 WinEventProc 里的
+// EVENT_OBJECT_SHOW 分支（面板一 show 立刻挪），定时器负责兜底 +
+// 跟随展开内容（展开 Wi-Fi / 蓝牙列表时区域上缘会变，需要持续复查）。
+void ToggleQuickSettings(AppState& s) {
+    if (IsQuickSettingsForeground()) {
+        // 已打开：收起并停掉对齐轮询
+        StopQuickSettingsAlign(s);
+        SendWinChord('A');
+        return;
+    }
+    SendWinChord('A');
+    ArmQuickSettingsAlign(s, false);
+}
+
+// 对齐轮询节拍：面板在 → 对齐并（稳定后）降到低频跟随；面板关 → 停表。
+// 面板还没出现时按 kQuickSettingsAlignWaitMs 宽限等待 —— shell 拉起有
+// 延迟，第一拍还没出现不能立刻停表。
+void TickQuickSettingsAlign(AppState& s) {
+    const ULONGLONG now = GetTickCount64();
+    HWND fg = GetForegroundWindow();
+    if (!IsQuickSettingsHost(fg)) {
+        if (s.quickAlignSeen || now > s.quickAlignDeadline) {
+            StopQuickSettingsAlign(s);
+        }
+        return;
+    }
+    AlignQuickSettingsToBar(s, fg);
+    if (!s.quickAlignSeen) {
+        s.quickAlignSeen = true;
+        s.quickAlignFastUntil = now + kQuickSettingsAlignSettleMs;
+    } else if (!s.quickAlignSettled && now > s.quickAlignFastUntil) {
+        // 已稳定：降到低频（内容变化时才需要再动，零浪费）
+        s.quickAlignSettled = true;
+        SetTimer(s.hwnd, kQuickSettingsAlignTimerId, kQuickSettingsAlignPollMs,
+                 nullptr);
+    }
+}
+
+// 打开/收起系统「通知中心 / 日历」浮出窗口（Win+N，含日期时间日历）。
+// 顶栏时钟的左键已改为快速设置，这里保留为时钟右键的日历入口。
+//
+// 为什么不是原先的 Win+Alt+D：该组合在本机实测不产生任何窗口（发送前后
+// 前台窗口不变、截图无浮出层），且它本就不是 Windows 官方快捷键；而 Dock
+// 运行时会隐藏系统任务栏，那条"点击任务栏时钟"的路径也不存在。Win+N 是
+// 官方快捷键，实测能稳定唤出与点击任务栏时钟相同的窗口。
+void ToggleCalendarFlyout() { SendWinChord('N'); }
 
 // 全局钩子：用户"显式选择窗口"的信号（鼠标点击 / Alt+Tab），
 // 供目标跟踪区分系统自动转移焦点与用户主动切换窗口
@@ -666,9 +894,17 @@ bool IsControlTarget(HWND hwnd, HWND self) {    if (!hwnd || hwnd == self) {
 }
 
 void ResolveVolumeSession(AppState& s);  // 前置声明（定义在前台窗口轮询之后）
+// 目标应用是否还有"看得见且未最小化"的窗口（整组最小化判定，定义在下方）
+bool AppHasVisibleWindow(HWND self, HWND target);
 bool ProcessTreeContains(DWORD rootPid, DWORD sessionPid);  // 前置声明（定义在下方）
 bool RefreshTabs(AppState& s);             // 前置声明（定义在下方）
 int HitTestTab(AppState& s, int x, int y); // 前置声明（定义在下方）
+// 拖动标签重排相关（定义在下方）
+void TabStripRange(AppState& s, float& left, float& right);
+int TabDragLo(AppState& s, bool draggingPinned);  // 让位区间下限（固定标签约束）
+int TabDragHi(AppState& s, bool draggingPinned);  // 让位区间上限（固定标签约束）
+void CancelTabDrag(AppState& s);
+void CommitTabReorder(AppState& s, int movedIndex);
 
 // Chrome 标签同步相关前置声明（定义在下方）
 bool IsChromeTarget(HWND hwnd);
@@ -677,6 +913,7 @@ bool ChromeSyncSendJson(const std::string& utf8Json);
 void ChromeSyncSendActivateTab(int tabId);
 void ChromeSyncSendCloseTab(int tabId);
 void ChromeSyncSendNewTab();
+void ChromeSyncSendMoveTab(int tabId, int index);
 void ChromeSyncStart(HWND hwnd);
 void ChromeSyncStop();
 
@@ -739,6 +976,11 @@ void ApplyTargetInfo(AppState& s, HWND hwnd) {
 // 特殊处理：当当前目标被最小化时，Windows 会自动把前台让给下一个窗口
 // （如 A 最小化后 B 成为前台）。此时顶栏不跟随系统转移——目标保持 A，
 // 直到用户显式点击其他窗口或 Alt+Tab 切换，避免"最小化 A 却变成操作 B"。
+//
+// 例外（本函数入口的整组最小化判定）：被最小化的是该应用的**最后**一张
+// 窗口（如 Dock 点图标"最小化全部窗口"，或最小化单窗口应用的唯一窗口）时，
+// 应用已经没有可展示的窗口，粘在它身上只会让顶栏聚焦一个看不见的应用。
+// 此时不再粘住，改为跟随 Windows 当前聚焦的窗口。
 void UpdateTarget(AppState& s) {
     HWND fg = GetForegroundWindow();
 
@@ -746,6 +988,18 @@ void UpdateTarget(AppState& s) {
     if (s.hasTarget && s.targetHwnd && IsWindow(s.targetHwnd)) {
         if (IsIconic(s.targetHwnd)) {
             s.targetSticky = true;
+        }
+        if (s.targetSticky) {
+            // 整组最小化：目标应用已无任何"看得见且未最小化"的窗口
+            // （含最小化动作尚未落到 IsIconic 的竞态帧——那时前台早已
+            // 让给别人，同样按整组最小化处理）。解粘并落到下方通用逻辑：
+            // 跟随 Windows 当前聚焦的窗口；若系统没有给出可聚焦的前台
+            // 窗口，则清空目标（标签清空），而不是继续显示看不见的应用。
+            if (IsIconic(s.targetHwnd) || fg != s.targetHwnd) {
+                if (!AppHasVisibleWindow(s.hwnd, s.targetHwnd)) {
+                    s.targetSticky = false;
+                }
+            }
         }
         if (s.targetSticky) {
             // 用户显式选择：鼠标点击其他窗口 / Alt+Tab
@@ -865,6 +1119,130 @@ void HitButton(HWND self, HWND target, ButtonHit hit) {
     }
 }
 
+// ---- 双击顶栏：让目标窗口"填充顶栏以外区域" ----
+//
+// 与右侧最大化键的系统最大化（SW_MAXIMIZE）不同：窗口只填满顶栏之外的
+// 屏幕区域——上缘压在顶栏下缘，顶栏本身始终可见（类 macOS 的"缩放"）。
+// 因为是顶栏自己摆的窗口，IsZoomed() 不会为真，所以填充前的位置由
+// AppState::filledWindows 自持，再次双击据此还原。
+
+// 目标窗口的"填充"矩形（屏幕坐标）：目标所在显示器的工作区，
+// 同屏时上缘让位给顶栏（顶栏下缘 = 可见区域上缘）。
+RECT FillRectFor(HWND bar, HWND target) {
+    RECT r{};
+    const HMONITOR targetMon = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (targetMon != nullptr && GetMonitorInfoW(targetMon, &mi)) {
+        r = mi.rcWork;  // 与系统最大化一致：铺满工作区（任务栏/Dock 之外）
+    } else {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &r, 0);
+    }
+    RECT barRc{};
+    const HMONITOR barMon =
+        (bar && IsWindow(bar)) ? MonitorFromWindow(bar, MONITOR_DEFAULTTONEAREST)
+                               : nullptr;
+    // 仅当目标与顶栏同屏时才给顶栏让位；窗口在副屏时顶栏不在那里，
+    // 按该屏工作区铺满即可
+    if (bar && IsWindow(bar) && barMon == targetMon &&
+        GetWindowRect(bar, &barRc) && barRc.bottom > r.top) {
+        r.top = barRc.bottom;
+    }
+    return r;
+}
+
+// 目标窗口当前是否处于填充态（窗口已销毁/已被系统最大化都视为否）
+bool TargetIsFilled(const AppState& s, HWND target) {
+    return target != nullptr && IsWindow(target) && !IsZoomed(target) &&
+           s.filledWindows.find(target) != s.filledWindows.end();
+}
+
+// 把"想让窗口可见边框占据的矩形"换算成要传给 SetWindowPos 的窗口矩形。
+//
+// Win10+ 标准边框窗口的窗口矩形在左/右/下三边比可见边框多出一圈不可见边缘
+// （阴影/缩放边框，本机 150% DPI 下量得 9px）。直接按工作区设置窗口矩形，
+// 可见边框就会三边内缩、四周露出桌面背景（这正是"自己摆窗口"与系统最大化
+// 的差别：系统最大化会自动把这圈边缘溢出到屏幕外）。这里用 DWM 的扩展边框
+// （可见边框）反推内缩量补偿回去；自定义边框窗口（如本套件组件、无边框窗口）
+// 差值为 0，取不到 DWM 数据时按原样返回。
+RECT InflateForInvisibleFrame(HWND target, const RECT& visible) {
+    RECT wr{};
+    RECT ext{};
+    if (!GetWindowRect(target, &wr) ||
+        FAILED(DwmGetWindowAttribute(target, DWMWA_EXTENDED_FRAME_BOUNDS, &ext,
+                                     sizeof(ext)))) {
+        return visible;
+    }
+    RECT out = visible;
+    out.left -= (std::max)(0L, ext.left - wr.left);
+    out.top -= (std::max)(0L, ext.top - wr.top);
+    out.right += (std::max)(0L, wr.right - ext.right);
+    out.bottom += (std::max)(0L, wr.bottom - ext.bottom);
+    return out;
+}
+
+// 进入填充：先记住当前位置，再把窗口摆到"顶栏以外"的区域。
+// 若目标是系统最大化状态：还原时仍回到最大化之前的普通位置（而不是又弹回
+// 最大化），故保存的 showCmd 一律归为 SW_SHOWNORMAL。
+void FillTarget(AppState& s, HWND target) {
+    WINDOWPLACEMENT wp{};
+    wp.length = sizeof(wp);
+    if (!GetWindowPlacement(target, &wp)) {
+        return;
+    }
+    wp.showCmd = SW_SHOWNORMAL;
+    s.filledWindows[target] = wp;
+
+    if (IsZoomed(target)) {
+        ShowWindow(target, SW_RESTORE);  // 先退出系统最大化，否则 SetWindowPos 无效
+    }
+    RECT r = FillRectFor(s.hwnd, target);
+    r = InflateForInvisibleFrame(target, r);  // 可见边框正好贴住目标区域
+    SetWindowPos(target, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// 退出填充：还原到双击前的位置
+void UnfillTarget(AppState& s, HWND target) {
+    const auto it = s.filledWindows.find(target);
+    if (it == s.filledWindows.end()) {
+        return;
+    }
+    WINDOWPLACEMENT wp = it->second;
+    wp.showCmd = SW_SHOWNORMAL;
+    s.filledWindows.erase(it);
+    if (target && IsWindow(target)) {
+        SetWindowPlacement(target, &wp);
+    }
+}
+
+// 双击顶栏空白处：填充 ↔ 还原
+void ToggleFillTarget(AppState& s, HWND target) {
+    if (!target || !IsWindow(target)) {
+        return;
+    }
+    // 顺手清理已销毁窗口的陈旧记录（数量极少，代价可忽略）
+    for (auto it = s.filledWindows.begin(); it != s.filledWindows.end();) {
+        if (IsWindow(it->first)) {
+            ++it;
+        } else {
+            it = s.filledWindows.erase(it);
+        }
+    }
+
+    if (IsIconic(target)) {
+        // 最小化：只还原显示（保持既有"先还原不直接缩放"的语义），
+        // 若它原本是填充态，SW_RESTORE 会回到填充矩形，再次双击才还原
+        ShowWindow(target, SW_RESTORE);
+        return;
+    }
+    if (TargetIsFilled(s, target)) {
+        UnfillTarget(s, target);
+    } else {
+        FillTarget(s, target);
+    }
+}
+
 int HitTestTab(AppState& s, int x, int y) {
     if (y < 0 || y >= BarAreaHeight(s) || x < 0 || x >= s.width) {
         return -1;
@@ -973,7 +1351,8 @@ ButtonHit HitTestButton(AppState& s, int x, int y) {
         return kHitTab;
     }
 
-    // 最小化键左侧的 Win11 风格时钟区域（点击 = 打开系统日历浮出窗口）
+    // 最小化键左侧的 Win11 风格时钟区域
+    // （左键 = 系统快速设置面板，右键 = 系统日历浮出窗口，见各点击分支）
     RectF clockR;
     ComputeClockRect(s, clockR);
     if (x >= static_cast<int>(clockR.X) &&
@@ -1157,6 +1536,13 @@ void ChromeSyncSendNewTab() {
     ChromeSyncSendJson(wsproto::ChromeSyncBuildCommand(L"newTab"));
 }
 
+// 拖动重排落定：让扩展把标签移动到新位置（chrome.tabs.move）。
+// 扩展执行后浏览器会推 tabMoved 回来，顺序以浏览器为准对齐。
+void ChromeSyncSendMoveTab(int tabId, int index) {
+    ChromeSyncSendJson(
+        wsproto::ChromeSyncBuildMoveTabCommand(tabId, index));
+}
+
 // 关闭当前客户端连接（可跨线程调用；sendMutex 串行化与 send 的竞争）
 void ChromeSyncCloseClient() {
     std::lock_guard<std::mutex> lock(g_chromeServer.sendMutex);
@@ -1284,6 +1670,19 @@ void ChromeSyncDeliverText(const std::string& utf8) {
                  reinterpret_cast<LPARAM>(copy));
 }
 
+// 顶栏 <-> 扩展的应用层心跳（保活 MV3 Service Worker，见常量注释）。
+// 返回 true 表示该文本消息已被心跳处理，调用方不要再投递到 UI 线程。
+bool ChromeSyncHandleKeepAlive(const std::string& utf8) {
+    if (utf8 == kChromeSyncPingJson) {
+        ChromeSyncSendFrameRaw(0x1, kChromeSyncPongJson);
+        return true;
+    }
+    if (utf8 == kChromeSyncPongJson) {
+        return true;
+    }
+    return false;
+}
+
 // 解析帧缓冲中的全部完整帧；返回 false 表示协议错误需断开
 bool ChromeSyncProcessFrames() {
     while (!g_chromeServer.stop.load()) {
@@ -1303,7 +1702,10 @@ bool ChromeSyncProcessFrames() {
         switch (frame.opcode) {
         case 0x1:  // 文本
             if (frame.fin) {
-                ChromeSyncDeliverText(frame.payload);
+                // 心跳在帧层消化，不占用 UI 线程（避免无谓重绘/唤醒）
+                if (!ChromeSyncHandleKeepAlive(frame.payload)) {
+                    ChromeSyncDeliverText(frame.payload);
+                }
             } else {
                 g_chromeServer.pendingText += frame.payload;
             }
@@ -1311,7 +1713,9 @@ bool ChromeSyncProcessFrames() {
         case 0x0:  // 延续帧
             g_chromeServer.pendingText += frame.payload;
             if (frame.fin) {
-                ChromeSyncDeliverText(g_chromeServer.pendingText);
+                if (!ChromeSyncHandleKeepAlive(g_chromeServer.pendingText)) {
+                    ChromeSyncDeliverText(g_chromeServer.pendingText);
+                }
                 g_chromeServer.pendingText.clear();
             }
             break;
@@ -1381,8 +1785,10 @@ void ChromeSyncServerThread() {
         }
         const int err = WSAGetLastError();
         if (err == WSAETIMEDOUT) {
-            // 空闲探活：发 ping；连续多次无响应则断开
-            ChromeSyncSendFrameRaw(0x9, "");
+            // 空闲探活：推应用层 JSON ping（扩展回 pong）。
+            // 该消息是 MV3 Service Worker 保活的关键：JS 收到消息才会重置
+            // 30s 空闲回收计时器，WS 协议层 ping 不经过 JS、无法保活。
+            ChromeSyncSendFrameRaw(0x1, kChromeSyncPingJson);
             if (++g_chromeServer.idleTimeouts > kChromeSyncMaxIdleTimeouts) {
                 ChromeSyncCloseClient();
             }
@@ -1518,33 +1924,81 @@ bool IsShellSystemWindow(HWND hwnd) {
            wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0;
 }
 
+// 该窗口是否算目标"应用"的一张任务栏窗口（标签枚举与最小化判定共用）
+bool IsAppWindowCandidate(HWND hwnd, HWND self, HWND target) {
+    if (!hwnd || hwnd == self || !target) {
+        return false;
+    }
+    if (!IsTaskbarWindow(hwnd)) {
+        return false;
+    }
+    // 忽略桌面 / 任务栏等系统 Shell 窗口，避免资源管理器标签混入系统窗口
+    if (IsShellSystemWindow(hwnd)) {
+        return false;
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0 || pid == GetCurrentProcessId()) {
+        return false;
+    }
+    return IsSameApplication(hwnd, target);
+}
+
+struct EnumAppWindowsContext {
+    HWND self = nullptr;
+    HWND target = nullptr;
+    std::vector<HWND>* windows = nullptr;
+};
+
+BOOL CALLBACK EnumAppWindowListProc(HWND hwnd, LPARAM lParam) {
+    auto* ctx = reinterpret_cast<EnumAppWindowsContext*>(lParam);
+    if (!ctx || !ctx->windows) {
+        return TRUE;
+    }
+    if (!IsAppWindowCandidate(hwnd, ctx->self, ctx->target)) {
+        return TRUE;
+    }
+    ctx->windows->push_back(hwnd);
+    return TRUE;
+}
+
+// 目标应用是否还有"看得见、没被最小化"的窗口。
+//
+// 用于区分"最小化该应用的一张窗口"与"最小化该应用的全部窗口"：
+// 前者保持顶栏粘住（不跟随系统自动转移的前台，避免"最小化 A 却操作 B"）；
+// 后者应用已经没有可展示的窗口，粘住毫无意义 —— 顶栏应改跟 Windows
+// 当前聚焦的窗口。
+bool AppHasVisibleWindow(HWND self, HWND target) {
+    std::vector<HWND> windows;
+    EnumAppWindowsContext ctx;
+    ctx.self = self;
+    ctx.target = target;
+    ctx.windows = &windows;
+    EnumWindows(EnumAppWindowListProc, reinterpret_cast<LPARAM>(&ctx));
+    for (HWND w : windows) {
+        if (IsWindow(w) && !IsIconic(w)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct EnumTabsContext {
     HWND self = nullptr;
     HWND target = nullptr;
-    DWORD selfPid = 0;
     std::vector<TabInfo>* tabs = nullptr;
 };
 
 BOOL CALLBACK EnumAppWindowsProc(HWND hwnd, LPARAM lParam) {
     auto* ctx = reinterpret_cast<EnumTabsContext*>(lParam);
-    if (!ctx || !ctx->tabs || !ctx->target || hwnd == ctx->self) {
+    if (!ctx || !ctx->tabs) {
         return TRUE;
     }
-    if (!IsTaskbarWindow(hwnd)) {
-        return TRUE;
-    }
-    // 忽略桌面 / 任务栏等系统 Shell 窗口，避免资源管理器标签混入系统窗口
-    if (IsShellSystemWindow(hwnd)) {
+    if (!IsAppWindowCandidate(hwnd, ctx->self, ctx->target)) {
         return TRUE;
     }
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
-    if (pid == 0 || pid == ctx->selfPid) {
-        return TRUE;
-    }
-    if (!IsSameApplication(hwnd, ctx->target)) {
-        return TRUE;
-    }
 
     TabInfo info;
     info.hwnd = hwnd;
@@ -1552,6 +2006,103 @@ BOOL CALLBACK EnumAppWindowsProc(HWND hwnd, LPARAM lParam) {
     info.title = GetWindowTitleText(hwnd);
     ctx->tabs->push_back(info);
     return TRUE;
+}
+
+// 标签条可用区间：音量键右侧 6px 到时钟左侧 6px（LayoutTabs 与拖动重排共用，
+// 保证"浮起的标签"和正常布局落在同一段可用宽度里）
+void TabStripRange(AppState& s, float& left, float& right) {
+    const float k = s.scale;
+    RectF volR;
+    VolumeButtonRect(s, volR);
+    RectF clockR;
+    ComputeClockRect(s, clockR);
+    left = volR.X + volR.Width + 6.0f * k;
+    // 标签区右边界让位给最小化键左侧的时钟区域
+    right = clockR.X - 6.0f * k;
+}
+
+// 拖动让位的允许区间（Chrome 固定标签恒在最前）：
+//   被拖的是普通标签 -> 只能落在固定区之后；
+//   被拖的是固定标签 -> 只能在固定区内移动；
+//   窗口枚举模式（无固定标签概念）-> 整段都行。
+int TabDragLo(AppState& s, bool draggingPinned) {
+    if (!ChromeSyncMode(s) || draggingPinned) {
+        return 0;
+    }
+    int pinned = 0;
+    for (const auto& t : s.tabs) {
+        if (t.isChrome && t.chromePinned) {
+            ++pinned;
+        } else {
+            break;
+        }
+    }
+    return pinned;
+}
+
+int TabDragHi(AppState& s, bool draggingPinned) {
+    if (!ChromeSyncMode(s) || !draggingPinned) {
+        return -1;  // -1 = 不限制（取列表末尾）
+    }
+    int pinned = 0;
+    for (const auto& t : s.tabs) {
+        if (t.isChrome && t.chromePinned) {
+            ++pinned;
+        } else {
+            break;
+        }
+    }
+    return pinned - 1;
+}
+
+// 结束拖动重排状态（不改顺序；顺序在拖动过程中已实时生效）
+void CancelTabDrag(AppState& s) {
+    s.tabPressIndex = -1;
+    s.tabDragging = false;
+    s.tabDragIndex = -1;
+    s.tabDragChromeId = 0;
+    s.tabDragHwnd = nullptr;
+    s.tabDragGrabDx = 0.0f;
+}
+
+// 松手落定：把拖动后的顺序交给"真正的主人"。
+//   Chrome 同步模式：把顶栏顺序写回同步模型（index 一并改写，否则之后
+//     任何一条 tabUpdated 的 upsert 都会按浏览器旧 index 重新排序，把
+//     用户刚拖好的顺序弹回去），再把最终 index 下发给扩展执行
+//     chrome.tabs.move —— 真正的标签顺序在浏览器里也一起变。
+//   窗口枚举模式：s.tabs 的顺序本身就是展示顺序，RefreshTabs 会保留
+//     既有相对顺序（见其中的 ordered 重建），无需额外持久化。
+void CommitTabReorder(AppState& s, int movedIndex) {
+    if (!ChromeSyncMode(s) || movedIndex < 0 ||
+        movedIndex >= static_cast<int>(s.tabs.size())) {
+        return;
+    }
+    const TabInfo& moved = s.tabs[movedIndex];
+    if (!moved.isChrome) {
+        return;
+    }
+
+    // 顶栏展示顺序 -> 同步模型顺序
+    std::vector<int> order;
+    order.reserve(s.tabs.size());
+    for (const auto& t : s.tabs) {
+        if (t.isChrome) {
+            order.push_back(t.chromeTabId);
+        }
+    }
+    wsproto::ChromeSyncApplyOrder(s.chromeSync, order);
+
+    // 下发给扩展：固定标签永远在最前，落点按浏览器规则夹取
+    int pinnedCount = 0;
+    for (const auto& t : s.tabs) {
+        if (t.chromePinned) {
+            ++pinnedCount;
+        }
+    }
+    const int index = wsproto::ChromeClampTabIndex(
+        movedIndex, pinnedCount, static_cast<int>(s.tabs.size()),
+        moved.chromePinned);
+    ChromeSyncSendMoveTab(moved.chromeTabId, index);
 }
 
 // 根据当前宽度计算每个标签的矩形（从音量键右侧到右侧三键左侧）。
@@ -1569,16 +2120,9 @@ void LayoutTabs(AppState& s, std::vector<TabInfo>& tabs,
     }
     const float k = s.scale;
 
-    RectF volR;
-    VolumeButtonRect(s, volR);
-    RectF minR, maxR, closeR;
-    ComputeButtonRects(s, minR, maxR, closeR);
-    RectF clockR;
-    ComputeClockRect(s, clockR);
-
-    const float left = volR.X + volR.Width + 6.0f * k;
-    // 标签区右边界让位给最小化键左侧的时钟区域
-    const float right = clockR.X - 6.0f * k;
+    float left = 0.0f;
+    float right = 0.0f;
+    TabStripRange(s, left, right);
     const float available = right - left;
     if (available <= 0.0f) {
         return;
@@ -1626,7 +2170,6 @@ bool RefreshTabs(AppState& s) {
             EnumTabsContext ctx;
             ctx.self = s.hwnd;
             ctx.target = s.targetHwnd;
-            ctx.selfPid = GetCurrentProcessId();
             ctx.tabs = &next;
             EnumWindows(EnumAppWindowsProc, reinterpret_cast<LPARAM>(&ctx));
         }
@@ -1714,6 +2257,39 @@ bool RefreshTabs(AppState& s) {
         next.swap(ordered);
     }
 
+    // 拖动重排进行中：让这次枚举结果跟随顶栏当前的本地顺序。
+    // 否则拖动途中扩展随便推一条 tabUpdated（标题变化等）就会重建列表，
+    // 按浏览器旧顺序重排，用户拖到一半的顺序被打回原样。
+    // 匹配按身份（Chrome tabId / 窗口句柄），不依赖索引。
+    if (s.tabPressIndex >= 0 && !next.empty() && !s.tabs.empty()) {
+        std::vector<TabInfo> ordered;
+        ordered.reserve(next.size());
+        std::vector<bool> used(next.size(), false);
+        for (const auto& old : s.tabs) {
+            for (size_t i = 0; i < next.size(); ++i) {
+                if (used[i]) {
+                    continue;
+                }
+                const bool same =
+                    old.isChrome
+                        ? (next[i].isChrome &&
+                           next[i].chromeTabId == old.chromeTabId)
+                        : (!next[i].isChrome && next[i].hwnd == old.hwnd);
+                if (same) {
+                    ordered.push_back(next[i]);
+                    used[i] = true;
+                    break;
+                }
+            }
+        }
+        for (size_t i = 0; i < next.size(); ++i) {
+            if (!used[i]) {
+                ordered.push_back(next[i]);
+            }
+        }
+        next.swap(ordered);
+    }
+
     // 右键新建窗口的聚焦重试：新窗口出现后可能因前台锁 / 初始化时序
     // 第一次抢前台失败，随标签刷新定时器（约 1s）重试。
     // 窗口消失、已成为前台、用户已切到其他应用或达到次数上限即停止。
@@ -1766,6 +2342,31 @@ bool RefreshTabs(AppState& s) {
         s.tabs.swap(next);
         if (s.hoverTab >= static_cast<int>(s.tabs.size())) {
             s.hoverTab = -1;
+        }
+        // 拖动重排中：列表被重建后按身份重新定位被拖标签，避免索引漂移；
+        // 被拖的标签已经消失（被关掉等）时直接结束拖动
+        if (s.tabPressIndex >= 0) {
+            int found = -1;
+            for (size_t i = 0; i < s.tabs.size(); ++i) {
+                const TabInfo& t = s.tabs[i];
+                const bool same =
+                    s.tabDragIsChrome
+                        ? (t.isChrome && t.chromeTabId == s.tabDragChromeId)
+                        : (!t.isChrome && t.hwnd == s.tabDragHwnd);
+                if (same) {
+                    found = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (found < 0) {
+                CancelTabDrag(s);
+                if (GetCapture() == s.hwnd) {
+                    ReleaseCapture();
+                }
+            } else {
+                s.tabPressIndex = found;
+                s.tabDragIndex = found;
+            }
         }
     }
 
@@ -2057,6 +2658,24 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
         }
         UpdateTarget(*s);
         DrawBarAndPresent(*s);
+        return;
+    }
+
+    // 系统「快速设置」面板被 show：这一刻就把它摆到顶栏正下方。
+    //
+    // 为什么必须在这里做：面板由 shell 先摆到任务栏上方（屏幕右下角）再
+    // 显示，等定时器（哪怕 20ms）去挪，用户就能看到"先在下方闪一下、再跳
+    // 到顶栏下"。EVENT_OBJECT_SHOW 是系统能给出的最早时机，在它之后立刻
+    // SetWindowPos，通常赶在面板首帧绘制之前，视觉上就是"一出现就在顶栏下"。
+    // 这里只做一次抢先；后续跟随（区域随内容变化）交给对齐定时器。
+    if (event == EVENT_OBJECT_SHOW && hwnd && hwnd != bar &&
+        IsQuickSettingsHost(hwnd) && IsWindowVisible(hwnd)) {
+        if (AlignQuickSettingsToBar(*s, hwnd)) {
+            ArmQuickSettingsAlign(*s, true);
+        } else {
+            // 区域/位置还没就绪：保持高频重试（下一拍通常就能摆好）
+            ArmQuickSettingsAlign(*s, false);
+        }
         return;
     }
 
@@ -2780,6 +3399,105 @@ void AddRoundedRectPath(GraphicsPath& path, const RectF& r, float radius) {
     path.CloseFigure();
 }
 
+// Chrome 风格标签背景：顶部两角外凸圆角、底部两角内凹圆角
+// （当前标签与拖动中"浮起"的标签共用同一形状，只换填充/描边）
+void BuildTabBackgroundPath(GraphicsPath& path, const RectF& visual, float k) {
+    const float rTop = (std::min)(8.0f * k, visual.Width * 0.5f);
+    const float rBot = (std::min)(8.0f * k, visual.Width * 0.25f);
+    const float x0 = visual.X;
+    const float y0 = visual.Y;
+    const float x1 = visual.X + visual.Width;
+    const float y1 = visual.Y + visual.Height;
+
+    // 左上外凸圆角
+    path.AddArc(x0, y0, rTop * 2.0f, rTop * 2.0f, 180.0f, 90.0f);
+    path.AddLine(x0 + rTop, y0, x1 - rTop, y0);
+    // 右上外凸圆角
+    path.AddArc(x1 - rTop * 2.0f, y0, rTop * 2.0f, rTop * 2.0f, 270.0f, 90.0f);
+    // 右侧边框向下到右下圆角起点
+    path.AddLine(x1, y0 + rTop, x1, y1 - rBot);
+    // 右下圆角（与未打开标签共用的样式）
+    {
+        RectF brBox(x1, y1 - rBot * 2.0f, rBot * 2.0f, rBot * 2.0f);
+        path.AddArc(brBox, 180.0f, -90.0f);
+    }
+    // 底边
+    path.AddLine(x1 + rBot, y1, x0 - rBot, y1);
+    // 左下圆角（与未打开标签共用的样式）
+    {
+        RectF blBox(x0 - rBot * 2.0f, y1 - rBot * 2.0f, rBot * 2.0f,
+                    rBot * 2.0f);
+        path.AddArc(blBox, 90.0f, -90.0f);
+    }
+    path.CloseFigure();
+}
+
+// 标签标题：固定标签左侧画小圆点，标题从左开始、超出宽度直接截断
+void DrawTabTitle(Graphics& g, AppState& s, const TabInfo& tab, const RectF& r,
+                  Gdiplus::Font& font, bool chromeMode) {
+    const float k = s.scale;
+    float textLeft = r.X + 8.0f * k;
+    if (chromeMode && tab.chromePinned) {
+        const float dotR = 2.6f * k;
+        SolidBrush dotBrush(Color(220, 255, 255, 255));
+        g.FillEllipse(&dotBrush, textLeft + 2.0f * k,
+                      r.Y + r.Height * 0.5f - dotR, dotR * 2.0f, dotR * 2.0f);
+        textLeft += 10.0f * k;
+    }
+    const float textRight = r.X + r.Width - 8.0f * k;
+    RectF textR = RectF(textLeft, r.Y, (std::max)(textRight - textLeft, 1.0f),
+                        r.Height);
+    StringFormat tabSf;
+    tabSf.SetFormatFlags(StringFormatFlagsNoWrap);  // 只显示一行，超出宽度直接截断
+    tabSf.SetAlignment(StringAlignmentNear);  // 从左开始，超出部分在右侧截断
+    tabSf.SetLineAlignment(StringAlignmentCenter);
+    tabSf.SetTrimming(StringTrimmingNone);  // 不用省略号，按渲染宽度截断
+
+    SolidBrush textBrush(Color(255, 255, 255, 255));
+    GraphicsState state = g.Save();
+    g.SetClip(textR);
+    g.DrawString(tab.title.c_str(), -1, &font, textR, &tabSf, &textBrush);
+    g.Restore(state);
+}
+
+// 拖动重排中"浮起"的标签：跟着光标走、比激活标签更亮，并带一圈浅色描边
+// （被拖标签原来的位置留空，后面的标签已经实时补位，即落点提示）
+void DrawFloatingTab(Graphics& g, AppState& s, const TabInfo& tab,
+                     Gdiplus::Font& font, bool chromeMode, float barH) {
+    const float k = s.scale;
+    const float w = tab.rect.Width;
+    if (w <= 0.0f) {
+        return;
+    }
+    float stripL = 0.0f;
+    float stripR = 0.0f;
+    TabStripRange(s, stripL, stripR);
+    float fx = static_cast<float>(s.tabDragPt.x) - s.tabDragGrabDx;
+    if (fx < stripL) {
+        fx = stripL;
+    }
+    if (fx + w > stripR) {
+        fx = stripR - w;
+    }
+
+    // 顶部再抬高一点，视觉上"离开标签栏"
+    const float inset = kTabTopInset * k * 0.35f;
+    const float h = barH - inset;
+    if (h <= 0.0f) {
+        return;
+    }
+    RectF visual(fx, inset, w, h);
+
+    GraphicsPath path;
+    BuildTabBackgroundPath(path, visual, k);
+    SolidBrush fill(Color(110, 255, 255, 255));
+    g.FillPath(&fill, &path);
+    Pen border(Color(130, 255, 255, 255), 1.0f * k);
+    g.DrawPath(&border, &path);
+
+    DrawTabTitle(g, s, tab, visual, font, chromeMode);
+}
+
 void DrawBar(AppState& s) {
     Gdiplus::Bitmap* bmp = s.bitmap;
     if (!bmp) {
@@ -2828,8 +3546,18 @@ void DrawBar(AppState& s) {
     };
     const bool chromeMode = ChromeSyncMode(s);
 
+    // 正在拖动重排的标签：它的正常绘制被跳过（位置留空 = 落点提示），
+    // 最后单独画在光标处
+    const bool tabDragging = s.tabDragging && s.tabDragIndex >= 0 &&
+                             s.tabDragIndex < static_cast<int>(s.tabs.size());
+    const int dragTabIndex = tabDragging ? s.tabDragIndex : -1;
+
     // 未激活标签之间的竖线：高度略小于标签栏高度，上下留白相等
     for (size_t i = 0; i + 1 < s.tabs.size(); ++i) {
+        if (static_cast<int>(i) == dragTabIndex ||
+            static_cast<int>(i + 1) == dragTabIndex) {
+            continue;  // 被拖标签两侧不画分隔线（它已经不在这条缝上了）
+        }
         const bool leftActive = tabActive(s.tabs[i]);
         const bool rightActive = tabActive(s.tabs[i + 1]);
         if (leftActive || rightActive) {
@@ -2846,6 +3574,9 @@ void DrawBar(AppState& s) {
     }
 
     for (size_t i = 0; i < s.tabs.size(); ++i) {
+        if (static_cast<int>(i) == dragTabIndex) {
+            continue;  // 拖动中的标签最后单独绘制
+        }
         const TabInfo& tab = s.tabs[i];
         const RectF& r = tab.rect;
         if (r.Width <= 0.0f || r.Height <= 0.0f) {
@@ -2862,40 +3593,7 @@ void DrawBar(AppState& s) {
             RectF visual(r.X, inset, r.Width, barH - inset);
             if (visual.Height > 0.0f) {
                 GraphicsPath activePath;
-                const float rTop = (std::min)(8.0f * k, visual.Width * 0.5f);
-                const float rBot = (std::min)(8.0f * k, visual.Width * 0.25f);
-                const float x0 = visual.X;
-                const float y0 = visual.Y;
-                const float x1 = visual.X + visual.Width;
-                const float y1 = visual.Y + visual.Height;
-
-                // 左上外凸圆角
-                activePath.AddArc(x0, y0, rTop * 2.0f, rTop * 2.0f,
-                                  180.0f, 90.0f);
-                activePath.AddLine(x0 + rTop, y0, x1 - rTop, y0);
-                // 右上外凸圆角
-                activePath.AddArc(x1 - rTop * 2.0f, y0,
-                                  rTop * 2.0f, rTop * 2.0f, 270.0f, 90.0f);
-                // 右侧边框向下到右下圆角起点
-                activePath.AddLine(x1, y0 + rTop, x1, y1 - rBot);
-                // 右下圆角（与未打开标签共用的样式）
-                {
-                    RectF brBox(x1,
-                                y1 - rBot * 2.0f,
-                                rBot * 2.0f, rBot * 2.0f);
-                    activePath.AddArc(brBox, 180.0f, -90.0f);
-                }
-                // 底边
-                activePath.AddLine(x1 + rBot, y1, x0 - rBot, y1);
-                // 左下圆角（与未打开标签共用的样式）
-                {
-                    RectF blBox(x0 - rBot * 2.0f,
-                                y1 - rBot * 2.0f,
-                                rBot * 2.0f, rBot * 2.0f);
-                    activePath.AddArc(blBox, 90.0f, -90.0f);
-                }
-                activePath.CloseFigure();
-
+                BuildTabBackgroundPath(activePath, visual, k);
                 SolidBrush fillBrush(hover ? Color(80, 255, 255, 255)
                                            : Color(45, 255, 255, 255));
                 g.FillPath(&fillBrush, &activePath);
@@ -2907,40 +3605,20 @@ void DrawBar(AppState& s) {
 
     // 所有标签文字统一在所有背景绘制完之后再绘制，避免已打开标签延伸的背景盖住左侧未打开标签
     for (size_t i = 0; i < s.tabs.size(); ++i) {
+        if (static_cast<int>(i) == dragTabIndex) {
+            continue;
+        }
         const TabInfo& tab = s.tabs[i];
         const RectF& r = tab.rect;
         if (r.Width <= 0.0f || r.Height <= 0.0f) {
             continue;
         }
+        DrawTabTitle(g, s, tab, r, tabFont, chromeMode);
+    }
 
-        float textLeft = r.X + 8.0f * k;
-        if (chromeMode && tab.chromePinned) {
-            // 固定标签：左侧画小圆点，标题相应右移
-            const float dotR = 2.6f * k;
-            SolidBrush dotBrush(Color(220, 255, 255, 255));
-            g.FillEllipse(&dotBrush, textLeft + 2.0f * k,
-                          r.Y + r.Height * 0.5f - dotR, dotR * 2.0f,
-                          dotR * 2.0f);
-            textLeft += 10.0f * k;
-        }
-        // 所有标签标题使用相同的高度和垂直居中，避免已打开/未打开标题高度不一致
-        const float textRight = r.X + r.Width - 8.0f * k;
-        RectF textR = RectF(textLeft, r.Y,
-                            (std::max)(textRight - textLeft, 1.0f),
-                            r.Height);
-        StringFormat tabSf;
-        tabSf.SetFormatFlags(StringFormatFlagsNoWrap);  // 只显示一行，超出宽度直接截断
-        tabSf.SetAlignment(StringAlignmentNear);  // 从左开始，超出部分在右侧截断
-        tabSf.SetLineAlignment(StringAlignmentCenter);
-        tabSf.SetTrimming(StringTrimmingNone);  // 不用省略号，按渲染宽度截断
-
-        // 未打开标签与已打开标签使用相同亮度的文字颜色；不绘制末尾渐变
-        const Color textCol(255, 255, 255, 255);
-        SolidBrush textBrush(textCol);
-        GraphicsState state = g.Save();
-        g.SetClip(textR);
-        g.DrawString(tab.title.c_str(), -1, &tabFont, textR, &tabSf, &textBrush);
-        g.Restore(state);
+    // 拖动中的标签：浮在光标处（原位置留空，其余标签已实时补位）
+    if (tabDragging) {
+        DrawFloatingTab(g, s, s.tabs[s.tabDragIndex], tabFont, chromeMode, barH);
     }
 
     // ---- 最小化键左侧：Win11 风格任务栏时钟（时间/日期两行）----
@@ -3254,6 +3932,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // 整条顶栏接收鼠标（顶栏在桌面层，点击不会覆盖/抢占任何窗口）
         return HTCLIENT;
 
+    case WM_SETCURSOR:
+        // 拖动标签重排时给一个左右箭头的光标反馈（其余情况保持默认箭头）
+        if (s && s->tabDragging) {
+            SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+            return TRUE;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+
     case WM_WINDOWPOSCHANGING: {
         // 防御：任何 Z 序变化都强制回到本模式应处的层级 ——
         // 「保持顶栏」模式：恒置顶，绝不让位；
@@ -3285,6 +3971,74 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        // 拖动标签重排：按住标签横向拖过阈值后，光标每越过相邻标签中点
+        // 就与它交换位置（实时让位），被拖标签浮在光标处
+        if (s->tabPressIndex >= 0) {
+            POINT cur{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            if (!s->tabDragging) {
+                const int threshold =
+                    (std::max)(kTabDragThreshold,
+                               MulDiv(kTabDragThreshold, s->dpi, 96));
+                const int adx = cur.x - s->tabPressPt.x;
+                const int ady = cur.y - s->tabPressPt.y;
+                if ((adx < 0 ? -adx : adx) < threshold &&
+                    (ady < 0 ? -ady : ady) < threshold) {
+                    return 0;  // 阈值内：还算"点击"，不做任何移动
+                }
+                s->tabDragging = true;
+            }
+
+            // 按身份重新定位被拖标签：拖动途中列表可能被刷新（扩展推送 /
+            // 窗口事件），只认索引会拖错标签
+            int idx = -1;
+            for (size_t i = 0; i < s->tabs.size(); ++i) {
+                const TabInfo& t = s->tabs[i];
+                const bool same =
+                    s->tabDragIsChrome
+                        ? (t.isChrome && t.chromeTabId == s->tabDragChromeId)
+                        : (!t.isChrome && t.hwnd == s->tabDragHwnd);
+                if (same) {
+                    idx = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (idx < 0) {
+                CancelTabDrag(*s);
+                if (GetCapture() == hwnd) {
+                    ReleaseCapture();
+                }
+                DrawBarAndPresent(*s);
+                return 0;
+            }
+            s->tabPressIndex = idx;
+            s->tabDragIndex = idx;
+            s->tabDragPt = cur;
+
+            // 每帧最多让位一格：越过相邻标签中点才交换
+            std::vector<float> centers;
+            centers.reserve(s->tabs.size());
+            for (const auto& t : s->tabs) {
+                centers.push_back(t.rect.X + t.rect.Width * 0.5f);
+            }
+            const bool draggingPinned = s->tabs[idx].isChrome &&
+                                        s->tabs[idx].chromePinned;
+            const int lo = TabDragLo(*s, draggingPinned);
+            const int hi = TabDragHi(*s, draggingPinned);
+            const int next = wsproto::TabDragNextIndex(
+                centers, idx, static_cast<float>(cur.x), lo, hi);
+            if (next != idx && next >= 0 &&
+                next < static_cast<int>(s->tabs.size())) {
+                std::swap(s->tabs[idx], s->tabs[next]);
+                s->tabDragIndex = next;
+                s->tabPressIndex = next;
+                if (s->hoverTab >= 0) {
+                    s->hoverTab = next;
+                }
+            }
+            DrawBarAndPresent(*s);
+            return 0;
+        }
+
         // 拖动中：移动目标窗口（等同标题栏拖动）
         if (s->dragWindow && s->dragHwnd && IsWindow(s->dragHwnd)) {
             POINT cur{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
@@ -3302,9 +4056,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 s->dragMoving = true;
                 RECT rc{};
                 GetWindowRect(s->dragHwnd, &rc);
-                if (IsZoomed(s->dragHwnd)) {
-                    // 最大化窗口拖动：先还原，抓点按比例换算（同 Windows 标题栏）
-                    ShowWindow(s->dragHwnd, SW_RESTORE);
+                const bool wasFilled = TargetIsFilled(*s, s->dragHwnd);
+                if (IsZoomed(s->dragHwnd) || wasFilled) {
+                    // 最大化/填充窗口拖动：先还原，抓点按比例换算（同 Windows 标题栏）
+                    if (wasFilled) {
+                        UnfillTarget(*s, s->dragHwnd);
+                    } else {
+                        ShowWindow(s->dragHwnd, SW_RESTORE);
+                    }
                     RECT rc2{};
                     GetWindowRect(s->dragHwnd, &rc2);
                     const float rx =
@@ -3362,6 +4121,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             s->dragMoving = false;
             s->dragHwnd = nullptr;
         }
+        if (s && s->tabPressIndex >= 0) {
+            CancelTabDrag(*s);
+            DrawBarAndPresent(*s);
+        }
         return 0;
 
     case WM_MOUSELEAVE:
@@ -3396,13 +4159,40 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetCapture(hwnd);
         }
 
+        // 按住标签：记下身份与抓点，超过阈值就变成拖动重排（见 WM_MOUSEMOVE）。
+        // 阈值以内松手依旧只是"点击切换标签"（点击本身已在下面的 switch 里
+        // 立即生效，与 Chrome 一样：按下即激活，拖动即重排）
+        if (hit == kHitTab && tabIndex >= 0 &&
+            tabIndex < static_cast<int>(s->tabs.size())) {
+            const TabInfo& pressed = s->tabs[tabIndex];
+            s->tabPressIndex = tabIndex;
+            s->tabDragging = false;
+            s->tabDragIndex = tabIndex;
+            s->tabDragIsChrome = pressed.isChrome;
+            s->tabDragChromeId = pressed.chromeTabId;
+            s->tabDragHwnd = pressed.hwnd;
+            s->tabPressPt = pt;
+            s->tabDragPt = pt;
+            float grab = static_cast<float>(pt.x) - pressed.rect.X;
+            if (grab < 0.0f) {
+                grab = 0.0f;
+            }
+            if (grab > pressed.rect.Width) {
+                grab = pressed.rect.Width;
+            }
+            s->tabDragGrabDx = grab;
+            SetCapture(hwnd);
+        }
+
         switch (hit) {
         case kHitVolume:
             SetVolumeOpen(*s, !s->volumeOpen);
             break;
         case kHitClock:
-            // 与 Win11 任务栏时钟一致：点击打开/收起系统日历浮出窗口
-            ToggleCalendarFlyout();
+            // 与 Win11 任务栏右端「网络/音量/电池」三合一按钮一致：
+            // 左键打开/收起系统「快速设置」面板（系统快捷键 Win+A）；
+            // 面板打开后由对齐定时器把它挪到顶栏正下方（上缘紧贴顶栏下缘）
+            ToggleQuickSettings(*s);
             break;
         case kHitTab:
             if (tabIndex >= 0 && tabIndex < static_cast<int>(s->tabs.size())) {
@@ -3446,8 +4236,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_LBUTTONDBLCLK: {
-        // 双击顶栏空白处：最大化/还原当前目标窗口（与标题栏双击行为一致）。
-        // 双击落在按钮/标签上时不触发（第二次按下已由各自逻辑处理）。
+        // 双击顶栏空白处：让目标窗口填充"顶栏以外"的区域（顶栏保持可见），
+        // 再次双击还原到填充前的位置。不同于右侧最大化键的系统最大化：
+        // 那个会把整条顶栏一起盖住，本手势的目的正是让顶栏不被盖住。
+        // 双击落在按钮上时不触发（第二次按下已由各自逻辑处理）。
         if (!s) {
             return 0;
         }
@@ -3455,8 +4247,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const ButtonHit hit = HitTestButton(*s, pt.x, pt.y);
         if (hit == kHitNone && s->hasTarget && s->targetHwnd &&
             IsWindow(s->targetHwnd)) {
-            HitButton(s->hwnd, s->targetHwnd, kHitMaximize);
-            // 刷新最大化状态（右侧按钮字形与后续布局）
+            ToggleFillTarget(*s, s->targetHwnd);
+            // 刷新最大化状态（右侧按钮字形与后续布局）：填充路径可能顺带
+            // 退出了系统最大化（SW_RESTORE），字形要跟着变回"最大化"
             s->targetMaximized = IsZoomed(s->targetHwnd) != FALSE;
             DrawBarAndPresent(*s);
         }
@@ -3477,6 +4270,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             s->dragMoving = false;
             s->dragHwnd = nullptr;
             ReleaseCapture();
+        }
+        // 松手：拖动过就落定新顺序（Chrome 模式还要把新位置下发给浏览器），
+        // 只是点了一下则什么都不用做（按下时已经切换完成了）
+        if (s->tabPressIndex >= 0) {
+            const bool dragged = s->tabDragging;
+            const int movedIndex = s->tabDragIndex;
+            CancelTabDrag(*s);
+            if (GetCapture() == hwnd) {
+                ReleaseCapture();
+            }
+            if (dragged) {
+                CommitTabReorder(*s, movedIndex);
+                DrawBarAndPresent(*s);
+            }
         }
         return 0;
     }
@@ -3506,6 +4313,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        // 右键时钟：打开/收起系统「日期和时间」日历浮出窗口
+        // （左键已改为系统快速设置面板，日历入口保留在右键）
+        if (HitTestButton(*s, pt.x, pt.y) == kHitClock) {
+            ToggleCalendarFlyout();
+            return 0;
+        }
         const int tabIndex = HitTestTab(*s, pt.x, pt.y);
         if (tabIndex >= 0 && tabIndex < static_cast<int>(s->tabs.size())) {
             const TabInfo& tab = s->tabs[tabIndex];
@@ -3542,21 +4355,37 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case kChromeSyncStateMsg: {
-        // 扩展连接 / 断开：连接后立即以现有数据刷新（首帧 hello 稍后到达），
-        // 断开则清空同步数据并回退为窗口枚举
+        // 扩展连接 / 断开。
+        // 连接：立即以现有数据刷新（首帧 hello/windowFocused 稍后到达）。
+        // 断开：先进入优雅期保留最后一批浏览器标签（避免短暂掉线时顶栏
+        //       闪回窗口枚举、看起来"只剩当前标签页"）；优雅期内未重连
+        //       才清空并回退为窗口枚举。
         if (!s) {
             return 0;
         }
         const bool connected = wParam != 0;
-        if (s->chromeSync.connected != connected) {
-            s->chromeSync.connected = connected;
-            if (!connected) {
-                s->chromeSync.tabs.clear();
-                s->chromeSync.windowId = 0;
+        if (connected) {
+            KillTimer(hwnd, kChromeSyncGraceTimerId);
+            if (!s->chromeSync.connected) {
+                s->chromeSync.connected = true;
+                if (RefreshTabs(*s)) {
+                    DrawBarAndPresent(*s);
+                }
             }
+            return 0;
+        }
+        if (!s->chromeSync.connected) {
+            return 0;  // 已经是断开态，无需重复处理
+        }
+        if (s->chromeSync.tabs.empty()) {
+            // 本来就没有同步数据（如刚启动就连不上）：直接回退，不挂优雅期
+            s->chromeSync.connected = false;
+            s->chromeSync.windowId = 0;
             if (RefreshTabs(*s)) {
                 DrawBarAndPresent(*s);
             }
+        } else {
+            SetTimer(hwnd, kChromeSyncGraceTimerId, kChromeSyncGraceMs, nullptr);
         }
         return 0;
     }
@@ -3716,6 +4545,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (RefreshTabs(*s)) {
                 DrawBarAndPresent(*s);
             }
+        } else if (wParam == kChromeSyncGraceTimerId) {
+            // 扩展断连优雅期结束：仍断线才丢弃同步标签、回退窗口枚举
+            KillTimer(hwnd, kChromeSyncGraceTimerId);
+            if (!g_chromeServer.connected.load() && s->chromeSync.connected) {
+                s->chromeSync.connected = false;
+                s->chromeSync.tabs.clear();
+                s->chromeSync.windowId = 0;
+                if (RefreshTabs(*s)) {
+                    DrawBarAndPresent(*s);
+                }
+            }
+        } else if (wParam == kQuickSettingsAlignTimerId) {
+            // 系统快速设置面板打开期间：持续把面板上缘对齐顶栏下缘；
+            // 面板关闭即在此停表（零轮询）
+            if (s) {
+                TickQuickSettingsAlign(*s);
+            }
         } else if (wParam == kVolumeRetryTimerId) {
             // 目标进程的音频会话晚到（先无声后出声）：面板展开期间补解析。
             // 解析成功即停；成功时刷新顶栏与音量面板，滑条/静音立即恢复可用
@@ -3778,6 +4624,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         KillTimer(hwnd, kSlowRefreshTimerId);
         KillTimer(hwnd, kVolumeRetryTimerId);
         KillTimer(hwnd, kClockTimerId);
+        KillTimer(hwnd, kChromeSyncGraceTimerId);
+        KillTimer(hwnd, kQuickSettingsAlignTimerId);
         ChromeSyncStop();  // 先停网络线程（会向本窗口发状态消息，需在窗口销毁前）
         UninstallVolumeHook();
         if (s) {
@@ -3835,7 +4683,7 @@ DWORD WINAPI TopbarThreadProc(LPVOID param) {
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;  // CS_DBLCLKS：双击空白处最大化
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;  // CS_DBLCLKS：双击空白处填充顶栏以外区域
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
