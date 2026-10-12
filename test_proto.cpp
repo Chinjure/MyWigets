@@ -236,40 +236,83 @@ static void TestModel() {
 
 // 标签拖动重排（顶栏交互用的纯逻辑）
 static void TestTabDragReorder() {
-    // 4 个等宽 100px 的标签：中心 50 / 150 / 250 / 350
-    const std::vector<float> centers{50.0f, 150.0f, 250.0f, 350.0f};
+    // 4 个等宽 100px 的标签：坑位 0/100/200/300，宽度都是 100
+    const std::vector<float> X{0.0f, 100.0f, 200.0f, 300.0f};
+    const std::vector<float> W{100.0f, 100.0f, 100.0f, 100.0f};
 
-    // 光标没越过任何相邻中点：位置不动
-    CHECK(TabDragNextIndex(centers, 1, 150.0f) == 1, "drag hold position");
-    CHECK(TabDragNextIndex(centers, 1, 200.0f) == 1,
-          "drag within own slot (no crossing)");
-    // 向右越过右邻居中点 -> 交换一格
-    CHECK(TabDragNextIndex(centers, 1, 250.5f) == 2, "drag swap right one");
-    // 向左越过左邻居中点 -> 交换一格
-    CHECK(TabDragNextIndex(centers, 2, 149.5f) == 1, "drag swap left one");
+    // 前进（远离起始位置）：阈值 = 相邻标签宽度的 20%（=20px）：19 不动，20 换位
+    CHECK(TabDragNextIndex(X, W, 0, 0, 0.0f, 100.0f, 0.0f) == 0,
+          "drag hold position");
+    CHECK(TabDragNextIndex(X, W, 0, 0, 19.0f, 100.0f, 0.0f) == 0,
+          "drag below 20% of neighbor -> no swap");
+    CHECK(TabDragNextIndex(X, W, 0, 0, 20.0f, 100.0f, 0.0f) == 1,
+          "drag 20% of neighbor width -> swap forward");
+    // 换位后（坑位 1、身体 20、锚点 20、起始位置 0）：这是"朝原来的位置移动"，
+    // 要退够刚被挤开的那个标签宽度的 80% 才让它回原位
+    CHECK(TabDragNextIndex(X, W, 1, 0, 1.0f, 100.0f, 20.0f) == 1,
+          "tiny jitter back -> no swap");
+    CHECK(TabDragNextIndex(X, W, 1, 0, -30.0f, 100.0f, 20.0f) == 1,
+          "pull back 50px (50% < 80%) -> displaced tab stays");
+    CHECK(TabDragNextIndex(X, W, 1, 0, -59.0f, 100.0f, 20.0f) == 1,
+          "pull back 79px (just below 80%) -> no return");
+    CHECK(TabDragNextIndex(X, W, 1, 0, -60.0f, 100.0f, 20.0f) == 0,
+          "pull back 80% of neighbor width -> displaced tab returns");
+    // 回到原位后再次前进，阈值又是 20%（此时是"远离起始位置"）
+    CHECK(TabDragNextIndex(X, W, 0, 0, 20.0f, 100.0f, 0.0f) == 1,
+          "forward again after return -> 20% threshold");
+    // 同方向继续前进：坑位已随标签前移一整格，因此还要再拖约一整格
+    CHECK(TabDragNextIndex(X, W, 1, 0, 119.0f, 100.0f, 20.0f) == 1,
+          "next slot still needs a full tab of travel");
+    CHECK(TabDragNextIndex(X, W, 1, 0, 120.0f, 100.0f, 20.0f) == 2,
+          "second swap forward");
+    // 向左拖动同理：前进（远离起始位置）20% 就换，往回退要 80%
+    CHECK(TabDragNextIndex(X, W, 2, 2, 181.0f, 100.0f, 200.0f) == 2,
+          "left drag below 20% -> no swap");
+    CHECK(TabDragNextIndex(X, W, 2, 2, 180.0f, 100.0f, 200.0f) == 1,
+          "left drag 20% into neighbor -> swap forward (left)");
+    CHECK(TabDragNextIndex(X, W, 1, 2, 259.0f, 100.0f, 180.0f) == 1,
+          "pull back right 79px (< 80%) -> no return");
+    CHECK(TabDragNextIndex(X, W, 1, 2, 260.0f, 100.0f, 180.0f) == 2,
+          "pull back right 80% of neighbor width -> returns");
     // 一次只走一格（长距离甩动由后续 mousemove 逐格推进）
-    CHECK(TabDragNextIndex(centers, 0, 400.0f) == 1,
-          "drag one step per event (right end)");
-    CHECK(TabDragNextIndex(centers, 3, 0.0f) == 2,
-          "drag one step per event (left end)");
+    CHECK(TabDragNextIndex(X, W, 0, 0, 400.0f, 100.0f, 0.0f) == 1,
+          "drag one step per event (right)");
+    CHECK(TabDragNextIndex(X, W, 3, 3, 0.0f, 100.0f, 300.0f) == 2,
+          "drag one step per event (left)");
     // 到头不再越界
-    CHECK(TabDragNextIndex(centers, 3, 999.0f) == 3, "drag stops at last");
-    CHECK(TabDragNextIndex(centers, 0, -50.0f) == 0, "drag stops at first");
+    CHECK(TabDragNextIndex(X, W, 3, 3, 900.0f, 100.0f, 300.0f) == 3,
+          "drag stops at last");
+    CHECK(TabDragNextIndex(X, W, 0, 0, -60.0f, 100.0f, 0.0f) == 0,
+          "drag stops at first");
     // 非法输入原样返回
-    CHECK(TabDragNextIndex(centers, -1, 100.0f) == -1, "drag invalid index");
-    CHECK(TabDragNextIndex({}, 0, 100.0f) == 0, "drag empty list");
+    CHECK(TabDragNextIndex(X, W, -1, 0, 0.0f, 100.0f, 0.0f) == -1,
+          "drag invalid index");
+    CHECK(TabDragNextIndex({}, {}, 0, 0, 0.0f, 100.0f, 0.0f) == 0,
+          "drag empty list");
+
+    // 阈值按**相邻标签自己的宽度**算：右邻居宽 200 -> 要 40 的重叠
+    const std::vector<float> X2{0.0f, 100.0f};
+    const std::vector<float> W2{100.0f, 200.0f};
+    CHECK(TabDragNextIndex(X2, W2, 0, 0, 39.0f, 100.0f, 0.0f) == 0,
+          "ratio uses neighbor width (39 < 20% of 200)");
+    CHECK(TabDragNextIndex(X2, W2, 0, 0, 40.0f, 100.0f, 0.0f) == 1,
+          "ratio uses neighbor width (40 = 20% of 200)");
 
     // 固定标签约束：前 2 个是固定标签
     //   普通标签（lo=2）不能拖到固定区
-    CHECK(TabDragNextIndex(centers, 2, 100.0f, 2, -1) == 2,
+    CHECK(TabDragNextIndex(X, W, 2, 2, 100.0f, 100.0f, 200.0f, 0.2f, 0.8f, 2,
+                           -1) == 2,
           "drag unpinned cannot enter pinned zone");
     //   固定标签（hi=1）不能拖出固定区
-    CHECK(TabDragNextIndex(centers, 1, 300.0f, 0, 1) == 1,
+    CHECK(TabDragNextIndex(X, W, 1, 1, 220.0f, 100.0f, 100.0f, 0.2f, 0.8f, 0,
+                           1) == 1,
           "drag pinned cannot leave pinned zone");
     //   固定区内/普通区内正常交换
-    CHECK(TabDragNextIndex(centers, 0, 200.0f, 0, 1) == 1,
+    CHECK(TabDragNextIndex(X, W, 0, 0, 50.0f, 100.0f, 0.0f, 0.2f, 0.8f, 0, 1) ==
+              1,
           "drag pinned swaps inside pinned zone");
-    CHECK(TabDragNextIndex(centers, 2, 350.5f, 2, -1) == 3,
+    CHECK(TabDragNextIndex(X, W, 2, 2, 250.0f, 100.0f, 200.0f, 0.2f, 0.8f, 2,
+                           -1) == 3,
           "drag unpinned swaps inside normal zone");
 
     // 下发给浏览器的落点夹取（固定标签恒在最前）

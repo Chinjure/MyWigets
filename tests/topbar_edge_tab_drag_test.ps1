@@ -84,6 +84,11 @@ public class EdgeTabDrag {
     System.Threading.Thread.Sleep(350);
   }
   public static void Drag(int fromX, int fromY, int toX, int toY, int steps) {
+    DragShot(fromX, fromY, toX, toY, steps, null, 0, 0, 0, 0);
+  }
+  // 拖动：按下 -> 分步移动（可选：中途抓一张"拖动中"截图）-> 抬起
+  public static void DragShot(int fromX, int fromY, int toX, int toY, int steps,
+                              string midShotPath, int shotX, int shotY, int shotW, int shotH) {
     SetCursorPos(fromX, fromY);
     System.Threading.Thread.Sleep(150);
     mouse_event(LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
@@ -91,6 +96,27 @@ public class EdgeTabDrag {
     for (int i = 1; i <= steps; i++) {
       SetCursorPos(fromX + (toX - fromX) * i / steps, fromY + (toY - fromY) * i / steps);
       System.Threading.Thread.Sleep(25);
+      if (!string.IsNullOrEmpty(midShotPath) && i == steps / 2) {
+        Shot(midShotPath, shotX, shotY, shotW, shotH);
+      }
+    }
+    System.Threading.Thread.Sleep(120);
+    mouse_event(LEFTUP, 0, 0, 0, UIntPtr.Zero);
+    System.Threading.Thread.Sleep(400);
+  }
+  // 多段路拖动（一次按下 - 依次经过 xs - 抬起）：验证"换过去再退回来"的迟滞
+  public static void DragPath(int fromX, int fromY, int[] xs, int stepsPerLeg) {
+    SetCursorPos(fromX, fromY);
+    System.Threading.Thread.Sleep(150);
+    mouse_event(LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+    System.Threading.Thread.Sleep(120);
+    int prev = fromX;
+    foreach (int to in xs) {
+      for (int i = 1; i <= stepsPerLeg; i++) {
+        SetCursorPos(prev + (to - prev) * i / stepsPerLeg, fromY);
+        System.Threading.Thread.Sleep(25);
+      }
+      prev = to;
     }
     System.Threading.Thread.Sleep(120);
     mouse_event(LEFTUP, 0, 0, 0, UIntPtr.Zero);
@@ -266,6 +292,68 @@ try {
   Check '顶栏拖动后顺序为 [原2号, 原0号, 原1号]' `
     (($order.Count -eq 3) -and ($order[0] -eq $T[2]) -and ($order[1] -eq $T[0]) -and ($order[2] -eq $T[1])) `
     ("期望 [" + (@($T[2], $T[0], $T[1]) -join ', ') + "]，实际 [" + ($order -join ', ') + "]")
+
+  # ---- 6) 换位阈值：只拖相邻标签宽度的 25% 也必须换位 ----
+  #（阈值是相邻标签宽度的 20%；旧行为要拖满一整格、约一个标签宽才换）
+  function ReadOrder() {
+    $o = @()
+    foreach ($i in 0..2) {
+      [EdgeTabDrag]::Click((TabX $i), $tabY)
+      Start-Sleep -Milliseconds 500
+      $o += (ActiveTitle $win)
+    }
+    return @($o)
+  }
+  $O0 = ReadOrder
+  Write-Host ("  短拖前 0/1/2 -> [" + ($O0 -join ', ') + "]")
+  $short = [int]($tabW * 0.25)
+  [EdgeTabDrag]::DragShot((TabX 1), $tabY, ((TabX 1) + $short), $tabY, 8,
+    (Join-Path $logs 'edge_tab_drag_short_mid.png'), $shotX, $shotY, $shotW, $stripH)
+  Start-Sleep -Milliseconds 700
+  $O1 = ReadOrder
+  Write-Host ("  向右短拖 {0}px（{1:P0} 标签宽）后 0/1/2 -> [{2}]" -f `
+    $short, ($short / $tabW), ($O1 -join ', '))
+  Check '拖动 25% 相邻标签宽度就换位（20% 阈值生效）' `
+    (($O1.Count -eq 3) -and ($O1[0] -eq $O0[0]) -and ($O1[1] -eq $O0[2]) -and ($O1[2] -eq $O0[1])) `
+    ("期望 [" + (@($O0[0], $O0[2], $O0[1]) -join ', ') + "]，实际 [" + ($O1 -join ', ') + "]")
+
+  # ---- 7) 反向短拖：再拖回来应当恢复原顺序 ----
+  [EdgeTabDrag]::Drag((TabX 2), $tabY, ((TabX 2) - $short), $tabY, 8)
+  Start-Sleep -Milliseconds 700
+  $O2 = ReadOrder
+  Write-Host ("  向左短拖 {0}px 后 0/1/2 -> [{1}]" -f $short, ($O2 -join ', '))
+  Check '反向短拖 25% 即换回原位' `
+    (($O2.Count -eq 3) -and ($O2[0] -eq $O0[0]) -and ($O2[1] -eq $O0[1]) -and ($O2[2] -eq $O0[2])) `
+    ("期望 [" + ($O0 -join ', ') + "]，实际 [" + ($O2 -join ', ') + "]")
+
+  # ---- 8) 回退迟滞：换过去之后要退够 80% 宽度，被挤开的标签才回原位 ----
+  #  一次拖动里两段路：先向右 25%（换位），再往回退；退 30% 宽度时顺序不动，
+  #  退到 80% 宽度时被挤开的那个标签回原位。
+  $O3 = ReadOrder
+  Write-Host ("  迟滞测试前 0/1/2 -> [" + ($O3 -join ', ') + "]")
+  $fwd = [int]($tabW * 0.25)
+  $small = [int]($tabW * 0.30)
+  [EdgeTabDrag]::DragPath((TabX 1), $tabY,
+    @(((TabX 1) + $fwd), ((TabX 1) + $fwd - $small)), 8)
+  Start-Sleep -Milliseconds 700
+  $O4 = ReadOrder
+  Write-Host ("  向右 25% 再退回 30% 宽度后 0/1/2 -> [{0}]" -f ($O4 -join ', '))
+  Check '退回不到 80% 宽度：被挤开的标签不回原位' `
+    (($O4.Count -eq 3) -and ($O4[0] -eq $O3[0]) -and ($O4[1] -eq $O3[2]) -and ($O4[2] -eq $O3[1])) `
+    ("期望 [" + (@($O3[0], $O3[2], $O3[1]) -join ', ') + "]，实际 [" + ($O4 -join ', ') + "]")
+
+  #  再拖一次：向右 25% 换位后，往回退够 80% 宽度 -> 被挤开的标签回原位
+  #  （换位发生在拖动 20% 宽度处，所以回退量按"越过换位点 80% 宽度"算，
+  #    这里退到 95% 宽度，留一点余量）
+  $big = [int]($tabW * 0.95)
+  [EdgeTabDrag]::DragPath((TabX 1), $tabY,
+    @(((TabX 1) + $fwd), ((TabX 1) + $fwd - $big)), 8)
+  Start-Sleep -Milliseconds 700
+  $O5 = ReadOrder
+  Write-Host ("  向右 25% 再退回 95% 宽度后 0/1/2 -> [{0}]" -f ($O5 -join ', '))
+  Check '退回 80% 宽度后：被挤开的标签回原位' `
+    (($O5.Count -eq 3) -and ($O5[0] -eq $O4[0]) -and ($O5[1] -eq $O4[1]) -and ($O5[2] -eq $O4[2])) `
+    ("期望 [" + ($O4 -join ', ') + "]，实际 [" + ($O5 -join ', ') + "]")
 
   if ($fail -ne 0) {
     Write-Host ''

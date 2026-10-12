@@ -761,17 +761,35 @@ inline std::string ChromeSyncBuildMoveTabCommand(int tabId, int index) {
 
 // ---- 标签拖动重排（纯逻辑：顶栏交互与单元测试共用）----
 
-// 拖动让位一步：光标越过相邻标签的中点，就与它交换位置。
-//   slotCenters 当前顺序下每个标签的中心 x（升序）
-//   dragIndex   被拖标签当前所处位置
-//   cursorX     光标 x（客户区坐标）
-//   lo, hi      允许停留的索引区间（Chrome 固定标签恒在最前：普通标签不能
-//               拖进固定区、固定标签也不能拖出；窗口模式传 0 / n-1 即无约束）
-// 返回这一帧结束后被拖标签应处的位置。一次只走一格（而不是直接算到最终位置）：
-// 让位跟着光标逐格推进，长距离甩动不会来回抖动。
-inline int TabDragNextIndex(const std::vector<float>& slotCenters, int dragIndex,
-                            float cursorX, int lo = 0, int hi = -1) {
-    const int n = static_cast<int>(slotCenters.size());
+// 拖动让位一步：被拖标签"浮起"后的矩形与相邻标签**重叠**达到后者宽度的
+// 相应比例就与它交换位置。
+//   slotX/slotW  当前顺序下每个标签的左边界与宽度（宽度 > 0，位置递增）
+//   dragIndex    被拖标签当前所处位置
+//   originIndex  本次拖动开始时被拖标签的位置（"原来的位置"）
+//   bodyX/bodyW  被拖标签浮起后的矩形（客户区坐标，bodyX 为左边界）
+//   anchorX      上一次换位时的 bodyX：换位后要朝新方向再拖够比例才允许下一次
+//                换位（否则指尖回抖会把刚换好的顺序立刻抖回去）
+//   ratioForward 前进阈值（默认 0.2）：**远离**起始位置的方向上，拖动距离与重叠
+//                达到相邻标签宽度的 20% 就换位 —— 轻轻一拖就换。
+//   ratioBack    回退阈值（默认 0.8）：**朝原来的位置**移动时，要让刚被挤开的
+//                那个标签回到原位，被拖标签得退够它宽度的 80%（拖动距离与重叠
+//                都满足）—— 换出去容易、退回来要拖得更明确。
+//   lo, hi       允许停留的索引区间（Chrome 固定标签恒在最前：普通标签不能
+//                拖进固定区、固定标签也不能拖出；窗口模式传 0 / -1 即无约束）
+// 返回这一帧结束后被拖标签应处的位置。一次只走一格，由后续帧继续推进。
+//
+// 方向不对称的由来：前进一格后，被拖标签的坑位随之前移一整格，同方向继续
+// 前进的那一格因此仍要再拖约一整格 —— 这是"坑位按整格量化 + 标签跟着光标走"
+// 的必然结果，也只有这样才能保证松手后标签落在光标附近，而不是飞到几格外。
+// 回退方向（朝起始位置）按 ratioBack 判定：默认要退够 80% 宽度才让被挤开的
+// 标签回原位。
+inline int TabDragNextIndex(const std::vector<float>& slotX,
+                            const std::vector<float>& slotW, int dragIndex,
+                            int originIndex, float bodyX, float bodyW,
+                            float anchorX, float ratioForward = 0.2f,
+                            float ratioBack = 0.8f, int lo = 0, int hi = -1) {
+    const int n = (std::min)(static_cast<int>(slotX.size()),
+                             static_cast<int>(slotW.size()));
     if (n <= 0 || dragIndex < 0 || dragIndex >= n) {
         return dragIndex;
     }
@@ -781,13 +799,37 @@ inline int TabDragNextIndex(const std::vector<float>& slotCenters, int dragIndex
     if (lo < 0) {
         lo = 0;
     }
-    if (dragIndex + 1 < n && dragIndex + 1 <= hi &&
-        cursorX > slotCenters[dragIndex + 1]) {
-        return dragIndex + 1;
+    if (originIndex < 0) {
+        originIndex = 0;
     }
-    if (dragIndex - 1 >= 0 && dragIndex - 1 >= lo &&
-        cursorX < slotCenters[dragIndex - 1]) {
-        return dragIndex - 1;
+    if (originIndex > n - 1) {
+        originIndex = n - 1;
+    }
+    // 离起始位置更近 = 正在"往原来的位置移动" -> 用回退阈值
+    const int distNow = dragIndex > originIndex ? dragIndex - originIndex
+                                                : originIndex - dragIndex;
+
+    const int right = dragIndex + 1;
+    if (right < n && right <= hi) {
+        const int distAfter = right > originIndex ? right - originIndex
+                                                  : originIndex - right;
+        const float ratio = distAfter < distNow ? ratioBack : ratioForward;
+        const float need = ratio * slotW[right];
+        if (bodyX - anchorX >= need &&
+            (bodyX + bodyW) - slotX[right] >= need) {
+            return right;
+        }
+    }
+    const int left = dragIndex - 1;
+    if (left >= 0 && left >= lo) {
+        const int distAfter = left > originIndex ? left - originIndex
+                                                 : originIndex - left;
+        const float ratio = distAfter < distNow ? ratioBack : ratioForward;
+        const float need = ratio * slotW[left];
+        if (anchorX - bodyX >= need &&
+            (slotX[left] + slotW[left]) - bodyX >= need) {
+            return left;
+        }
     }
     return dragIndex;
 }

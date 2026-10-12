@@ -20,6 +20,7 @@
 //        顶栏会凭空弹出来（如 hotspot 的 WS_EX_TOOLWINDOW 启动器弹出窗）
 //      - 按住标签左右拖动即可随意重排（超过 4px 阈值才算拖动）：
 //        拖动中被拖标签浮在光标处、其余标签实时补位（原位置留空即落点提示），
+//        拖动距离只要占相邻标签宽度的 20%（kTabDragSwapRatio）就换位，
 //        松手即生效。Chrome 同步模式下额外把新位置下发给扩展执行
 //        chrome.tabs.move —— 浏览器里的真实标签顺序一起变；窗口枚举模式
 //        只调整顶栏展示顺序（同一应用内保持到应用切走为止）。
@@ -150,6 +151,13 @@ constexpr float kUniformTabWidth = 240.0f;   // 1.5 × 160 基准宽度
 // 拖动标签重排：按住标签横向拖动的启动阈值（96 DPI 基准，随 DPI 缩放）。
 // 阈值内松手依旧只是"点击切换标签"，避免手抖把标签拖乱。
 constexpr int kTabDragThreshold = 4;
+// 换位阈值：被拖标签与相邻标签的重叠达到**相邻标签宽度的这个比例**就换位。
+// 0.2 = 拖动距离占相邻标签 20% 的宽度即交换位置（旧行为要拖满整格才换）。
+constexpr float kTabDragSwapRatio = 0.2f;
+// 回退阈值：已经换过去之后，要让刚被挤开的那个标签回到原位，被拖标签得朝
+// 原位置退够它宽度的这个比例（默认 80%）—— 换出去容易、退回来要拖得更明确，
+// 拖动途中手一抖不会把顺序来回翻。
+constexpr float kTabDragReturnRatio = 0.8f;
 
 // 左上角音量按钮与展开面板
 constexpr int kVolumeButtonW = 46;      // 音量按钮宽度（与窗口控制按钮一致，便于点击）
@@ -376,12 +384,18 @@ struct AppState {
     int tabPressIndex = -1;      // 按住的标签索引（-1 = 没有按住）
     bool tabDragging = false;    // 是否已超过阈值、进入拖动重排
     int tabDragIndex = -1;       // 被拖标签当前所处索引
+    int tabDragOriginIndex = -1; // 本次拖动开始时被拖标签的位置（"原来的位置"）
     bool tabDragIsChrome = false;  // 被拖标签是否来自 Chrome 同步
     int tabDragChromeId = 0;     // Chrome 模式：被拖标签的 tabId
     HWND tabDragHwnd = nullptr;  // 窗口模式：被拖标签的窗口句柄
     POINT tabPressPt{};          // 按下点（客户区坐标，判定阈值用）
     POINT tabDragPt{};           // 拖动中的光标（客户区坐标，浮起标签跟随用）
     float tabDragGrabDx = 0.0f;  // 按下点相对标签左边缘的偏移
+    // 浮起标签的"身体"左边界（客户区坐标，= 光标 - 抓点偏移）：换位判定按
+    // 相邻标签宽度的 20% 计算重叠，所以判定要用身体的实际位置而不是光标
+    float tabDragBodyX = 0.0f;
+    // 上一次换位时的身体位置：同方向还要再拖 20% 才允许下次换位（防回抖）
+    float tabDragAnchorX = 0.0f;
 
     // Chrome 风格标签：聚焦窗口所属应用打开的全部顶层窗口
     std::vector<TabInfo> tabs;
@@ -2060,9 +2074,12 @@ void CancelTabDrag(AppState& s) {
     s.tabPressIndex = -1;
     s.tabDragging = false;
     s.tabDragIndex = -1;
+    s.tabDragOriginIndex = -1;
     s.tabDragChromeId = 0;
     s.tabDragHwnd = nullptr;
     s.tabDragGrabDx = 0.0f;
+    s.tabDragBodyX = 0.0f;
+    s.tabDragAnchorX = 0.0f;
 }
 
 // 松手落定：把拖动后的顺序交给"真正的主人"。
@@ -3472,7 +3489,7 @@ void DrawFloatingTab(Graphics& g, AppState& s, const TabInfo& tab,
     float stripL = 0.0f;
     float stripR = 0.0f;
     TabStripRange(s, stripL, stripR);
-    float fx = static_cast<float>(s.tabDragPt.x) - s.tabDragGrabDx;
+    float fx = s.tabDragBodyX;
     if (fx < stripL) {
         fx = stripL;
     }
@@ -3971,8 +3988,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
-        // 拖动标签重排：按住标签横向拖过阈值后，光标每越过相邻标签中点
-        // 就与它交换位置（实时让位），被拖标签浮在光标处
+        // 拖动标签重排：按住标签横向拖过阈值后，被拖标签与相邻标签的重叠
+        // 达到后者宽度的 20% 就交换位置（实时让位），被拖标签浮在光标处
         if (s->tabPressIndex >= 0) {
             POINT cur{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             if (!s->tabDragging) {
@@ -4013,24 +4030,38 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             s->tabPressIndex = idx;
             s->tabDragIndex = idx;
             s->tabDragPt = cur;
+            // 浮起标签的"身体"跟着光标走：判定与绘制都用这个位置
+            s->tabDragBodyX = static_cast<float>(cur.x) - s->tabDragGrabDx;
 
-            // 每帧最多让位一格：越过相邻标签中点才交换
-            std::vector<float> centers;
-            centers.reserve(s->tabs.size());
+            // 换位判定：前进只要身体与相邻标签的重叠达到后者宽度的
+            // kTabDragSwapRatio（20%）；回退（把刚被挤开的标签放回去）要退够
+            // 它宽度的 kTabDragReturnRatio（80%）。拖动距离与重叠都要满足，
+            // 且以"上一次换位处"为基准重新起算，指尖回抖不会抖回顺序。
+            std::vector<float> slotX;
+            std::vector<float> slotW;
+            slotX.reserve(s->tabs.size());
+            slotW.reserve(s->tabs.size());
             for (const auto& t : s->tabs) {
-                centers.push_back(t.rect.X + t.rect.Width * 0.5f);
+                slotX.push_back(t.rect.X);
+                slotW.push_back(t.rect.Width);
             }
             const bool draggingPinned = s->tabs[idx].isChrome &&
                                         s->tabs[idx].chromePinned;
             const int lo = TabDragLo(*s, draggingPinned);
             const int hi = TabDragHi(*s, draggingPinned);
             const int next = wsproto::TabDragNextIndex(
-                centers, idx, static_cast<float>(cur.x), lo, hi);
+                slotX, slotW, idx, s->tabDragOriginIndex, s->tabDragBodyX,
+                s->tabs[idx].rect.Width, s->tabDragAnchorX,
+                kTabDragSwapRatio, kTabDragReturnRatio, lo, hi);
             if (next != idx && next >= 0 &&
                 next < static_cast<int>(s->tabs.size())) {
                 std::swap(s->tabs[idx], s->tabs[next]);
                 s->tabDragIndex = next;
                 s->tabPressIndex = next;
+                // 交换后各标签的坑位要立刻重排：下一帧的换位判定、以及下面的
+                // 锚点取值都依赖 rect（元素被搬动后还带着旧 rect）
+                LayoutTabs(*s, s->tabs, nullptr);
+                s->tabDragAnchorX = s->tabDragBodyX;
                 if (s->hoverTab >= 0) {
                     s->hoverTab = next;
                 }
@@ -4181,6 +4212,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 grab = pressed.rect.Width;
             }
             s->tabDragGrabDx = grab;
+            // 身体从标签自己的坑位出发；锚点也在这里（第一次换位需要 20% 的重叠）
+            s->tabDragBodyX = pressed.rect.X;
+            s->tabDragAnchorX = pressed.rect.X;
+            s->tabDragOriginIndex = tabIndex;  // "原来的位置"：朝它移动时用回退阈值
             SetCapture(hwnd);
         }
 
