@@ -212,6 +212,16 @@ $tabY = $rc.T + [int]($barH / 2)
 $tabCount = 3
 $tabW = [Math]::Min(240.0 * $k, ($tabRight - $tabLeft) / $tabCount)
 function TabX([int]$i) { return $rc.L + [int]($tabLeft + $tabW * ($i + 0.5)) }
+# 读顶栏当前的顺序：依次点 0/1/2 号标签，读 Edge 里随之激活的标签标题
+function ReadOrder() {
+  $o = @()
+  foreach ($i in 0..2) {
+    [EdgeTabDrag]::Click((TabX $i), $tabY)
+    Start-Sleep -Milliseconds 500
+    $o += (ActiveTitle $win)
+  }
+  return @($o)
+}
 Write-Host ("顶栏标签区 x={0:N1}..{1:N1}，3 槽位中心 = {2},{3},{4}" -f `
   $tabLeft, $tabRight, (TabX 0), (TabX 1), (TabX 2))
 
@@ -249,6 +259,28 @@ try {
   [EdgeTabDrag]::Click($wrc.L + 400, $wrc.T + 300)
   Start-Sleep -Milliseconds 1500
 
+  # 前置：确认顶栏已进入 Chrome 同步模式（扩展已连上）。判据是点顶栏 0/1 号
+  # 标签能切换浏览器里两个不同的测试标签 —— 顶栏刚重启时扩展可能还没重连上，
+  # 那时顶栏是窗口枚举模式，点标签不会切浏览器标签，整个测试无从谈起。
+  $syncOk = $false
+  for ($try = 0; $try -lt 20; $try++) {
+    [EdgeTabDrag]::Click((TabX 0), $tabY)
+    Start-Sleep -Milliseconds 450
+    $a = ActiveTitle $win
+    [EdgeTabDrag]::Click((TabX 1), $tabY)
+    Start-Sleep -Milliseconds 450
+    $b = ActiveTitle $win
+    if (($a -ne $b) -and ($a -like "*$key*") -and ($b -like "*$key*")) {
+      $syncOk = $true
+      break
+    }
+    Start-Sleep -Milliseconds 800
+  }
+  if (-not $syncOk) {
+    Write-Host 'FAIL: 顶栏没有进入 Chrome 同步模式（扩展未连上？先在 edge://extensions 确认扩展已加载）'
+    throw 'chrome sync mode not ready'
+  }
+
   [EdgeTabDrag]::Shot((Join-Path $logs 'edge_tab_drag_before.png'), $shotX, $shotY, $shotW, $stripH)
 
   $B0 = OrderTitles (Get-BrowserTabs $win)
@@ -273,13 +305,12 @@ try {
   Start-Sleep -Milliseconds 1500
   [EdgeTabDrag]::Shot((Join-Path $logs 'edge_tab_drag_after.png'), $shotX, $shotY, $shotW, $stripH)
 
-  # ---- 4) 浏览器侧的真实标签顺序应变成 [T2,T0,T1] ----
+  # ---- 4) 浏览器侧的真实标签顺序**不能**被顶栏拖动改动（两套顺序解绑）----
   $B1 = OrderTitles (Get-BrowserTabs $win)
   Write-Host ("  浏览器标签顺序（拖动后）= [" + ($B1 -join ', ') + "]")
-  $expectB = @($B0[2], $B0[0], $B0[1])
-  Check '浏览器里的真实标签顺序也跟着重排了（扩展处理了 moveTab）' `
-    (($B1.Count -eq 3) -and ($B1[0] -eq $expectB[0]) -and ($B1[1] -eq $expectB[1]) -and ($B1[2] -eq $expectB[2])) `
-    ("期望 [" + ($expectB -join ', ') + "]，实际 [" + ($B1 -join ', ') + "]")
+  Check '浏览器里的真实标签顺序保持不变（拖动只改顶栏顺序）' `
+    (($B1.Count -eq $B0.Count) -and ($B1[0] -eq $B0[0]) -and ($B1[1] -eq $B0[1]) -and ($B1[2] -eq $B0[2])) `
+    ("期望 [" + ($B0 -join ', ') + "]，实际 [" + ($B1 -join ', ') + "]")
 
   # ---- 5) 顶栏顺序也应与之一致 ----
   $order = @()
@@ -293,17 +324,19 @@ try {
     (($order.Count -eq 3) -and ($order[0] -eq $T[2]) -and ($order[1] -eq $T[0]) -and ($order[2] -eq $T[1])) `
     ("期望 [" + (@($T[2], $T[0], $T[1]) -join ', ') + "]，实际 [" + ($order -join ', ') + "]")
 
+  # 焦点在浏览器与顶栏之间来回切一次：浏览器会推 windowFocused 全量快照，
+  # 顶栏自己排好的顺序不能被冲回浏览器顺序
+  [EdgeTabDrag]::Click($wrc.L + 400, $wrc.T + 300)
+  Start-Sleep -Milliseconds 1200
+  $afterFocus = ReadOrder
+  Write-Host ("  焦点切换（触发全量快照）后 0/1/2 -> [" + ($afterFocus -join ', ') + "]")
+  Check '顶栏顺序在浏览器全量快照后仍然保留' `
+    (($afterFocus.Count -eq 3) -and ($afterFocus[0] -eq $order[0]) -and `
+     ($afterFocus[1] -eq $order[1]) -and ($afterFocus[2] -eq $order[2])) `
+    ("期望 [" + ($order -join ', ') + "]，实际 [" + ($afterFocus -join ', ') + "]")
+
   # ---- 6) 换位阈值：只拖相邻标签宽度的 25% 也必须换位 ----
   #（阈值是相邻标签宽度的 20%；旧行为要拖满一整格、约一个标签宽才换）
-  function ReadOrder() {
-    $o = @()
-    foreach ($i in 0..2) {
-      [EdgeTabDrag]::Click((TabX $i), $tabY)
-      Start-Sleep -Milliseconds 500
-      $o += (ActiveTitle $win)
-    }
-    return @($o)
-  }
   $O0 = ReadOrder
   Write-Host ("  短拖前 0/1/2 -> [" + ($O0 -join ', ') + "]")
   $short = [int]($tabW * 0.25)
@@ -326,32 +359,30 @@ try {
     (($O2.Count -eq 3) -and ($O2[0] -eq $O0[0]) -and ($O2[1] -eq $O0[1]) -and ($O2[2] -eq $O0[2])) `
     ("期望 [" + ($O0 -join ', ') + "]，实际 [" + ($O2 -join ', ') + "]")
 
-  # ---- 8) 回退迟滞：换过去之后要退够 80% 宽度，被挤开的标签才回原位 ----
-  #  一次拖动里两段路：先向右 25%（换位），再往回退；退 30% 宽度时顺序不动，
-  #  退到 80% 宽度时被挤开的那个标签回原位。
+  # ---- 8) 回退：换过去之后方向一反（越过防抖量）就让被挤开的标签回原位 ----
+  #  一次拖动里两段路：先向右 25% 换位，再往回退。
+  #  8a) 只回抖 3px（小于防抖 6px）：顺序不动（还是换过去的样子）
+  #  8b) 往回退 30% 宽度（远大于防抖）：被挤开的那个标签立刻回原位
   $O3 = ReadOrder
-  Write-Host ("  迟滞测试前 0/1/2 -> [" + ($O3 -join ', ') + "]")
+  Write-Host ("  回退测试前 0/1/2 -> [" + ($O3 -join ', ') + "]")
   $fwd = [int]($tabW * 0.25)
-  $small = [int]($tabW * 0.30)
   [EdgeTabDrag]::DragPath((TabX 1), $tabY,
-    @(((TabX 1) + $fwd), ((TabX 1) + $fwd - $small)), 8)
+    @(((TabX 1) + $fwd), ((TabX 1) + $fwd - 3)), 8)
   Start-Sleep -Milliseconds 700
   $O4 = ReadOrder
-  Write-Host ("  向右 25% 再退回 30% 宽度后 0/1/2 -> [{0}]" -f ($O4 -join ', '))
-  Check '退回不到 80% 宽度：被挤开的标签不回原位' `
+  Write-Host ("  向右 25% 再回抖 3px 后 0/1/2 -> [{0}]" -f ($O4 -join ', '))
+  Check '换位后只回抖 3px（< 防抖量）：不回位' `
     (($O4.Count -eq 3) -and ($O4[0] -eq $O3[0]) -and ($O4[1] -eq $O3[2]) -and ($O4[2] -eq $O3[1])) `
     ("期望 [" + (@($O3[0], $O3[2], $O3[1]) -join ', ') + "]，实际 [" + ($O4 -join ', ') + "]")
 
-  #  再拖一次：向右 25% 换位后，往回退够 80% 宽度 -> 被挤开的标签回原位
-  #  （换位发生在拖动 20% 宽度处，所以回退量按"越过换位点 80% 宽度"算，
-  #    这里退到 95% 宽度，留一点余量）
-  $big = [int]($tabW * 0.95)
+  #  从当前顺序出发，再拖一次：向右 25% 换位后往回退 30% 宽度 -> 立刻回原位
+  $back = [int]($tabW * 0.30)
   [EdgeTabDrag]::DragPath((TabX 1), $tabY,
-    @(((TabX 1) + $fwd), ((TabX 1) + $fwd - $big)), 8)
+    @(((TabX 1) + $fwd), ((TabX 1) + $fwd - $back)), 8)
   Start-Sleep -Milliseconds 700
   $O5 = ReadOrder
-  Write-Host ("  向右 25% 再退回 95% 宽度后 0/1/2 -> [{0}]" -f ($O5 -join ', '))
-  Check '退回 80% 宽度后：被挤开的标签回原位' `
+  Write-Host ("  向右 25% 再退回 30% 宽度后 0/1/2 -> [{0}]" -f ($O5 -join ', '))
+  Check '往回退 30% 宽度：被挤开的标签立刻回原位' `
     (($O5.Count -eq 3) -and ($O5[0] -eq $O4[0]) -and ($O5[1] -eq $O4[1]) -and ($O5[2] -eq $O4[2])) `
     ("期望 [" + ($O4 -join ', ') + "]，实际 [" + ($O5 -join ', ') + "]")
 

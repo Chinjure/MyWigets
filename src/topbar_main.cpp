@@ -20,10 +20,12 @@
 //        顶栏会凭空弹出来（如 hotspot 的 WS_EX_TOOLWINDOW 启动器弹出窗）
 //      - 按住标签左右拖动即可随意重排（超过 4px 阈值才算拖动）：
 //        拖动中被拖标签浮在光标处、其余标签实时补位（原位置留空即落点提示），
-//        拖动距离只要占相邻标签宽度的 20%（kTabDragSwapRatio）就换位，
-//        松手即生效。Chrome 同步模式下额外把新位置下发给扩展执行
-//        chrome.tabs.move —— 浏览器里的真实标签顺序一起变；窗口枚举模式
-//        只调整顶栏展示顺序（同一应用内保持到应用切走为止）。
+//        前进只要拖动距离占相邻标签宽度的 20%（kTabDragSwapRatio）就换位；
+//        往回（朝原来的位置）一动（超过防抖量）就让刚被挤开的标签回原位
+//        （此时被拖标签仍覆盖着它 80% 宽度）。松手即落定这个顺序。
+//        **顶栏标签顺序与浏览器里的真实标签顺序解绑**：拖动只改顶栏自己的
+//        展示顺序（按浏览器窗口分别保留），不下发任何命令、不动浏览器的标签；
+//        浏览器那侧的标签移动（tabMoved）也不会回过来重排顶栏。
 //        固定标签恒在最前：普通标签拖不进固定区、固定标签也拖不出。
 //   4. 顶栏右侧提供 Chrome 浏览器风格的 最小化 / 最大化 / 关闭 三个按钮，
 //      用于控制当前聚焦窗口；双击顶栏空白处让当前聚焦窗口填充"顶栏以外"
@@ -154,9 +156,9 @@ constexpr int kTabDragThreshold = 4;
 // 换位阈值：被拖标签与相邻标签的重叠达到**相邻标签宽度的这个比例**就换位。
 // 0.2 = 拖动距离占相邻标签 20% 的宽度即交换位置（旧行为要拖满整格才换）。
 constexpr float kTabDragSwapRatio = 0.2f;
-// 回退阈值：已经换过去之后，要让刚被挤开的那个标签回到原位，被拖标签得朝
-// 原位置退够它宽度的这个比例（默认 80%）—— 换出去容易、退回来要拖得更明确，
-// 拖动途中手一抖不会把顺序来回翻。
+// 回退阈值：**朝原来的位置**移动时，被拖标签覆盖到刚被挤开的那个标签宽度的
+// 这个比例（默认 80% —— 换位瞬间正好就是这个姿态），被挤开的标签就回原位：
+// 方向一反就回，不需要再往回拖 80% 的距离。注意这是"覆盖比例"，不是拖动距离。
 constexpr float kTabDragReturnRatio = 0.8f;
 
 // 左上角音量按钮与展开面板
@@ -927,7 +929,6 @@ bool ChromeSyncSendJson(const std::string& utf8Json);
 void ChromeSyncSendActivateTab(int tabId);
 void ChromeSyncSendCloseTab(int tabId);
 void ChromeSyncSendNewTab();
-void ChromeSyncSendMoveTab(int tabId, int index);
 void ChromeSyncStart(HWND hwnd);
 void ChromeSyncStop();
 
@@ -1550,13 +1551,6 @@ void ChromeSyncSendNewTab() {
     ChromeSyncSendJson(wsproto::ChromeSyncBuildCommand(L"newTab"));
 }
 
-// 拖动重排落定：让扩展把标签移动到新位置（chrome.tabs.move）。
-// 扩展执行后浏览器会推 tabMoved 回来，顺序以浏览器为准对齐。
-void ChromeSyncSendMoveTab(int tabId, int index) {
-    ChromeSyncSendJson(
-        wsproto::ChromeSyncBuildMoveTabCommand(tabId, index));
-}
-
 // 关闭当前客户端连接（可跨线程调用；sendMutex 串行化与 send 的竞争）
 void ChromeSyncCloseClient() {
     std::lock_guard<std::mutex> lock(g_chromeServer.sendMutex);
@@ -2082,11 +2076,11 @@ void CancelTabDrag(AppState& s) {
     s.tabDragAnchorX = 0.0f;
 }
 
-// 松手落定：把拖动后的顺序交给"真正的主人"。
-//   Chrome 同步模式：把顶栏顺序写回同步模型（index 一并改写，否则之后
-//     任何一条 tabUpdated 的 upsert 都会按浏览器旧 index 重新排序，把
-//     用户刚拖好的顺序弹回去），再把最终 index 下发给扩展执行
-//     chrome.tabs.move —— 真正的标签顺序在浏览器里也一起变。
+// 松手落定：把拖动后的顺序记到顶栏自己这边（**不写回浏览器**）。
+//   Chrome 同步模式：顶栏顺序与浏览器里的真实标签顺序解绑 —— 这里只把
+//     新顺序写回同步模型的本地顺序（顺序即位置，index 跟着重编号），
+//     这样随后的单条 tabUpdated 或同窗口全量快照都不会把用户排好的顺序
+//     按浏览器的 index 重排。不下发 moveTab，浏览器的标签顺序保持不动。
 //   窗口枚举模式：s.tabs 的顺序本身就是展示顺序，RefreshTabs 会保留
 //     既有相对顺序（见其中的 ordered 重建），无需额外持久化。
 void CommitTabReorder(AppState& s, int movedIndex) {
@@ -2094,12 +2088,11 @@ void CommitTabReorder(AppState& s, int movedIndex) {
         movedIndex >= static_cast<int>(s.tabs.size())) {
         return;
     }
-    const TabInfo& moved = s.tabs[movedIndex];
-    if (!moved.isChrome) {
+    if (!s.tabs[movedIndex].isChrome) {
         return;
     }
 
-    // 顶栏展示顺序 -> 同步模型顺序
+    // 顶栏展示顺序 -> 同步模型的本地顺序（只改顶栏这边）
     std::vector<int> order;
     order.reserve(s.tabs.size());
     for (const auto& t : s.tabs) {
@@ -2108,18 +2101,6 @@ void CommitTabReorder(AppState& s, int movedIndex) {
         }
     }
     wsproto::ChromeSyncApplyOrder(s.chromeSync, order);
-
-    // 下发给扩展：固定标签永远在最前，落点按浏览器规则夹取
-    int pinnedCount = 0;
-    for (const auto& t : s.tabs) {
-        if (t.chromePinned) {
-            ++pinnedCount;
-        }
-    }
-    const int index = wsproto::ChromeClampTabIndex(
-        movedIndex, pinnedCount, static_cast<int>(s.tabs.size()),
-        moved.chromePinned);
-    ChromeSyncSendMoveTab(moved.chromeTabId, index);
 }
 
 // 根据当前宽度计算每个标签的矩形（从音量键右侧到右侧三键左侧）。
@@ -4034,9 +4015,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             s->tabDragBodyX = static_cast<float>(cur.x) - s->tabDragGrabDx;
 
             // 换位判定：前进只要身体与相邻标签的重叠达到后者宽度的
-            // kTabDragSwapRatio（20%）；回退（把刚被挤开的标签放回去）要退够
-            // 它宽度的 kTabDragReturnRatio（80%）。拖动距离与重叠都要满足，
-            // 且以"上一次换位处"为基准重新起算，指尖回抖不会抖回顺序。
+            // kTabDragSwapRatio（20%）；回退（把刚被挤开的标签放回去）只要
+            // 方向反过来、越过一个防抖量，且身体仍覆盖着那个标签
+            // kTabDragReturnRatio（80%）的宽度就立刻回位。
             std::vector<float> slotX;
             std::vector<float> slotW;
             slotX.reserve(s->tabs.size());
@@ -4049,10 +4030,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                         s->tabs[idx].chromePinned;
             const int lo = TabDragLo(*s, draggingPinned);
             const int hi = TabDragHi(*s, draggingPinned);
+            const float jitterPx = static_cast<float>(
+                (std::max)(kTabDragThreshold,
+                           MulDiv(kTabDragThreshold, s->dpi, 96)));
             const int next = wsproto::TabDragNextIndex(
                 slotX, slotW, idx, s->tabDragOriginIndex, s->tabDragBodyX,
                 s->tabs[idx].rect.Width, s->tabDragAnchorX,
-                kTabDragSwapRatio, kTabDragReturnRatio, lo, hi);
+                kTabDragSwapRatio, kTabDragReturnRatio, jitterPx, lo, hi);
             if (next != idx && next >= 0 &&
                 next < static_cast<int>(s->tabs.size())) {
                 std::swap(s->tabs[idx], s->tabs[next]);

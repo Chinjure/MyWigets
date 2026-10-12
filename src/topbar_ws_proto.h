@@ -620,10 +620,21 @@ inline JsonValue JsonParse(const std::wstring& text) {
 }
 
 // ---- Chrome 标签同步模型 ----
+//
+// 顺序语义（重要）：**顶栏标签顺序是顶栏自己的一套，和浏览器里的标签顺序解绑**。
+//   - 顶栏第一次看到某个浏览器窗口（或换到另一个窗口）时，按浏览器推送的
+//     index 顺序铺开；
+//   - 之后用户可以在顶栏上随意拖动重排，这个本地顺序会被保留：
+//        · 同一个窗口的 hello / windowFocused 全量快照只更新标签内容
+//          （新增的追加、消失的移除），不会把用户排好的顺序按浏览器 index 重排；
+//        · 浏览器自己那侧的标签顺序变化（tabMoved）不影响顶栏顺序；
+//   - 顶栏的顺序也不会写回浏览器（不下发 moveTab，不动 chrome.tabs.move）。
+// 模型里每个标签的 index 字段始终是它在顶栏里的位置（每次变更后重编号），
+// 浏览器的 index 只在"首次铺开"和"新标签插位"时参考。
 
 struct ChromeTabModel {
     int id = 0;
-    int index = 0;
+    int index = 0;  // 顶栏里的位置（不是浏览器里的位置）
     std::wstring title;
     std::wstring url;
     bool active = false;
@@ -633,11 +644,18 @@ struct ChromeTabModel {
 struct ChromeSyncModel {
     bool connected = false;  // UI 线程镜像：扩展已连接
     int windowId = 0;        // 当前同步的 Chrome 窗口
-    std::vector<ChromeTabModel> tabs;  // 按 index 升序
+    std::vector<ChromeTabModel> tabs;  // 顶栏展示顺序（index 与位置一致）
 };
 
 inline bool ChromeSyncModelValid(const ChromeSyncModel& m) {
     return m.connected && !m.tabs.empty();
+}
+
+// 把 index 重编号为各自的位置（每次增删/重排后调用，保持"index = 顶栏位置"）
+inline void ChromeSyncRenumber(ChromeSyncModel& m) {
+    for (size_t i = 0; i < m.tabs.size(); ++i) {
+        m.tabs[i].index = static_cast<int>(i);
+    }
 }
 
 // 应用一条来自扩展的消息；返回 true 表示标签列表有变化
@@ -646,8 +664,7 @@ inline bool ChromeSyncApplyMessage(ChromeSyncModel& m, const JsonValue& msg) {
     if (!type) {
         return false;
     }
-    const auto upsert = [&m](const JsonValue& t) {
-        ChromeTabModel tab;
+    const auto parseTab = [](const JsonValue& t, ChromeTabModel& tab) {
         tab.id = t.GetInt(L"id", -1);
         if (tab.id < 0) {
             return false;
@@ -661,33 +678,97 @@ inline bool ChromeSyncApplyMessage(ChromeSyncModel& m, const JsonValue& msg) {
         }
         tab.active = t.GetBool(L"active");
         tab.pinned = t.GetBool(L"pinned");
+        return true;
+    };
+
+    // 单条标签更新：已在列表里的只更新内容、位置不动（顶栏本地顺序优先）；
+    // 新标签按浏览器给的 index 插到对应位置。
+    const auto upsert = [&m, &parseTab](const JsonValue& t) {
+        ChromeTabModel tab;
+        if (!parseTab(t, tab)) {
+            return false;
+        }
         for (auto& e : m.tabs) {
             if (e.id == tab.id) {
-                e = tab;
-                std::sort(m.tabs.begin(), m.tabs.end(),
-                          [](const ChromeTabModel& a, const ChromeTabModel& b) {
-                              return a.index < b.index;
-                          });
-                return true;
+                const bool changed = e.title != tab.title || e.url != tab.url ||
+                                     e.active != tab.active ||
+                                     e.pinned != tab.pinned;
+                e.title = tab.title;
+                e.url = tab.url;
+                e.active = tab.active;
+                e.pinned = tab.pinned;
+                return changed;
             }
         }
-        m.tabs.push_back(tab);
-        std::sort(m.tabs.begin(), m.tabs.end(),
-                  [](const ChromeTabModel& a, const ChromeTabModel& b) {
-                      return a.index < b.index;
-                  });
+        size_t pos = m.tabs.size();
+        for (size_t i = 0; i < m.tabs.size(); ++i) {
+            if (tab.index <= m.tabs[i].index) {
+                pos = i;
+                break;
+            }
+        }
+        m.tabs.insert(m.tabs.begin() + static_cast<long>(pos), tab);
+        ChromeSyncRenumber(m);
         return true;
     };
 
     if (*type == L"hello" || *type == L"windowFocused") {
-        m.windowId = msg.GetInt(L"windowId", 0);
-        m.tabs.clear();
+        const int windowId = msg.GetInt(L"windowId", 0);
+        std::vector<ChromeTabModel> incoming;
         if (const std::vector<JsonValue>* arr = msg.GetArr(L"tabs")) {
             for (const auto& t : *arr) {
-                upsert(t);
+                ChromeTabModel tab;
+                if (parseTab(t, tab)) {
+                    incoming.push_back(tab);
+                }
             }
         }
-        return true;
+        std::sort(incoming.begin(), incoming.end(),
+                  [](const ChromeTabModel& a, const ChromeTabModel& b) {
+                      return a.index < b.index;
+                  });
+        // 换窗口（或还没有任何数据）：按浏览器顺序铺开
+        if (windowId != m.windowId || m.tabs.empty()) {
+            m.windowId = windowId;
+            m.tabs.swap(incoming);
+            ChromeSyncRenumber(m);
+            return true;
+        }
+        // 同一个窗口：保留顶栏本地顺序，只更新内容 + 追加新标签
+        std::vector<ChromeTabModel> next;
+        std::vector<bool> used(incoming.size(), false);
+        for (const auto& old : m.tabs) {
+            for (size_t i = 0; i < incoming.size(); ++i) {
+                if (!used[i] && incoming[i].id == old.id) {
+                    ChromeTabModel keep = incoming[i];
+                    keep.index = old.index;  // 位置以顶栏为准
+                    next.push_back(keep);
+                    used[i] = true;
+                    break;
+                }
+            }
+        }
+        for (size_t i = 0; i < incoming.size(); ++i) {
+            if (!used[i]) {
+                next.push_back(incoming[i]);  // 新标签追加到末尾
+            }
+        }
+        const bool changed =
+            next.size() != m.tabs.size() ||
+            [&next, &m] {
+                for (size_t i = 0; i < next.size(); ++i) {
+                    const ChromeTabModel& a = m.tabs[i];
+                    const ChromeTabModel& b = next[i];
+                    if (a.id != b.id || a.title != b.title || a.url != b.url ||
+                        a.active != b.active || a.pinned != b.pinned) {
+                        return true;
+                    }
+                }
+                return false;
+            }();
+        m.tabs.swap(next);
+        ChromeSyncRenumber(m);
+        return changed;
     }
     if (*type == L"tabCreated" || *type == L"tabUpdated") {
         const JsonValue* tab = msg.Get(L"tab");
@@ -700,25 +781,13 @@ inline bool ChromeSyncApplyMessage(ChromeSyncModel& m, const JsonValue& msg) {
             [id](const ChromeTabModel& t) { return t.id == id; });
         if (it != m.tabs.end()) {
             m.tabs.erase(it);
+            ChromeSyncRenumber(m);
             return true;
         }
         return false;
     }
     if (*type == L"tabMoved") {
-        const int id = msg.GetInt(L"tabId", -1);
-        const int index = msg.GetInt(L"index", 0);
-        auto it = std::find_if(m.tabs.begin(), m.tabs.end(),
-                               [id](const ChromeTabModel& t) {
-                                   return t.id == id;
-                               });
-        if (it != m.tabs.end()) {
-            it->index = index;
-            std::sort(m.tabs.begin(), m.tabs.end(),
-                      [](const ChromeTabModel& a, const ChromeTabModel& b) {
-                          return a.index < b.index;
-                      });
-            return true;
-        }
+        // 浏览器自己那侧的标签顺序变化：顶栏顺序与它解绑，不做重排
         return false;
     }
     if (*type == L"tabActivated") {
@@ -750,6 +819,10 @@ inline std::string ChromeSyncBuildCommand(const wchar_t* type, int tabId = -1) {
 }
 
 // 构造拖动重排命令：扩展侧执行 chrome.tabs.move(tabId, { index })
+//
+// 注意：**已废弃、不再下发**。顶栏的标签顺序是顶栏自己的一套，和浏览器
+// 里的真实标签顺序解绑（拖动只改顶栏展示顺序，绝不动浏览器的标签），
+// 这里保留构造器只是为了让扩展侧那段处理仍有据可查、并留着单元测试。
 inline std::string ChromeSyncBuildMoveTabCommand(int tabId, int index) {
     std::wstring s = L"{\"type\":\"moveTab\",\"tabId\":";
     s += std::to_wstring(tabId);
@@ -767,13 +840,15 @@ inline std::string ChromeSyncBuildMoveTabCommand(int tabId, int index) {
 //   dragIndex    被拖标签当前所处位置
 //   originIndex  本次拖动开始时被拖标签的位置（"原来的位置"）
 //   bodyX/bodyW  被拖标签浮起后的矩形（客户区坐标，bodyX 为左边界）
-//   anchorX      上一次换位时的 bodyX：换位后要朝新方向再拖够比例才允许下一次
-//                换位（否则指尖回抖会把刚换好的顺序立刻抖回去）
+//   anchorX      上一次换位时的 bodyX：换位后要按新方向越过一小段（jitterPx）
+//                才允许下一次换位，指尖回抖不会把顺序来回翻
 //   ratioForward 前进阈值（默认 0.2）：**远离**起始位置的方向上，拖动距离与重叠
 //                达到相邻标签宽度的 20% 就换位 —— 轻轻一拖就换。
-//   ratioBack    回退阈值（默认 0.8）：**朝原来的位置**移动时，要让刚被挤开的
-//                那个标签回到原位，被拖标签得退够它宽度的 80%（拖动距离与重叠
-//                都满足）—— 换出去容易、退回来要拖得更明确。
+//   ratioBack    回退阈值（默认 0.8）：**朝原来的位置**移动时，被拖标签覆盖到
+//                刚被挤开的那个标签宽度的 80%（正是换位瞬间的姿态）就让
+//                它回原位 —— 方向一反就回，不需要再往回拖 80% 的距离。
+//   jitterPx     防抖量（客户区像素）：回退方向至少要走这么多才算"往回拖"，
+//                避免按住不动时的手抖把顺序抖回去。
 //   lo, hi       允许停留的索引区间（Chrome 固定标签恒在最前：普通标签不能
 //                拖进固定区、固定标签也不能拖出；窗口模式传 0 / -1 即无约束）
 // 返回这一帧结束后被拖标签应处的位置。一次只走一格，由后续帧继续推进。
@@ -781,13 +856,14 @@ inline std::string ChromeSyncBuildMoveTabCommand(int tabId, int index) {
 // 方向不对称的由来：前进一格后，被拖标签的坑位随之前移一整格，同方向继续
 // 前进的那一格因此仍要再拖约一整格 —— 这是"坑位按整格量化 + 标签跟着光标走"
 // 的必然结果，也只有这样才能保证松手后标签落在光标附近，而不是飞到几格外。
-// 回退方向（朝起始位置）按 ratioBack 判定：默认要退够 80% 宽度才让被挤开的
-// 标签回原位。
+// 回退方向相反：换位瞬间被拖标签已经覆盖了刚被挤开的标签 80% 的宽度，
+// 所以往回一动（超过 jitterPx）就该让那个标签回原位。
 inline int TabDragNextIndex(const std::vector<float>& slotX,
                             const std::vector<float>& slotW, int dragIndex,
                             int originIndex, float bodyX, float bodyW,
                             float anchorX, float ratioForward = 0.2f,
-                            float ratioBack = 0.8f, int lo = 0, int hi = -1) {
+                            float ratioBack = 0.8f, float jitterPx = 6.0f,
+                            int lo = 0, int hi = -1) {
     const int n = (std::min)(static_cast<int>(slotX.size()),
                              static_cast<int>(slotW.size()));
     if (n <= 0 || dragIndex < 0 || dragIndex >= n) {
@@ -805,6 +881,9 @@ inline int TabDragNextIndex(const std::vector<float>& slotX,
     if (originIndex > n - 1) {
         originIndex = n - 1;
     }
+    if (jitterPx < 0.0f) {
+        jitterPx = 0.0f;
+    }
     // 离起始位置更近 = 正在"往原来的位置移动" -> 用回退阈值
     const int distNow = dragIndex > originIndex ? dragIndex - originIndex
                                                 : originIndex - dragIndex;
@@ -813,9 +892,11 @@ inline int TabDragNextIndex(const std::vector<float>& slotX,
     if (right < n && right <= hi) {
         const int distAfter = right > originIndex ? right - originIndex
                                                   : originIndex - right;
-        const float ratio = distAfter < distNow ? ratioBack : ratioForward;
-        const float need = ratio * slotW[right];
-        if (bodyX - anchorX >= need &&
+        const bool towardOrigin = distAfter < distNow;
+        const float need = (towardOrigin ? ratioBack : ratioForward) *
+                           slotW[right];
+        const float travel = towardOrigin ? jitterPx : need;
+        if (bodyX - anchorX >= travel &&
             (bodyX + bodyW) - slotX[right] >= need) {
             return right;
         }
@@ -824,9 +905,11 @@ inline int TabDragNextIndex(const std::vector<float>& slotX,
     if (left >= 0 && left >= lo) {
         const int distAfter = left > originIndex ? left - originIndex
                                                  : originIndex - left;
-        const float ratio = distAfter < distNow ? ratioBack : ratioForward;
-        const float need = ratio * slotW[left];
-        if (anchorX - bodyX >= need &&
+        const bool towardOrigin = distAfter < distNow;
+        const float need = (towardOrigin ? ratioBack : ratioForward) *
+                           slotW[left];
+        const float travel = towardOrigin ? jitterPx : need;
+        if (anchorX - bodyX >= travel &&
             (slotX[left] + slotW[left]) - bodyX >= need) {
             return left;
         }

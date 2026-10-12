@@ -197,17 +197,43 @@ static void TestModel() {
     CHECK(m.tabs[0].active && !m.tabs[1].active && !m.tabs[2].active,
           "model tabActivated state");
 
-    // tabMoved：13 移到末尾（index 2）
-    std::wstring moved = L"{\"type\":\"tabMoved\",\"tabId\":13,\"index\":2}";
-    CHECK(ChromeSyncApplyMessage(m, JsonParse(moved)), "model tabMoved");
-    CHECK(m.tabs[2].id == 13, "model tabMoved order");
+    // 顶栏本地顺序：用户把 13 拖到末尾（只改顶栏顺序，不写回浏览器）
+    CHECK(ChromeSyncApplyOrder(m, {11, 12, 13}), "local order moved to end");
+    CHECK(m.tabs[2].id == 13 && m.tabs[2].index == 2, "local order state");
+
+    // tabMoved：浏览器自己那侧的标签顺序变化 —— 顶栏顺序与它解绑，不重排
+    std::wstring moved = L"{\"type\":\"tabMoved\",\"tabId\":13,\"index\":0}";
+    CHECK(!ChromeSyncApplyMessage(m, JsonParse(moved)),
+          "browser-side tabMoved ignored (no reorder)");
+    CHECK(m.tabs[2].id == 13, "topbar order unaffected by browser move");
+
+    // 同窗口的 hello（浏览器重新推送全量快照）：内容更新，但顶栏排好的顺序保留
+    std::wstring helloAgain =
+        L"{\"type\":\"hello\",\"windowId\":7,\"tabs\":["
+        L"{\"id\":11,\"index\":0,\"title\":\"A\",\"url\":\"u1\",\"active\":false,\"pinned\":false},"
+        L"{\"id\":12,\"index\":1,\"title\":\"B2\",\"url\":\"u2\",\"active\":false,\"pinned\":true},"
+        L"{\"id\":13,\"index\":2,\"title\":\"N\",\"url\":\"u3\",\"active\":true,\"pinned\":false}]}";
+    ChromeSyncApplyMessage(m, JsonParse(helloAgain));
+    CHECK(m.tabs.size() == 3 && m.tabs[2].id == 13,
+          "same-window snapshot keeps local order");
+    // 快照里新出现的标签：追加到顶栏顺序末尾
+    std::wstring helloNew =
+        L"{\"type\":\"hello\",\"windowId\":7,\"tabs\":["
+        L"{\"id\":11,\"index\":0,\"title\":\"A\",\"url\":\"u1\",\"active\":false,\"pinned\":false},"
+        L"{\"id\":12,\"index\":1,\"title\":\"B2\",\"url\":\"u2\",\"active\":false,\"pinned\":true},"
+        L"{\"id\":13,\"index\":2,\"title\":\"N\",\"url\":\"u3\",\"active\":true,\"pinned\":false},"
+        L"{\"id\":14,\"index\":3,\"title\":\"NEW\",\"url\":\"u4\",\"active\":false,\"pinned\":false}]}";
+    ChromeSyncApplyMessage(m, JsonParse(helloNew));
+    CHECK(m.tabs.size() == 4 && m.tabs[3].id == 14,
+          "new tab from snapshot appended to local order");
 
     // tabRemoved
     std::wstring removed = L"{\"type\":\"tabRemoved\",\"tabId\":12,\"windowId\":7}";
     CHECK(ChromeSyncApplyMessage(m, JsonParse(removed)), "model tabRemoved");
-    CHECK(m.tabs.size() == 2 && m.tabs[1].id == 13, "model tabRemoved state");
+    CHECK(m.tabs.size() == 3 && m.tabs[1].id == 13 && m.tabs[2].id == 14,
+          "model tabRemoved state");
 
-    // windowFocused：换窗口全量替换
+    // windowFocused：换窗口 -> 按浏览器顺序重新铺开
     std::wstring focused = L"{\"type\":\"windowFocused\",\"windowId\":9,\"tabs\":["
                            L"{\"id\":21,\"index\":0,\"title\":\"W2\",\"url\":\"x\",\"active\":true,\"pinned\":false}]}";
     CHECK(ChromeSyncApplyMessage(m, JsonParse(focused)), "model windowFocused");
@@ -223,9 +249,10 @@ static void TestModel() {
           "command closeTab");
     CHECK(ChromeSyncBuildCommand(L"newTab") == "{\"type\":\"newTab\"}",
           "command newTab");
+    // moveTab 已废弃（顶栏顺序不写回浏览器），构造器留着以备查
     CHECK(ChromeSyncBuildMoveTabCommand(11, 2) ==
               "{\"type\":\"moveTab\",\"tabId\":11,\"index\":2}",
-          "command moveTab");
+          "command moveTab (deprecated, not sent)");
 
     // 中文标题经命令/模型往返
     m.tabs.clear();
@@ -248,15 +275,14 @@ static void TestTabDragReorder() {
     CHECK(TabDragNextIndex(X, W, 0, 0, 20.0f, 100.0f, 0.0f) == 1,
           "drag 20% of neighbor width -> swap forward");
     // 换位后（坑位 1、身体 20、锚点 20、起始位置 0）：这是"朝原来的位置移动"，
-    // 要退够刚被挤开的那个标签宽度的 80% 才让它回原位
-    CHECK(TabDragNextIndex(X, W, 1, 0, 1.0f, 100.0f, 20.0f) == 1,
-          "tiny jitter back -> no swap");
-    CHECK(TabDragNextIndex(X, W, 1, 0, -30.0f, 100.0f, 20.0f) == 1,
-          "pull back 50px (50% < 80%) -> displaced tab stays");
-    CHECK(TabDragNextIndex(X, W, 1, 0, -59.0f, 100.0f, 20.0f) == 1,
-          "pull back 79px (just below 80%) -> no return");
-    CHECK(TabDragNextIndex(X, W, 1, 0, -60.0f, 100.0f, 20.0f) == 0,
-          "pull back 80% of neighbor width -> displaced tab returns");
+    // 换位瞬间身体已经覆盖住刚被挤开的那个标签 80% 宽度，所以方向一反
+    // （越过防抖量 6px）就该让它回原位
+    CHECK(TabDragNextIndex(X, W, 1, 0, 17.0f, 100.0f, 20.0f) == 1,
+          "jitter back 3px (< jitter gate) -> no return");
+    CHECK(TabDragNextIndex(X, W, 1, 0, 14.0f, 100.0f, 20.0f) == 0,
+          "pull back past jitter gate -> displaced tab returns at once");
+    CHECK(TabDragNextIndex(X, W, 1, 0, -30.0f, 100.0f, 20.0f) == 0,
+          "pull back 50% of width -> still returns");
     // 回到原位后再次前进，阈值又是 20%（此时是"远离起始位置"）
     CHECK(TabDragNextIndex(X, W, 0, 0, 20.0f, 100.0f, 0.0f) == 1,
           "forward again after return -> 20% threshold");
@@ -265,15 +291,15 @@ static void TestTabDragReorder() {
           "next slot still needs a full tab of travel");
     CHECK(TabDragNextIndex(X, W, 1, 0, 120.0f, 100.0f, 20.0f) == 2,
           "second swap forward");
-    // 向左拖动同理：前进（远离起始位置）20% 就换，往回退要 80%
+    // 向左拖动同理：前进（远离起始位置）20% 就换，往回一动就退回
     CHECK(TabDragNextIndex(X, W, 2, 2, 181.0f, 100.0f, 200.0f) == 2,
           "left drag below 20% -> no swap");
     CHECK(TabDragNextIndex(X, W, 2, 2, 180.0f, 100.0f, 200.0f) == 1,
           "left drag 20% into neighbor -> swap forward (left)");
-    CHECK(TabDragNextIndex(X, W, 1, 2, 259.0f, 100.0f, 180.0f) == 1,
-          "pull back right 79px (< 80%) -> no return");
-    CHECK(TabDragNextIndex(X, W, 1, 2, 260.0f, 100.0f, 180.0f) == 2,
-          "pull back right 80% of neighbor width -> returns");
+    CHECK(TabDragNextIndex(X, W, 1, 2, 183.0f, 100.0f, 180.0f) == 1,
+          "jitter back right 3px -> no return");
+    CHECK(TabDragNextIndex(X, W, 1, 2, 190.0f, 100.0f, 180.0f) == 2,
+          "pull back right past jitter gate -> returns");
     // 一次只走一格（长距离甩动由后续 mousemove 逐格推进）
     CHECK(TabDragNextIndex(X, W, 0, 0, 400.0f, 100.0f, 0.0f) == 1,
           "drag one step per event (right)");
@@ -300,19 +326,19 @@ static void TestTabDragReorder() {
 
     // 固定标签约束：前 2 个是固定标签
     //   普通标签（lo=2）不能拖到固定区
-    CHECK(TabDragNextIndex(X, W, 2, 2, 100.0f, 100.0f, 200.0f, 0.2f, 0.8f, 2,
-                           -1) == 2,
+    CHECK(TabDragNextIndex(X, W, 2, 2, 100.0f, 100.0f, 200.0f, 0.2f, 0.8f,
+                           6.0f, 2, -1) == 2,
           "drag unpinned cannot enter pinned zone");
     //   固定标签（hi=1）不能拖出固定区
-    CHECK(TabDragNextIndex(X, W, 1, 1, 220.0f, 100.0f, 100.0f, 0.2f, 0.8f, 0,
-                           1) == 1,
+    CHECK(TabDragNextIndex(X, W, 1, 1, 220.0f, 100.0f, 100.0f, 0.2f, 0.8f,
+                           6.0f, 0, 1) == 1,
           "drag pinned cannot leave pinned zone");
     //   固定区内/普通区内正常交换
-    CHECK(TabDragNextIndex(X, W, 0, 0, 50.0f, 100.0f, 0.0f, 0.2f, 0.8f, 0, 1) ==
-              1,
+    CHECK(TabDragNextIndex(X, W, 0, 0, 50.0f, 100.0f, 0.0f, 0.2f, 0.8f, 6.0f,
+                           0, 1) == 1,
           "drag pinned swaps inside pinned zone");
-    CHECK(TabDragNextIndex(X, W, 2, 2, 250.0f, 100.0f, 200.0f, 0.2f, 0.8f, 2,
-                           -1) == 3,
+    CHECK(TabDragNextIndex(X, W, 2, 2, 250.0f, 100.0f, 200.0f, 0.2f, 0.8f,
+                           6.0f, 2, -1) == 3,
           "drag unpinned swaps inside normal zone");
 
     // 下发给浏览器的落点夹取（固定标签恒在最前）
