@@ -218,6 +218,21 @@ function Get-KeepTop {
     if ($null -eq $v) { return 0 }
     return [int]$v
 }
+# Dock auto-collapse (HKCU\Software\DesktopSuite\Dock\AutoCollapse, default 1).
+# Since the dock band is reserved whenever auto-collapse is OFF -- with or without
+# keep-top (see dock_main.cpp KeepTopTargetWorkArea) -- this test pins it ON for
+# every phase that asserts a full work-area bottom, and turns it OFF only in P2.
+# The user's original value is restored in the cleanup phase.
+$REG_DOCK = 'HKCU:\Software\DesktopSuite\Dock'
+function Get-AutoCollapse {
+    $v = (Get-ItemProperty -Path $REG_DOCK -Name 'AutoCollapse' -ErrorAction SilentlyContinue).AutoCollapse
+    if ($null -eq $v) { return 1 }
+    return [int]$v
+}
+function Set-AutoCollapse([int]$on) {
+    if (-not (Test-Path $REG_DOCK)) { New-Item -Path $REG_DOCK -Force | Out-Null }
+    New-ItemProperty -Path $REG_DOCK -Name 'AutoCollapse' -Value $on -PropertyType DWord -Force | Out-Null
+}
 function Notify-Components([int]$on) {
     $dock = [KT]::Find('DesktopDockWindow')
     $bar = [KT]::Find('DesktopTopBarWindow')
@@ -241,6 +256,12 @@ function MaximizedWindowUnderBar([int]$waTop) {
 }
 
 "=== P0 baseline (mode off) ==="
+# Pin auto-collapse ON (dock parked off-screen) so that "mode off" really means a
+# full-monitor work area: with auto-collapse OFF the dock band is reserved even
+# without keep-top, which would break this phase's assertion.
+$autoCollapseOrig = Get-AutoCollapse
+Set-AutoCollapse 1
+Start-Sleep -Milliseconds 3200
 $maxwPre = ""
 $mwPre = [KT]::MaximizedWindows()
 if ($mwPre.Count -gt 0) { $maxwPre = $mwPre[0] }
@@ -335,9 +356,9 @@ if ($maxw -eq '') {
 #    One Down + Enter must land on "keep top" and toggle the registry flag.
 # 2) Then flip the dock's own auto-collapse setting so the dock is always
 #    visible, which is the case where the dock band must be reserved, and check
-#    the work area + maximized window.
-$dockCfg0 = (Get-ItemProperty -Path 'HKCU:\Software\DesktopSuite\Dock' -Name 'AutoCollapse' -ErrorAction SilentlyContinue).AutoCollapse
-if ($null -eq $dockCfg0) { $dockCfg0 = 1 }
+#    the work area + maximized window. (Auto-collapse was pinned ON above; P2
+#    turns it OFF on purpose and restores it to ON afterwards.)
+$dockCfg0 = 1
 
 $blkY = [int](($dockR1.B - $dockR1.T) * 0.7)
 "[note] opening the dock blank-area context menu (WM_RBUTTONUP client=(10," + $blkY + "))"
@@ -481,11 +502,13 @@ if ($maxw4.Count -gt 0) {
 "=== cleanup ==="
 Set-KeepTop 0
 Notify-Components 2
+Set-AutoCollapse $autoCollapseOrig
+Start-Sleep -Milliseconds 3200
 if ($cand -ne [IntPtr]::Zero -and [KT]::IsWindow($cand)) {
     [void][KT]::ShowWindow($cand, 3)  # leave the test window maximized as found
 }
 $waEnd = [KT]::Wa()
-"[note] work area restored: " + [KT]::Rect($waEnd) + " KeepTop=" + (Get-KeepTop)
+"[note] work area left as: " + [KT]::Rect($waEnd) + " KeepTop=" + (Get-KeepTop) + " AutoCollapse=" + (Get-AutoCollapse) + " (original)"
 
 ""
 "=== summary: $fails failure(s) ==="

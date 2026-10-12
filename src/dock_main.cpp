@@ -271,6 +271,11 @@ struct DockItem {
     std::wstring key;           // 归一化小写完整路径（分组主键）
     std::wstring launchPath;    // 启动用路径（固定的 .lnk 或原始 exe）
     std::wstring displayName;
+    // 「按名称并入运行组」的条目：key 是运行组 exe（关闭/托盘触发要按它找进程），
+    // pinKey 记录它所代表的固定项解析 key（启动器 exe/lnk）。拖拽重排与
+    // 取消固定都必须用 pinKey 反查 s.pins —— 否则运行 key 与固定 key 不同，
+    // 条目会被当成“找不到对应固定项”而无法拖动（钉钉等启动器/主程序分离的应用）。
+    std::wstring pinKey;
     bool pinned = false;
     bool hasWindow = false;     // 有顶层窗口 → 打开
     bool trayMarked = false;    // 托盘第三方驻留 → 视同打开（特别需求）
@@ -372,8 +377,6 @@ struct AppState {
     int menuCount = 0;
 
     uint64_t lastSignature = 0;  // 内容签名（FNV-1a），状态无变化时跳过重绘
-
-    ULONGLONG taskbarShowUntil = 0;  // 托盘图标触发期间：任务栏临时可见的截止时刻
 
     // ---- 全屏应用让位（游戏全屏 / 全屏视频 / 演示模式）----
     // 前台出现铺满本 Dock 所在显示器的应用时：Dock 无条件完全滑出屏幕底，
@@ -892,6 +895,32 @@ PinDescriptor DescribePin(const std::wstring& pinPath) {
     return d;
 }
 
+// 固定列表去重：同一解析 key 只保留首条（解析失败的 lnk 用原始路径比较）。
+// 为什么必须去重：固定项在 Dock 里一 key 一个图标，而拖拽重排的槽位映射
+// （ShownPinIndexList 取第一条匹配、ApplyDockReorder 重写 orderMap 取最后一
+// 条）在存在重复 key 时会互相矛盾 —— 图标被拖到重复项左侧会“弹回”，
+// 取消固定也只删掉一条，看起来像“钉钉固定不生效/拖不动”。历史版本里
+// “取消固定”对名称合并条目按运行 key 反查失败、反复追加就会留下这种重复。
+// 启动读配置后收敛一次并持久化。
+bool DedupePins(AppState& s) {
+    std::unordered_set<std::wstring> seen;
+    std::vector<std::wstring> kept;
+    kept.reserve(s.pins.size());
+    for (const auto& p : s.pins) {
+        std::wstring k = DescribePin(p).key;
+        if (k.empty()) k = NormalizePath(p);
+        if (seen.insert(k).second) {
+            kept.push_back(p);
+        } else {
+            Logf(L"固定列表去重：丢弃重复固定项 %ls（key=%ls）", p.c_str(),
+                 k.c_str());
+        }
+    }
+    if (kept.size() == s.pins.size()) return false;
+    s.pins.swap(kept);
+    return true;
+}
+
 // ============================== 图标提取（同 launcher 方案）===============
 
 Bitmap* HiconToArgbBitmap(HICON hIcon) {
@@ -1201,6 +1230,61 @@ std::vector<std::wstring> ReadRegisteredTrayRawPaths() {
     }
     RegCloseKey(root);
     return paths;
+}
+
+// 托盘图标注册表里该 exe 的「初始 Tooltip」。
+//
+// 为什么需要：Dock 条目的显示名取自 exe 的 FileDescription，而托盘图标的名字是
+// 应用自己设的 Tooltip，两者经常互不包含。hotspot 就是这种情况：
+//   条目名   = "hotspot - Everything-style NTFS file search launcher (C++/Win32)"
+//   Tooltip  = "hotspot — 左键显示 · 右键菜单"
+// 于是溢出弹窗里明明有它、名字匹配却始终失败，表现为「点 Dock 图标没反应」。
+// 注册表 NotifyIconSettings 按 exe 路径持久化了这个名字，用它兜底最准。
+std::wstring RegisteredTrayTooltipForExe(const std::wstring& exePath) {
+    const std::wstring want = NormalizePath(exePath);
+    if (want.empty()) return L"";
+    static std::mutex mu;
+    static std::unordered_map<std::wstring, std::wstring> cache;
+    static ULONGLONG cacheAt = 0;
+    const ULONGLONG now = GetTickCount64();
+    std::lock_guard<std::mutex> lock(mu);
+    if (now - cacheAt > kRunningPathsCacheMs) {
+        cache.clear();
+        cacheAt = now;
+        HKEY root = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kNotifyIconsKey, 0, KEY_READ,
+                          &root) == ERROR_SUCCESS) {
+            DWORD index = 0;
+            for (;;) {
+                wchar_t name[128] = {};
+                DWORD nameLen = 127;
+                if (RegEnumKeyExW(root, index++, name, &nameLen, nullptr,
+                                  nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
+                    break;
+                }
+                HKEY sub = nullptr;
+                if (RegOpenKeyExW(root, name, 0, KEY_READ, &sub) ==
+                    ERROR_SUCCESS) {
+                    const std::wstring exe =
+                        ReadRegString(sub, L"ExecutablePath");
+                    const std::wstring tip =
+                        ReadRegString(sub, L"InitialTooltip");
+                    RegCloseKey(sub);
+                    if (!exe.empty() && !tip.empty()) {
+                        const std::wstring key =
+                            NormalizePath(ExpandKnownFolderPrefix(exe));
+                        // 同一 exe 可能有多条（历史遗留 uid）：保留第一条
+                        if (!key.empty() && cache.find(key) == cache.end()) {
+                            cache[key] = tip;
+                        }
+                    }
+                }
+            }
+            RegCloseKey(root);
+        }
+    }
+    auto it = cache.find(want);
+    return it == cache.end() ? L"" : it->second;
 }
 
 DWORD PidOf(HWND hwnd) {
@@ -1574,7 +1658,9 @@ bool PointInGlassBody(const AppState& s, POINT pt, int winYOverride = -1) {
 
 
 
-// 本模式下 Dock 应让出的高度带（物理像素）：
+// 常驻可见的 Dock 应让出的高度带（物理像素）。与「保持顶栏」开关无关：
+// 只要 Dock 常驻可见（自动收起关闭），最大化窗口就必须停在这条带上方，
+// 否则置顶的 Dock 会压住窗口底部内容。
 //   自动收起开启 → Dock 平时收在屏幕外，不让（最大化窗口填满到屏幕底）；
 //   自动收起关闭 → Dock 常驻可见，让出 Dock 高度带，使最大化窗口底边距
 //                  **毛玻璃顶边** 恰好 keeptop::kMaxWindowToDockGapBase（2px）。
@@ -1632,12 +1718,22 @@ int KeepTopDockReserve() {
     return 0;
 }
 
-// 模式目标工作区：关闭 → 整屏；开启 → 顶部让出顶栏高度（+ 视情况让出 Dock 带）
+// 目标工作区（工作区唯一写入口的取值函数）。两段预留彼此独立：
+//   顶部让出顶栏高度 —— 仅「保持顶栏」开启时。该模式下顶栏恒置顶且不被任何
+//                        普通窗口遮挡，最大化窗口必须从顶栏以下开始。
+//   底部让出 Dock 高度带 —— 只要 Dock 常驻可见（自动收起关闭）就让，与
+//                        「保持顶栏」开关无关。Dock 是 WS_EX_TOPMOST 常驻窗，
+//                        不让出时最大化窗口会一路填到屏幕底，整条 Dock 压在
+//                        窗口内容上（毛玻璃半透明，窗口底部按钮被挡住）。
+//                        KeepTopDockReserve() 在自动收起开启时返回 0 —— Dock
+//                        平时收在屏幕外，最大化窗口应填满到屏幕底，不做无谓
+//                        留白。
+// 因此关闭「保持顶栏」不再等于整屏：自动收起关闭时仍要让出 Dock 带，
+// 让位手法（ReserveWorkArea + RefitMaximizedWindowsToWorkArea）与顶栏同一套。
 RECT KeepTopTargetWorkArea() {
     const RECT full = PrimaryScreenRect();
-    if (!g_state.keepTopEnabled) return full;
-    return keeptop::ReserveWorkArea(full, TopBarHeightForWorkArea(),
-                                    KeepTopDockReserve());
+    const int topInset = g_state.keepTopEnabled ? TopBarHeightForWorkArea() : 0;
+    return keeptop::ReserveWorkArea(full, topInset, KeepTopDockReserve());
 }
 
 // 把已最大化的窗口重排到新工作区。
@@ -1729,6 +1825,21 @@ void UpdateKeepTopWorkArea(AppState& s, bool refitMaximized) {
     ApplyWorkArea(want, refitMaximized);
 }
 
+// ============ 托盘图标触发期间：任务栏临时可见的截止时刻 ============
+// 这是**兜底**路径才用的开关，不是常态：任务栏被 Dock 隐藏时，shell 用久了会
+// 把任务栏那套 XAML 宿主卸载掉（实测：同一台机器上隐藏状态下 DesktopWindowContentBridge
+// 的 UIA 子树会由「10 个元素」变成空，此时可见区图标与溢出弹窗都枚举不到）。
+// 这时临时显示任务栏让宿主重新渲染一次，再试最后一遍即可命中。
+//
+// 注意：不要把它当成常态——任务栏隐藏时托盘图标的 UIA Invoke **本来就是有效的**
+// （实测：对可见区的 hotspot 图标 Invoke，任务栏保持隐藏，hotspot 窗口照常弹出），
+// 所以正常路径不需要显示任务栏，也就没有任务栏闪烁。
+//
+// worker 线程临时显示任务栏前置位截止时刻，主线程 EnsureTaskbarHidden 在截止前
+// 不抢收（否则刚显示就被隐藏，宿主渲染不完整）。
+std::atomic<ULONGLONG> g_taskbarShowUntil{0};
+constexpr ULONGLONG kTrayTaskbarShowMs = 3000;  // 临时显示任务栏的总时长上限
+
 void HideTaskbar() {
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &g_state.savedWorkArea, 0);
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
@@ -1767,8 +1878,11 @@ void ShowTaskbar() {
 // 周期性保护：explorer 崩溃自动重启后任务栏会重建为可见，
 // 轮询发现可见则再次隐藏（与 RefreshItems 同节奏，开销可忽略）
 void EnsureTaskbarHidden(AppState& s) {
-    // 托盘图标触发期间任务栏临时可见（见 TrayIconTrigger），不得抢收
-    if (GetTickCount64() < s.taskbarShowUntil) return;
+    // 托盘图标触发期间任务栏临时可见（见 g_taskbarShowUntil 注释）：不得抢收，
+    // 否则溢出弹窗装配到一半就被隐藏，图标永远点不到
+    if (GetTickCount64() < g_taskbarShowUntil.load(std::memory_order_relaxed)) {
+        return;
+    }
     bool touched = false;
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (tray && IsWindowVisible(tray)) {
@@ -2022,6 +2136,7 @@ void ApplyKeepTopEnabled(AppState& s, bool enabled, bool refitMaximized);  // �
 void ToggleKeepTopFromMenu(AppState& s);  // 右键菜单切换「保持顶栏」（定义在下方）
 void RequestCloseByIndex(AppState& s, size_t idx);  // 中键关闭：固定项隐藏圆点，临时项直接移除
 size_t FindItemByKey(AppState& s, const std::wstring& key);          // 按 key 定位条目
+std::wstring PinLookupKeyFor(const DockItem& item);  // 条目 → 固定项反查 key（定义在下方）
 void BeginDockPress(AppState& s, size_t idx, POINT pt);              // 固定区按下
 void ProcessDockDragMove(AppState& s);                               // 拖拽推进
 void ProcessDockDragUp(AppState& s, POINT client);                   // 松手收尾
@@ -2484,6 +2599,7 @@ bool RefreshItems(AppState& s) {
     struct Cand {
         DockItem item;
         size_t ordinal = SIZE_MAX;
+        bool absorbed = false;  // 固定项已被同名运行组取代（不再显示）
     };
     std::vector<Cand> cands;
     std::unordered_map<std::wstring, size_t> indexOfKey;
@@ -2560,6 +2676,11 @@ bool RefreshItems(AppState& s) {
     // dingtalk.exe），会导致 Dock 出现同名重复图标。这里不再只处理
     // 解析失败的 lnk，只要固定项和某个运行/托盘组显示名一致，就把
     // 运行/托盘组升级为固定项（保留 lnk 启动路径），消除重复。
+    // 关键：运行组必须**继承固定项的槽位序 ordinal**，否则打开应用后它会
+    // 带着运行组自己的尾序号跳到固定区末尾（钉钉打开后图标飞到 Dock 结尾）；
+    // 同时记下 pinKey —— 运行 key ≠ 固定 key（dingtalk.exe vs
+    // dingtalklauncher.exe），没有它拖拽重排/取消固定就反查不到 s.pins，
+    // 名称合并后的条目会“能显示但拖不动”。
     auto PinNameMatchesWindow = [](const std::wstring& pinNameLower,
                                    const std::wstring& winKey) {
         const std::wstring base =
@@ -2573,31 +2694,32 @@ bool RefreshItems(AppState& s) {
         return desc.find(pinNameLower) != std::wstring::npos ||
                pinNameLower.find(desc) != std::wstring::npos;
     };
-    for (size_t i = 0; i < cands.size(); ++i) {
-        Cand& p = cands[i];
+    for (Cand& p : cands) {
         if (!p.item.pinned || p.item.hasWindow || p.item.trayMarked) continue;
         const std::wstring nameLower = ToLower(p.item.displayName);
         if (nameLower.empty()) continue;
-        for (size_t j = 0; j < cands.size(); ++j) {
-            if (j == i) continue;
-            Cand& w = cands[j];
+        for (Cand& w : cands) {
+            if (&w == &p || w.absorbed) continue;
             if (!w.item.hasWindow && !w.item.trayMarked) continue;
             if (w.item.key == p.item.key) continue;
             if (!PinNameMatchesWindow(nameLower, w.item.key)) continue;
             w.item.pinned = true;
             w.item.launchPath = p.item.launchPath;
             w.item.displayName = p.item.displayName;
+            // 留在固定槽位：继承固定项序号（不可沿用运行组尾序号）
+            w.item.pinKey = p.item.key;
+            w.ordinal = p.ordinal;
             // 每对 (固定项, 运行组) 只记录一次，避免每轮询刷日志
             static std::unordered_set<std::wstring> mergedLogged;
             if (mergedLogged.insert(p.item.displayName + L"→" +
                                     w.item.key).second) {
-                Logf(L"固定项按名称并入运行组：%ls → %ls",
-                     p.item.displayName.c_str(), w.item.key.c_str());
+                Logf(L"固定项按名称并入运行组：%ls → %ls（槽位序 %zu）",
+                     p.item.displayName.c_str(), w.item.key.c_str(),
+                     w.ordinal);
             }
-            // 从候选中剔除启动器固定项本体，避免同名重复图标
-            cands.erase(cands.begin() + static_cast<long>(i));
-            --i;
-            break;
+            // 启动器固定项本体不再显示，避免同名重复图标
+            p.absorbed = true;
+            break;  // 一个固定项只并入一个运行组
         }
     }
 
@@ -2605,6 +2727,7 @@ bool RefreshItems(AppState& s) {
     std::vector<Cand*> shownPtrs;
     shownPtrs.reserve(cands.size());
     for (auto& c : cands) {
+        if (c.absorbed) continue;  // 已被同名运行组取代的固定项本体
         // 非固定项中键按下后：立即从 Dock 消失，即使窗口/进程还没真正退出；
         // 否则关闭慢时图标会“消失一瞬间又被下一次刷新重新加回”。
         // 托盘驻留项同样要在关闭完成前隐藏（战网等会先以托盘形式短暂残留，
@@ -3962,6 +4085,10 @@ struct DockTrayIconInfo {
 
 // 递归收集托盘区域的 XAML DesktopWindowContentBridge 桥窗口。
 // 这些桥窗口是 Win11 XAML 化托盘的 UIA 宿主，TrayList 正是从这里枚举。
+// 前置声明：下面的溢出弹窗可用性判断会用到（定义在本段之后）。
+std::vector<ComPtr<IUIAutomationElement>> UiaFindAll(
+    IUIAutomation* uia, ComPtr<IUIAutomationElement>& root, TreeScope scope);
+
 void FindBridgeWindowsRecursive(HWND parent, std::vector<HWND>& out) {
     if (!parent) return;
     HWND child = nullptr;
@@ -3988,6 +4115,75 @@ std::vector<HWND> CollectTrayBridgeWindows() {
     std::sort(bridges.begin(), bridges.end());
     bridges.erase(std::unique(bridges.begin(), bridges.end()), bridges.end());
     return bridges;
+}
+
+// 溢出弹窗宿主下的 XAML 内容桥：原实现只认 FindWindowExW 的**直接子窗口**，
+// 一旦 shell 把桥嵌到下一层（不同 Win11 版本/装配阶段会变）就整段枚举落空，
+// 且失败路径没有日志，表现成「点了没反应、日志也没有」。这里改成递归查找。
+HWND FindContentBridgeRecursive(HWND parent) {
+    if (!parent) return nullptr;
+    HWND child = nullptr;
+    while (true) {
+        child = FindWindowExW(parent, child, nullptr, nullptr);
+        if (!child) break;
+        wchar_t cls[256] = {};
+        GetClassNameW(child, cls, 255);
+        if (_wcsicmp(cls, kDesktopContentBridgeCls) == 0) return child;
+        if (HWND deeper = FindContentBridgeRecursive(child)) return deeper;
+    }
+    return nullptr;
+}
+
+// 溢出弹窗是否真的「开着且装着图标列表」。
+// 注意：不能只看 TopLevelWindowForOverflowXamlIsland 是否存在 —— 任务栏的其它
+// XAML 浮出层（音量/网络快捷设置等）用的就是同一个 island 宿主窗口，窗口在但
+// 内容不是溢出列表。旧实现据此提前 return true，于是枚举不到任何图标、静默失败。
+bool OverflowFlyoutUsable(IUIAutomation* uia, HWND* outIsland = nullptr) {
+    HWND hOuter = FindWindowW(kOverflowXamlIslandCls, nullptr);
+    if (outIsland) *outIsland = hOuter;
+    if (!hOuter || !IsWindowVisible(hOuter)) return false;
+    HWND inner = FindContentBridgeRecursive(hOuter);
+    if (!inner) return false;
+    if (!uia) return false;
+    ComPtr<IUIAutomationElement> root;
+    IUIAutomationElement* rawRoot = nullptr;
+    if (FAILED(uia->ElementFromHandle(inner, &rawRoot)) || !rawRoot) return false;
+    root.Attach(rawRoot);
+    return !UiaFindAll(uia, root, TreeScope_Children).empty();
+}
+
+// 临时把任务栏显示出来（幂等：同一轮触发内只显示一次）。
+// 见 g_taskbarShowUntil 注释：不显示任务栏，溢出弹窗装配不出来。
+void BeginTrayTaskbarShow() {
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_taskbarShowUntil.load(std::memory_order_relaxed)) return;
+    g_taskbarShowUntil.store(now + kTrayTaskbarShowMs,
+                             std::memory_order_relaxed);
+    HWND tray = FindWindowW(kShellTrayWndCls, nullptr);
+    if (tray) ShowWindowAsync(tray, SW_SHOWNOACTIVATE);
+    for (HWND sec = FindWindowExW(nullptr, nullptr, L"Shell_SecondaryTrayWnd",
+                                  nullptr);
+         sec; sec = FindWindowExW(nullptr, sec, L"Shell_SecondaryTrayWnd",
+                                  nullptr)) {
+        ShowWindowAsync(sec, SW_SHOWNOACTIVATE);
+    }
+}
+
+// 一轮托盘触发结束：关掉溢出弹窗、还回「任务栏隐藏」，交主线程自愈工作区。
+void EndTrayTaskbarShow() {
+    g_taskbarShowUntil.store(0, std::memory_order_relaxed);
+    HWND hOuter = FindWindowW(kOverflowXamlIslandCls, nullptr);
+    if (hOuter && IsWindowVisible(hOuter)) {
+        ShowWindowAsync(hOuter, SW_HIDE);
+    }
+    HWND tray = FindWindowW(kShellTrayWndCls, nullptr);
+    if (tray && IsWindowVisible(tray)) ShowWindowAsync(tray, SW_HIDE);
+    for (HWND sec = FindWindowExW(nullptr, nullptr, L"Shell_SecondaryTrayWnd",
+                                  nullptr);
+         sec; sec = FindWindowExW(nullptr, sec, L"Shell_SecondaryTrayWnd",
+                                  nullptr)) {
+        if (IsWindowVisible(sec)) ShowWindowAsync(sec, SW_HIDE);
+    }
 }
 
 std::wstring UiaElementName(ComPtr<IUIAutomationElement>& el) {
@@ -4281,6 +4477,18 @@ bool TrayIconMatchesApp(const DockTrayIconInfo& icon,
         }
         if (ContainsCaseInsensitive(icon.DisplayName(), nameHint)) return true;
     }
+
+    // 兜底：注册表里该 exe 的托盘 Tooltip（应用自己设的名字，与 Dock 条目名
+    // 常常完全不同 —— hotspot 条目名是 FileDescription、Tooltip 是
+    // "hotspot — 左键显示 · 右键菜单"）。见 RegisteredTrayTooltipForExe。
+    const std::wstring regTip = RegisteredTrayTooltipForExe(appKey);
+    if (!regTip.empty()) {
+        if (TrayElementNameMatches(regTip, icon.name) ||
+            TrayElementNameMatches(regTip, icon.tooltip) ||
+            TrayElementNameMatches(regTip, icon.DisplayName())) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -4383,78 +4591,119 @@ bool ClickTrayInVisible(IUIAutomation* uia, const std::wstring& nameHint,
     return false;
 }
 
-// 溢出窗（「隐藏的图标」弹窗）不存在时把它创建出来。
+// 溢出窗（「隐藏的图标」弹窗）没有真正打开时把它打开。
 //
-// 这是「点 Dock 图标打不开托盘驻留应用」的真正原因所在：
-// 第三方托盘图标（Clash Verge 等）默认全部落在溢出区，而溢出窗
-// TopLevelWindowForOverflowXamlIsland 是 shell **惰性创建**的 —— 本会话只要
-// 还没展开过一次隐藏图标，这个窗口就不存在。此时 ClickTrayInOverflow 一进门
-// 就因为 FindWindowW 为空而整段跳过，可见区又只放系统自身的网络/音量/时钟，
-// 于是「可见 → 溢出 → 直接 UIA」三条路全空，日志只剩：
-//     托盘图标触发失败：<应用>
-//     托盘触发失败：<应用> 不再外部显示窗口（避免影子窗口）
-// TrayList 里有对应的 OpenOverflowWindow()，但只声明没接线；Dock 移植时
-// 连这一步也没有，所以只能靠用户自己先点一次任务栏的 ^ 才“偶然”能用。
+// 点一次「显示隐藏的图标」，等溢出弹窗真的出现（不改任务栏可见性）。
+// 返回 true 表示弹窗已可见且装着图标列表。
 //
-// 实测结论（本机 Win11 24H2，决定了下面用 UIA Invoke 而不是坐标点击）：
-//   · Shell_TrayWnd 自身被 SW_HIDE 时它的 UIA 子树为空，但它下面的
-//     DesktopWindowContentBridge 子树照常有内容（任务栏 14 个元素、
-//     展开按钮 '显示隐藏的图标' 在里面）→ 创建溢出窗**全程不需要显示任务栏**；
-//   · 溢出窗自身隐藏时其 bridge 子树也照常有内容（7 个图标按钮），
-//     但所有图标的 bounds 都是 0×0 → 只能靠 UIA Invoke，坐标点击无从下手。
-bool EnsureOverflowIslandWindow(IUIAutomation* uia) {
-    if (FindWindowW(kOverflowXamlIslandCls, nullptr)) return true;  // 已存在
-    if (!uia) return false;
-    HWND hTray = FindWindowW(kShellTrayWndCls, nullptr);
-    if (!hTray) return false;
-    HWND hBridge = FindWindowExW(hTray, nullptr, kDesktopContentBridgeCls,
-                                 nullptr);
-
-    std::vector<HWND> roots;
-    if (hBridge) roots.push_back(hBridge);  // 任务栏隐藏时只有这棵树有内容
-    roots.push_back(hTray);
-    for (HWND hRoot : roots) {
-        ComPtr<IUIAutomationElement> root;
-        IUIAutomationElement* rawRoot = nullptr;
-        if (FAILED(uia->ElementFromHandle(hRoot, &rawRoot)) || !rawRoot) {
-            continue;
+// 实测（本机 Win11 24H2）：任务栏被 Dock SW_HIDE 时，对「显示隐藏的图标」按钮
+// UIA Invoke 同样有效 —— 弹窗 Island 窗口会在 ~300ms 内可见（任务栏保持隐藏），
+// 其内容桥的图标子项也能枚举/Invoke。所以这里**不需要**先把任务栏显示出来。
+bool TryOpenOverflowFlyout(IUIAutomation* uia, HWND hTray) {
+    if (OverflowFlyoutUsable(uia)) return true;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        // 每轮都重新找桥窗口：任务栏 XAML 可能刚被 shell 重建/卸载
+        std::vector<HWND> roots;
+        if (HWND hBridge = FindContentBridgeRecursive(hTray)) {
+            roots.push_back(hBridge);  // 任务栏隐藏时往往只有这棵树有内容
         }
-        root.Attach(rawRoot);
-        for (auto& el : UiaFindAll(uia, root, TreeScope_Descendants)) {
-            // 必须限定 Button：同名「显示隐藏的图标」还有一个 ToolTip 元素，
-            // 它的矩形是按钮上方的气泡，对它 Invoke 什么都不会发生。
-            if (UiaElementControlType(el) != UIA_ButtonControlTypeId) continue;
-            const std::wstring name = UiaElementName(el);
-            if (name.empty()) continue;
-            if (name.find(L"隐藏的图标") == std::wstring::npos &&
-                !ContainsCaseInsensitive(name, L"hidden icon")) {
+        roots.push_back(hTray);
+        for (HWND hRoot : roots) {
+            ComPtr<IUIAutomationElement> root;
+            IUIAutomationElement* rawRoot = nullptr;
+            if (FAILED(uia->ElementFromHandle(hRoot, &rawRoot)) || !rawRoot) {
                 continue;
             }
-            if (!InvokeTrayElement(el)) continue;
-            for (int i = 0; i < 30; ++i) {  // ≤1.5s：XAML island 首次装配较慢
-                Sleep(50);
-                if (FindWindowW(kOverflowXamlIslandCls, nullptr)) {
-                    Logf(L"托盘触发：溢出窗不存在，已点开「显示隐藏的图标」创建它");
-                    return true;
+            root.Attach(rawRoot);
+            for (auto& el : UiaFindAll(uia, root, TreeScope_Descendants)) {
+                // 必须限定 Button：同名「显示隐藏的图标」还有一个 ToolTip 元素，
+                // 它的矩形是按钮上方的气泡，对它 Invoke 什么都不会发生。
+                if (UiaElementControlType(el) != UIA_ButtonControlTypeId) {
+                    continue;
+                }
+                const std::wstring name = UiaElementName(el);
+                if (name.empty()) continue;
+                if (name.find(L"隐藏的图标") == std::wstring::npos &&
+                    !ContainsCaseInsensitive(name, L"hidden icon")) {
+                    continue;
+                }
+                // 1) UIA Invoke（TrayList 首选）；
+                // 2) 400ms 没反应再按 TrayList click.cpp 坐标点击兜底
+                //    （任务栏可见时才有意义；隐藏时坐标上是别的东西）。
+                InvokeTrayElement(el);
+                for (int i = 0; i < 8; ++i) {
+                    Sleep(50);
+                    if (OverflowFlyoutUsable(uia)) return true;
+                }
+                RECT rc{};
+                if (UiaElementBounds(el, rc)) {
+                    SendTrayClickAt((rc.left + rc.right) / 2,
+                                    (rc.top + rc.bottom) / 2);
+                    for (int i = 0; i < 20; ++i) {  // ≤1s
+                        Sleep(50);
+                        if (OverflowFlyoutUsable(uia)) return true;
+                    }
                 }
             }
         }
+        Sleep(150);
     }
-    Logf(L"托盘触发：溢出窗不存在，且点不开「显示隐藏的图标」（任务栏不可用？）");
     return false;
 }
 
-// 溢出区（隐藏托盘）：先尝试直接枚举，失败则临时显示溢出窗口后按名称点击。
+// 溢出弹窗（「隐藏的图标」）没有真正打开时把它打开。
+//
+// 这是「点 Dock 图标打不开托盘驻留应用」的现场之一：
+// 没被“提升”到可见区（NotifyIconSettings 里 IsPromoted 为空）的第三方托盘图标
+// 只存在于这个 XAML 浮出层里，而它的唯一入口就是任务栏上的「显示隐藏的图标」
+// 按钮。判定标准必须是「窗口可见 + 内容桥里有图标子项」（OverflowFlyoutUsable）：
+// TopLevelWindowForOverflowXamlIsland 是任务栏 XAML 浮出层的**共用宿主**
+// （音量/网络快捷设置也用它），窗口存在 ≠ 溢出列表开着 —— 原实现只看窗口是否存在，
+// 于是「什么都没点、日志也没有」地静默失败。
+bool EnsureOverflowIslandWindow(IUIAutomation* uia) {
+    if (!uia) return false;
+    if (OverflowFlyoutUsable(uia)) return true;
+
+    HWND hTray = FindWindowW(kShellTrayWndCls, nullptr);
+    if (!hTray) {
+        Logf(L"托盘触发：找不到 Shell_TrayWnd，无法打开溢出弹窗");
+        return false;
+    }
+
+    // 正常路径：任务栏保持隐藏（Invoke 对隐藏的任务栏同样有效）
+    if (TryOpenOverflowFlyout(uia, hTray)) {
+        Logf(L"托盘触发：溢出弹窗已打开");
+        return true;
+    }
+
+    // 兜底：任务栏 XAML 宿主可能已被 shell 卸载（隐藏状态下它的 UIA 子树会变空，
+    // 见 g_taskbarShowUntil 注释）。临时显示任务栏让它重新渲染，再试一次。
+    Logf(L"托盘触发：溢出弹窗未打开，临时显示任务栏重试");
+    BeginTrayTaskbarShow();
+    const bool ok = TryOpenOverflowFlyout(uia, hTray);
+    Logf(ok ? L"托盘触发：溢出弹窗已打开（临时显示任务栏）"
+            : L"托盘触发：溢出弹窗打不开（临时显示任务栏后仍无图标列表）");
+    if (!ok) EndTrayTaskbarShow();  // 失败也要还回「任务栏隐藏」
+    return ok;
+}
+
+// 溢出区（隐藏托盘）：先确保溢出弹窗真的开着，再按名称/进程匹配点击图标。
 bool ClickTrayInOverflow(IUIAutomation* uia, const std::wstring& nameHint,
                          const std::wstring& appKey,
                          const std::vector<DWORD>& pids) {
     if (!uia) return false;
-    EnsureOverflowIslandWindow(uia);  // shell 没建过就先建出来（否则下面整段跳过）
+    // 先记下弹窗原来是否可见：本轮是我们打开的，收尾要还原（旧实现把
+    // Ensure 之后的可见性当“原来就可见”，于是弹窗会留在屏幕上不关）
+    HWND hOuterBefore = FindWindowW(kOverflowXamlIslandCls, nullptr);
+    const bool wasVisibleBefore =
+        hOuterBefore && IsWindowVisible(hOuterBefore) != FALSE;
+    EnsureOverflowIslandWindow(uia);
     HWND hOuter = FindWindowW(kOverflowXamlIslandCls, nullptr);
     if (hOuter) {
-        HWND hInner = FindWindowExW(hOuter, nullptr,
-                                    kDesktopContentBridgeCls, nullptr);
-        bool wasVisible = IsWindowVisible(hOuter) != FALSE;
+        // 递归找内容桥：不同装配阶段内容桥可能嵌到 island 的下一层，只认直接
+        // 子窗口会让整段枚举静默落空
+        HWND hInner = FindContentBridgeRecursive(hOuter);
+        const bool wasVisible = IsWindowVisible(hOuter) != FALSE;
         if (!wasVisible) {
             ShowWindowAsync(hOuter, SW_SHOWNOACTIVATE);
             Sleep(400);  // TrayList click.cpp 同款：溢出 XAML 装配需要等待
@@ -4465,16 +4714,27 @@ bool ClickTrayInOverflow(IUIAutomation* uia, const std::wstring& nameHint,
             if (SUCCEEDED(uia->ElementFromHandle(hInner, &rawInner)) &&
                 rawInner) {
                 inner.Attach(rawInner);
+                // 先按直接子项枚举（TrayList 同款，图标就是桥的一级子项），
+                // 空则放宽到后代，避免中间多包一层时漏掉
                 auto children = UiaFindAll(uia, inner, TreeScope_Children);
+                if (children.empty()) {
+                    children = UiaFindAll(uia, inner, TreeScope_Descendants);
+                }
                 int idx = 0;
+                std::wstring roster;
                 for (auto& child : children) {
                     DockTrayIconInfo info;
                     if (!ExtractTrayIconInfo(uia, child, idx++, info)) continue;
+                    // 失败排查用清单（只在没命中时落盘一行，防刷屏）
+                    if (!roster.empty()) roster += L"; ";
+                    roster += info.DisplayName();
                     if (!TrayIconMatchesApp(info, nameHint, appKey, pids)) {
                         continue;
                     }
                     if (InvokeTrayElement(child)) {
-                        if (!wasVisible) ShowWindowAsync(hOuter, SW_HIDE);
+                        if (!wasVisibleBefore) {
+                            ShowWindowAsync(hOuter, SW_HIDE);
+                        }
                         return true;
                     }
                     if (info.hasValidBounds &&
@@ -4485,14 +4745,25 @@ bool ClickTrayInOverflow(IUIAutomation* uia, const std::wstring& nameHint,
                         const int cy =
                             (info.bounds.top + info.bounds.bottom) / 2;
                         if (SendTrayClickAt(cx, cy)) {
-                            if (!wasVisible) ShowWindowAsync(hOuter, SW_HIDE);
+                            if (!wasVisibleBefore) {
+                                ShowWindowAsync(hOuter, SW_HIDE);
+                            }
                             return true;
                         }
                     }
                 }
+                // 弹窗开着但没匹配到：把清单记下来（旧实现这里是静默 return，
+                // 排查「点了没反应、日志也没有」时完全瞎）
+                if (!roster.empty()) {
+                    Logf(L"托盘触发：溢出弹窗内未匹配到 %ls（共 %d 个：%ls）",
+                         nameHint.c_str(), idx, roster.c_str());
+                }
             }
+        } else {
+            Logf(L"托盘触发：溢出弹窗内找不到内容桥（结构变化？）");
         }
-        if (!wasVisible) ShowWindowAsync(hOuter, SW_HIDE);
+        // 本轮是我们打开的弹窗 → 收尾关掉；用户本来就开着就不动它
+        if (!wasVisibleBefore) ShowWindowAsync(hOuter, SW_HIDE);
     }
 
     // 传统 Win10 溢出窗口回退。
@@ -4671,8 +4942,8 @@ bool TrayElementNameMatches(const std::wstring& hint,
 }
 
 // 托盘图标触发（异步）：后台 STA 线程按 TrayList 方式枚举/触发 →
-// 完成后通知主线程（kMsgTriggerDone）。Dock 隐藏任务栏时 TrayList 仍能
-// 工作，因此不再临时显示任务栏，去掉任务栏闪烁与工作区来回切换。
+// 完成后通知主线程（kMsgTriggerDone）。溢出区图标必须先临时显示任务栏
+// （见 g_taskbarShowUntil 注释），本轮结束后立刻还回隐藏态。
 bool g_skipTrayTriggerOnce = false;  // 触发失败后的二次回退：直接评分强显
 
 void TrayIconTriggerAsync(AppState& s, const std::wstring& nameHint,
@@ -4695,7 +4966,8 @@ void TrayIconTriggerAsync(AppState& s, const std::wstring& nameHint,
                     ok = ClickTrayIconForApp(uia, nameHint, appKey, pids);
                     if (!ok) {
                         // XAML 托盘 UIA 树（尤其 explorer 重启后）有装配延迟，
-                        // 短暂重试；无需显示任务栏。
+                        // 短暂重试；任务栏的临时显示由 BeginTrayTaskbarShow
+                        // 幂等维持，这里不用管。
                         Sleep(200);
                     }
                 }
@@ -4703,6 +4975,9 @@ void TrayIconTriggerAsync(AppState& s, const std::wstring& nameHint,
             }
             if (SUCCEEDED(hr)) CoUninitialize();
         }
+        // 无论成败都要收尾：关掉溢出弹窗 + 重新隐藏任务栏
+        // （工作区由主线程 kMsgTriggerDone 里的 EnsureTaskbarHidden 自愈）
+        EndTrayTaskbarShow();
         Logf(ok ? L"托盘图标触发成功：%ls（等待应用自行恢复）"
                 : L"托盘图标触发失败：%ls",
              nameHint.c_str());
@@ -5008,11 +5283,14 @@ void CloseAllWindowsOf(DockItem& item) {
 }
 
 void TogglePinByKey(AppState& s, const DockItem& item) {
-    // 已固定：按解析 key 反查删除（兼容 lnk 固定来源）
+    // 已固定：按解析 key 反查删除（兼容 lnk 固定来源）。
+    // 名称合并条目 key 是运行 exe，要用 pinKey 反查固定项的启动器 key，
+    // 否则会把运行 exe 当成“未固定”再插一条，导致取消固定失败/重复固定。
+    const std::wstring want = PinLookupKeyFor(item);
     size_t removeAt = SIZE_MAX;
     for (size_t i = 0; i < s.pins.size(); ++i) {
         PinDescriptor d = DescribePin(s.pins[i]);
-        if (d.key == item.key) {
+        if (d.key == want) {
             removeAt = i;
             break;
         }
@@ -5124,14 +5402,22 @@ void ProcessDockDragMove(AppState& s) {
     SetFrameCadence(s, true);  // Dragging 期间帧驱动持续运行（见 FrameTick）
 }
 
+// 固定项反查 key：正常条目 key 就是固定项解析 key；「按名称并入运行组」的
+// 条目 key 是运行组 exe（dingtalk.exe），必须回落到 pinKey（启动器 key），
+// 否则它在 s.pins 里查无此键 —— 表现为图标能显示但拖不动 / 无法取消固定。
+std::wstring PinLookupKeyFor(const DockItem& item) {
+    return item.pinKey.empty() ? item.key : item.pinKey;
+}
+
 // 可见固定槽 → s.pins 下标映射：按行序（items 的前 pinCount 个）收集，
 // 保证 shown[k] = 行内第 k 个固定条目对应的 pins 下标。
-// （按名称并入运行组的条目 key 与 pin 不同，不会出现在映射中 —— 此类条目不可重排）
+// 名称合并后的条目按 pinKey 反查（见 PinLookupKeyFor），因此同样可重排。
 std::vector<size_t> ShownPinIndexList(AppState& s) {
     std::vector<size_t> out;
     for (size_t i = 0; i < s.pinCount && i < s.items.size(); ++i) {
+        const std::wstring want = PinLookupKeyFor(s.items[i]);
         for (size_t p = 0; p < s.pins.size(); ++p) {
-            if (DescribePin(s.pins[p]).key == s.items[i].key) {
+            if (DescribePin(s.pins[p]).key == want) {
                 out.push_back(p);
                 break;
             }
@@ -5193,9 +5479,16 @@ void ResetDockDrag(AppState& s) {
 // 同步重排 orderMap：RefreshItems 按 ordinal 稳定排序，固定区必须随新序走。
 void ApplyDockReorder(AppState& s) {
     if (s.dragKey.empty()) return;
+    // 被拖条目若是「名称并入运行组」的（key = 运行 exe），按 pinKey 反查固定项；
+    // 否则运行 key 在 s.pins 里找不到，拖拽会被当成边缘情况放弃（钉钉拖不动）。
+    std::wstring lookupKey = s.dragKey;
+    const size_t dragIdx = FindItemByKey(s, s.dragKey);
+    if (dragIdx != static_cast<size_t>(-1)) {
+        lookupKey = PinLookupKeyFor(s.items[dragIdx]);
+    }
     size_t src = static_cast<size_t>(-1);
     for (size_t p = 0; p < s.pins.size(); ++p) {
-        if (DescribePin(s.pins[p]).key == s.dragKey) {
+        if (DescribePin(s.pins[p]).key == lookupKey) {
             src = p;
             break;
         }
@@ -6235,10 +6528,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         // 托盘图标触发完成（worker 线程）：确保任务栏保持隐藏并收尾
-        // （TrayList 方案不临时显示任务栏，这里仅做兜底自愈）
+        // （溢出触发会临时显示过任务栏，这里清截止时刻并做兜底自愈）
         case kMsgTriggerDone: {
             const bool ok = wParam != 0;
-            s->taskbarShowUntil = 0;
+            g_taskbarShowUntil.store(0, std::memory_order_relaxed);
             EnsureTaskbarHidden(*s);  // 兜底：隐藏任务栏 + 工作区扩回全屏
             if (!ok) {
                 // 触发失败：回退评分强显（旧行为兜底，尽力而为）
@@ -6362,6 +6655,7 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
         SaveConfig(s);
     }
     LogInit();
+    if (DedupePins(s)) SaveConfig(s);  // 去重后立即持久化（收敛历史重复固定项）
     Logf(L"配置载入：固定 %zu 项，隐藏 %zu 项", s.pins.size(),
          s.hiddenKeys.size());
 
