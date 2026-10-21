@@ -50,7 +50,8 @@ $sources = @(
     'calendar_main.cpp', # calendar
     'launcher_main.cpp', # launcher
     'topbar_main.cpp',   # topbar
-    'dock_main.cpp'      # dock
+    'dock_main.cpp',     # dock
+    'app_suspend.cpp'    # inactive app process suspend/resume
 ) | ForEach-Object { (Join-Path $srcDir $_) }
 
 $defs = '/DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX'

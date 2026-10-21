@@ -249,6 +249,13 @@ constexpr UINT kDockStateQueryMsg = WM_APP + 15;
 // ← 宿主托盘菜单「保持顶栏」：请求立即按注册表重读开关并生效（顶栏层级、
 // 全屏让位）。wParam = 0 仅重读（以注册表为准）。与 mywigets_main.cpp 同值。
 constexpr UINT kKeepTopRefreshMsg = WM_APP + 18;
+// ← Dock：查询顶栏当前焦点窗口（返回 targetHwnd；0 = 当前无目标）。
+// Dock 的「未聚焦应用挂起」只认顶栏目标，必须能直接取到窗口句柄，
+// 再按 Dock 自己的 exe 分组口径映射成应用 key。与 dock_main.cpp 同值。
+constexpr UINT kDockTargetQueryMsg = WM_APP + 19;
+// → Dock：顶栏目标变化通知（lParam = 新目标 HWND，0 = 已清空）。
+// 收到后 Dock 立即恢复新目标、旧目标进入挂起宽限期。与 dock_main.cpp 同值。
+constexpr UINT kDockTargetChangedMsg = WM_APP + 20;
 // 「保持顶栏」模式下的全屏让位复核周期（ms）。全屏应用占用本屏时顶栏整体
 // 隐藏（用户要求：全屏游戏等场景顶栏不参与显示）；SHQueryUserNotificationState
 // 约 75µs，只在模式开启期间按 2s 复核，不进任何高频路径。
@@ -963,8 +970,19 @@ void PresentVolumePanel(AppState& s);
 void ShowVolumePanel(AppState& s);
 void HideVolumePanel(AppState& s);
 
+// 通知 Dock：顶栏焦点窗口变了。Dock 的未聚焦应用挂起以顶栏目标为准；
+// 没有这条消息，Dock 只能等 2s 保底，切换应用时会多冻结旧应用两秒。
+void NotifyDockTargetChanged(HWND target) {
+    HWND dock = FindWindowW(L"DesktopDockWindow", nullptr);
+    if (!dock || !IsWindow(dock)) return;
+    PostMessageW(dock, kDockTargetChangedMsg, 0,
+                 reinterpret_cast<LPARAM>(target));
+}
+
 // 把某个窗口设为当前目标并刷新最大化状态、音量会话与 Chrome 标签
 void ApplyTargetInfo(AppState& s, HWND hwnd) {
+    const bool hadTarget = s.hasTarget;
+    const HWND previous = s.targetHwnd;
     s.targetHwnd = hwnd;
     s.hasTarget = true;
     s.targetMaximized = IsZoomed(hwnd) != FALSE;
@@ -982,6 +1000,8 @@ void ApplyTargetInfo(AppState& s, HWND hwnd) {
     // 全系统订阅会把噪音灌进本线程消息队列），并立即重估让位层级
     RetargetLocationHook(hwnd);
     ApplyBarLayer(s, false);
+    // 同一窗口的高频重入（最大化/位置事件）不重复通知；真正切换才发。
+    if (!hadTarget || previous != hwnd) NotifyDockTargetChanged(hwnd);
 }
 
 // 轮询前台窗口，更新目标与 Chrome 标签。轮询而不是事件绑定，
@@ -1088,6 +1108,7 @@ void UpdateTarget(AppState& s) {
         if (targetAlive && fg && IsWindow(fg) && !IsTaskbarWindow(fg)) {
             return;
         }
+        const bool hadTarget = s.hasTarget || s.targetHwnd != nullptr;
         s.targetHwnd = nullptr;
         s.hasTarget = false;
         s.targetSticky = false;
@@ -1102,6 +1123,7 @@ void UpdateTarget(AppState& s) {
         // 没有聚焦目标 = 无需让位：退回覆盖态（置顶），并退订移动事件
         RetargetLocationHook(nullptr);
         ApplyBarLayer(s, false);
+        if (hadTarget) NotifyDockTargetChanged(nullptr);
     }
 }
 
@@ -4460,6 +4482,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     s->volumeTargetHwnd = nullptr;
                     ResolveVolumeSession(*s);
                 }
+                NotifyDockTargetChanged(nullptr);
             }
         }
         DrawBarAndPresent(*s);
@@ -4488,6 +4511,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         return IsSameApplication(probe, s->targetHwnd) ? 1 : 0;
+    }
+
+    // ← Dock 查询：顶栏当前焦点窗口。Dock 用它按自己的 exe 路径分组口径
+    // 映射应用 key（与上面只回 Yes/No 的焦点一致性查询是两件事）。
+    case kDockTargetQueryMsg: {
+        if (!s || !s->hasTarget || !s->targetHwnd ||
+            !IsWindow(s->targetHwnd)) {
+            return 0;
+        }
+        return reinterpret_cast<LRESULT>(s->targetHwnd);
     }
 
     case kDockStateMsg: {
@@ -4647,6 +4680,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         KillTimer(hwnd, kQuickSettingsAlignTimerId);
         ChromeSyncStop();  // 先停网络线程（会向本窗口发状态消息，需在窗口销毁前）
         UninstallVolumeHook();
+        if (s && (s->hasTarget || s->targetHwnd != nullptr)) {
+            NotifyDockTargetChanged(nullptr);
+        }
         if (s) {
             if (s->volumePanelHwnd) {
                 DestroyWindow(s->volumePanelHwnd);
