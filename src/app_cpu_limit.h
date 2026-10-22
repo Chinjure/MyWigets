@@ -53,8 +53,9 @@
 //     ControlMask |= EXECUTION_SPEED，StateMask |= EXECUTION_SPEED。
 //   - 记录启用前的 ControlMask/StateMask；恢复时原样写回，不把用户或系统
 //     本来设置好的效率模式误关掉。
-//   - 子进程不会继承 EcoQoS，所以 Dock 会周期性重新选中并补挂新出现的
-//     helper（见 EnforceLimited）。
+//   - 子进程不会继承 EcoQoS。本实现不做周期轮询：只对应用进入效率模式
+//     当时选中的进程生效；之后新开的 helper 需要等应用重新进入效率模式
+//     （重新聚焦后再最小化/收托盘）时由 LimitMany 重新选中。
 //   - 不使用 Job Object，不存在“崩溃后硬上限留在进程上”的问题。正常退出/
 //     组件重启会恢复全部；Dock 被强杀时应用最多停在低功耗效率模式，仍然
 //     可响应输入，下次启动/重新聚焦时会恢复。
@@ -192,13 +193,11 @@ public:
         const std::vector<LimitRequest>& requests,
         const std::vector<std::wstring>& allAppKeys = {});
 
-    // 给已经在效率模式中的应用补挂新出现的进程（主进程新开的 helper、
-    // 重启后的新实例等）。EcoQoS 不随进程创建继承，必须由 Dock 周期性
-    // 重新按“同 exe + 安装目录树”口径选中并 SetProcessInformation。
-    // 返回本次新启用效率模式的进程数；detail 仅在确有新增时填写。
-    size_t EnforceLimited(const std::vector<std::wstring>& appKeys,
-                          const std::vector<std::wstring>& allAppKeys,
-                          std::wstring* detail = nullptr);
+    // 注意：EcoQoS 不随进程创建继承。本实现不做轮询，只对进入效率模式
+    // 当时选中的进程生效；之后新开的 helper 需要等应用重新进入效率模式
+    //（重新聚焦后再最小化/收托盘）时由 LimitMany 重新选中。
+    // 如需“新 helper 出现即生效”且不轮询，可改用 Job Object 完成端口的
+    // JOB_OBJECT_MSG_NEW_PROCESS 事件（本项目暂不引入该线程）。
 
     // 退出该应用的效率模式。个别进程已退出视为成功；恢复失败会保留记录，
     // 等待下次重试。

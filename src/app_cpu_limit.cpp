@@ -579,14 +579,6 @@ struct CpuLimiter::Impl {
         return false;
     }
 
-    static bool ContainsTracked(const std::vector<TrackedProcess>& list,
-                                DWORD pid, ULONGLONG creation) {
-        for (const TrackedProcess& t : list) {
-            if (t.pid == pid && t.creation == creation) return true;
-        }
-        return false;
-    }
-
     // 对一个进程启用 EcoQoS。成功时 out 记录恢复所需的原始状态。
     bool ApplyProcess(DWORD pid, ULONGLONG creation, TrackedProcess* out,
                       size_t* reusedPids, size_t* deniedPids,
@@ -814,60 +806,6 @@ struct CpuLimiter::Impl {
         return results;
     }
 
-    size_t EnforceLimited(const std::vector<std::wstring>& appKeys,
-                          const std::vector<std::wstring>& allAppKeys,
-                          std::wstring* detail) {
-        if (!initialized) return 0;
-        std::vector<std::wstring> keys;
-        keys.reserve(appKeys.size());
-        for (const std::wstring& k : appKeys) {
-            const std::wstring normalized = NormalizePath(k);
-            auto it = apps.find(normalized);
-            if (it != apps.end() && it->second.ecoOn) {
-                keys.push_back(normalized);
-            }
-        }
-        if (keys.empty()) return 0;
-
-        std::unordered_set<std::wstring> foreignAppKeys;
-        for (const std::wstring& k : allAppKeys) {
-            const std::wstring normalized = NormalizePath(k);
-            if (!normalized.empty()) foreignAppKeys.insert(normalized);
-        }
-
-        const std::vector<ProcessEntry> snapshot = SnapshotProcesses();
-        if (snapshot.empty()) return 0;
-
-        size_t totalAdded = 0;
-        for (const std::wstring& key : keys) {
-            auto entryIt = apps.find(key);
-            if (entryIt == apps.end() || !entryIt->second.ecoOn) continue;
-            const Selection sel = SelectAppProcesses(key, snapshot,
-                                                    &foreignAppKeys);
-            for (const ProcessRef& ref : sel.processes) {
-                if (ContainsTracked(entryIt->second.processes, ref.pid,
-                                    ref.creationTime)) {
-                    continue;
-                }
-                size_t denied = 0;
-                size_t reused = 0;
-                bool critical = false;
-                TrackedProcess t;
-                if (ApplyProcess(ref.pid, ref.creationTime, &t, &reused,
-                                 &denied, &critical)) {
-                    entryIt->second.processes.push_back(t);
-                    ++totalAdded;
-                }
-                if (critical) break;
-            }
-        }
-        if (totalAdded > 0 && detail) {
-            *detail = L"已对 " + std::to_wstring(totalAdded) +
-                      L" 个新进程启用效率模式";
-        }
-        return totalAdded;
-    }
-
     bool Restore(const std::wstring& appKey, std::wstring* detail) {
         const std::wstring key = NormalizePath(appKey);
         auto it = apps.find(key);
@@ -1054,12 +992,6 @@ std::vector<LimitResult> CpuLimiter::LimitMany(
     const std::vector<LimitRequest>& requests,
     const std::vector<std::wstring>& allAppKeys) {
     return impl_->LimitMany(requests, allAppKeys);
-}
-
-size_t CpuLimiter::EnforceLimited(
-    const std::vector<std::wstring>& appKeys,
-    const std::vector<std::wstring>& allAppKeys, std::wstring* detail) {
-    return impl_->EnforceLimited(appKeys, allAppKeys, detail);
 }
 
 bool CpuLimiter::Restore(const std::wstring& appKey, std::wstring* detail) {

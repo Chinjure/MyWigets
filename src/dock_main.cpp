@@ -169,9 +169,6 @@ constexpr UINT kCollapseWatchMs = 2000;        // 监视周期（2s，只记录�
 // 顶栏目标短暂清空都可能产生一闪而过的“未聚焦”，立即切换会打断后台任务。
 constexpr ULONGLONG kLimitGraceMs = 1200;
 constexpr ULONGLONG kLimitLogRepeatMs = 30000;  // 同一应用失败日志限频
-// 效率模式应对新开的 helper（或重启）补启用：EcoQoS 不随进程创建继承。
-// 每 5s 做一次补挂，兼顾及时性与全进程枚举开销。
-constexpr ULONGLONG kLimitEnforceMs = 5000;
 
 // 事件驱动消息（WinEvent 回调/注册表监听线程 → 主窗口）
 constexpr UINT kMsgRefresh = WM_APP + 1;   // 窗口集合/托盘状态可能变化，合并刷新
@@ -388,7 +385,6 @@ struct AppState {
     std::unordered_set<std::wstring> cpuLimitExceptions;
     std::unordered_map<std::wstring, ULONGLONG> limitSince;  // 未聚焦起点
     std::unordered_map<std::wstring, ULONGLONG> limitLogAt;  // 失败日志限频
-    ULONGLONG lastCpuLimitEnforce = 0;  // 上次补启用效率模式新进程的时刻
     bool hideRequested = false;   // 收起目标态（光标离开 Dock / 触碰下缘触发条）
     float collapseOffset = 0;     // 当前收起偏移（0=展开，winH=完全滑出屏幕底）
     std::atomic<bool> menuOpen{false};  // 右键菜单打开期间不收起（低层钩子线程也会读取）
@@ -4119,23 +4115,6 @@ void ReconcileAppCpuLimit(AppState& s, HWND focusHint = nullptr,
                     LogLimitResultThrottled(
                         s, key, L"[效率] 跳过 %ls：%ls", name, r.detail);
                     break;
-            }
-        }
-    }
-
-    // 效率模式中的应用可能新开 helper 或重启。EcoQoS 不随进程创建继承，
-    // 必须周期性按同一口径重新选中并补启用。
-    if (g_cpuLimiter.TrackedProcessCount() > 0 &&
-        (s.lastCpuLimitEnforce == 0 ||
-         now - s.lastCpuLimitEnforce >= kLimitEnforceMs)) {
-        s.lastCpuLimitEnforce = now;
-        const std::vector<std::wstring> limited = g_cpuLimiter.LimitedKeys();
-        if (!limited.empty()) {
-            std::wstring enforceDetail;
-            const size_t added = g_cpuLimiter.EnforceLimited(
-                limited, allAppKeys, &enforceDetail);
-            if (added > 0) {
-                Logf(L"[效率] %ls", enforceDetail.c_str());
             }
         }
     }
