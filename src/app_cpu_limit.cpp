@@ -1,13 +1,17 @@
-// app_suspend.cpp - 见 app_suspend.h 的口径说明
+// app_cpu_limit.cpp - 见 app_cpu_limit.h 的口径说明
 //
-// 这里只做三件事：
+// 这里做四件事：
 //   1. 从全量进程快照中按「同一 exe + 安装目录树内的后代」选出应用进程；
-//   2. 通过 ntdll!NtSuspendProcess / NtResumeProcess 整进程挂起/恢复；
-//   3. 用 PID + 创建时间双保险，并把挂起表持久化，供异常退出后恢复。
+//   2. 为每个应用维护一个 Job Object，用 CPU rate control 的 hard cap
+//      把它的 CPU 占用限制到 0.01%；
+//   3. 用 SILENT_BREAKAWAY_OK 防止应用拉起的外部程序继承限速 Job，
+//      并周期性把新出现的同应用辅助进程补进 Job；
+//   4. 用 PID + 创建时间双保险，恢复时只关闭 rate control、不带着 hard cap
+//      关闭 Job 句柄。
 //
 // 不按进程树整棵挂起、不按 exe 名字合并、不碰系统基础设施，原因见头文件。
 
-#include "app_suspend.h"
+#include "app_cpu_limit.h"
 
 #include <tlhelp32.h>
 
@@ -20,21 +24,24 @@
 #include <unordered_set>
 #include <utility>
 
-namespace appsuspend {
+namespace appcpu {
 namespace {
 
 constexpr wchar_t kRegPath[] = L"Software\\DesktopSuite\\Dock";
-constexpr DWORD kPersistMagic = 0x50555353;  // "SSUP"
-constexpr DWORD kPersistVersion = 1;
-constexpr DWORD kPersistHeaderBytes = sizeof(DWORD) * 3;
 
-// 刚启动的进程先不挂起：Chrome/Electron/UWP 启动阶段会连续创建子进程，
-// 太早冻住会把「正在打开的应用」永久卡在启动中。
+// 旧版「挂起未聚焦应用」持久化值的格式（只用于升级时恢复残留进程）。
+constexpr wchar_t kLegacyStateValue[] = L"SuspendedState";
+constexpr DWORD kLegacyMagic = 0x50555353;  // "SSUP"
+constexpr DWORD kLegacyVersion = 1;
+constexpr DWORD kLegacyHeaderBytes = sizeof(DWORD) * 3;
+
+// 刚启动的进程先不限速：Chrome/Electron/UWP 启动阶段会连续创建子进程，
+// 太早压到 0.01% 会把「正在打开的应用」卡在启动中。
 constexpr ULONGLONG kMinProcessAgeDefaultMs = 8000;
 
 // 硬件断点/调试器挂起等场景不属于这里；只列常见的系统基础设施。
-// 基名均小写。应用自己的主 exe 若命中这里，Dock 侧也不会把它当可挂起项。
-const wchar_t* const kNeverSuspendBasenames[] = {
+// 基名均小写。应用自己的主 exe 若命中这里，Dock 侧也不会把它当可限速项。
+const wchar_t* const kNeverLimitBasenames[] = {
     L"system", L"smss.exe", L"csrss.exe", L"wininit.exe", L"winlogon.exe",
     L"services.exe", L"lsass.exe", L"svchost.exe", L"dwm.exe",
     L"fontdrvhost.exe", L"explorer.exe", L"sihost.exe", L"ctfmon.exe",
@@ -55,10 +62,25 @@ const wchar_t* const kNeverSuspendBasenames[] = {
     L"desktoplauncher-x64.exe", L"desktoplauncher-x86.exe",
 };
 
-std::wstring ToLower(std::wstring s) {
-    for (auto& ch : s) ch = static_cast<wchar_t>(towlower(ch));
-    return s;
-}
+// ---- Job Object CPU rate control ----
+// _WIN32_WINNT 可能仍按 0x0601 编译，SDK 不一定导出 Windows 8 的新枚举名，
+// 这里用 ABI 值：JobObjectCpuRateControlInformation = 15。
+constexpr JOBOBJECTINFOCLASS kJobCpuRateControlInformation =
+    static_cast<JOBOBJECTINFOCLASS>(15);
+constexpr DWORD kCpuRateControlEnable = 0x1;
+constexpr DWORD kCpuRateControlHardCap = 0x4;
+// CpuRate 单位是 1/10000（万分之一）。1 = 0.01%。
+constexpr DWORD kCpuRateOneHundredthPercent = 1;
+
+// 与 JOBOBJECT_CPU_RATE_CONTROL_INFORMATION 同布局；不直接使用 SDK 类型，
+// 避免旧 _WIN32_WINNT 下结构体/枚举缺失。
+struct JobCpuRateInfo {
+    DWORD ControlFlags;
+    union {
+        DWORD CpuRate;
+        DWORD Weight;
+    };
+};
 
 std::wstring TrimTrailingSlash(std::wstring path) {
     while (path.size() > 3 && path.back() == L'\\') path.pop_back();
@@ -81,8 +103,8 @@ ULONGLONG FileTimeToU64(const FILETIME& ft) {
            static_cast<ULONGLONG>(ft.dwLowDateTime);
 }
 
-bool IsNeverSuspendBase(const std::wstring& baseLower) {
-    for (const wchar_t* name : kNeverSuspendBasenames) {
+bool IsNeverLimitBase(const std::wstring& baseLower) {
+    for (const wchar_t* name : kNeverLimitBasenames) {
         if (baseLower == name) return true;
     }
     return false;
@@ -166,35 +188,12 @@ std::vector<std::wstring> BroadRoots() {
     return roots;
 }
 
-struct ProcKey {
-    DWORD pid = 0;
-    ULONGLONG creation = 0;
-
-    bool operator==(const ProcKey& other) const {
-        return pid == other.pid && creation == other.creation;
-    }
-};
-
-struct ProcKeyHash {
-    size_t operator()(const ProcKey& k) const noexcept {
-        const size_t a = std::hash<DWORD>{}(k.pid);
-        const size_t b = std::hash<ULONGLONG>{}(k.creation);
-        return a ^ (b + 0x9e3779b97f4a7c15ull + (a << 6) + (a >> 2));
-    }
-};
-
 struct TrackedProcess {
     DWORD pid = 0;
     ULONGLONG creation = 0;
 };
 
-struct PersistRecord {
-    DWORD pid = 0;
-    ULONGLONG creation = 0;
-    std::wstring appKey;
-};
-
-using NtProcessControlFn = LONG(NTAPI*)(HANDLE);
+using NtResumeProcessFn = LONG(NTAPI*)(HANDLE);
 
 bool NtSuccess(LONG status) { return status >= 0; }
 
@@ -259,6 +258,41 @@ bool IsProcessCritical(HANDLE proc) {
     BOOL critical = FALSE;
     if (!fn(proc, &critical)) return false;
     return critical != FALSE;
+}
+
+// 打开/关闭 Job 的 CPU rate control。enable=false 时 ControlFlags=0，
+// 解除硬上限；这是唯一安全的“还进程自由”的方式。
+bool ApplyCpuRate(HANDLE job, bool enable) {
+    JobCpuRateInfo info{};
+    if (enable) {
+        info.ControlFlags = kCpuRateControlEnable | kCpuRateControlHardCap;
+        info.CpuRate = kCpuRateOneHundredthPercent;
+    }
+    return SetInformationJobObject(
+               job, kJobCpuRateControlInformation, &info, sizeof(info)) != FALSE;
+}
+
+// 让 Job 里的进程创建子进程时不自动继承 Job：否则应用拉起的浏览器/
+// 终端/安装器会被一起压到 0.01%。代价是新出现的同应用 helper 需要由
+// Dock 周期性重新选中并 Assign（见 EnforceLimited）。
+bool EnableSilentBreakaway(HANDLE job) {
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION ext{};
+    ext.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+    return SetInformationJobObject(
+               job, JobObjectExtendedLimitInformation, &ext, sizeof(ext)) !=
+           FALSE;
+}
+
+bool IsCpuRateControlSupported() {
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (!job) return false;
+    // 先在空 Job 上真正打开一次 hard cap，再关闭：部分系统对“从未启用过
+    // CPU rate control 的 Job 直接 ControlFlags=0”会返回 INVALID_ARGS，
+    // 用它探测支持性会误判为不可用。
+    const bool supported = ApplyCpuRate(job, true);
+    if (supported) ApplyCpuRate(job, false);
+    CloseHandle(job);
+    return supported;
 }
 
 }  // namespace
@@ -329,14 +363,14 @@ std::wstring InstallRootForApp(const std::wstring& appKey, bool* broadRoot) {
     return dir;
 }
 
-bool IsNeverSuspendImage(const std::wstring& imagePath) {
-    return IsNeverSuspendBase(BaseNameOf(NormalizePath(imagePath)));
+bool IsNeverLimitImage(const std::wstring& imagePath) {
+    return IsNeverLimitBase(BaseNameOf(NormalizePath(imagePath)));
 }
 
-bool ShouldPauseApp(bool opened, bool hasVisibleWindow, bool userExcluded) {
-    // 没打开（进程已退出）没有可暂停对象；只要还有一张可见且未最小化的
-    // 窗口就保持运行；窗口全部最小化或纯托盘驻留时可以暂停。用户显式
-    // 勾选「不暂停此应用」时永久豁免，即使之后收起窗口变成托盘应用。
+bool ShouldLimitApp(bool opened, bool hasVisibleWindow, bool userExcluded) {
+    // 没打开（进程已退出）没有可限速对象；只要还有一张可见且未最小化的
+    // 窗口就保持运行；窗口全部最小化或纯托盘驻留时可以限速。用户显式
+    // 勾选「不限制此应用」时永久豁免，即使之后收起窗口变成托盘应用。
     return opened && !hasVisibleWindow && !userExcluded;
 }
 
@@ -380,7 +414,7 @@ std::vector<ProcessEntry> SnapshotProcesses() {
 
             const std::wstring normalized = NormalizePath(image);
             if (normalized.empty()) continue;
-            if (IsNeverSuspendImage(normalized)) continue;
+            if (IsNeverLimitImage(normalized)) continue;
 
             ProcessEntry entry;
             entry.pid = pid;
@@ -417,7 +451,7 @@ Selection SelectAppProcesses(
     for (size_t i = 0; i < snapshot.size(); ++i) {
         const ProcessEntry& e = snapshot[i];
         if (e.imagePath != key) continue;
-        if (IsNeverSuspendImage(e.imagePath)) continue;
+        if (IsNeverLimitImage(e.imagePath)) continue;
         selected[i] = true;
         pending.push(i);
         ++sel.exactMatches;
@@ -437,7 +471,7 @@ Selection SelectAppProcesses(
         for (size_t childIndex : it->second) {
             if (selected[childIndex]) continue;
             const ProcessEntry& child = snapshot[childIndex];
-            if (IsNeverSuspendImage(child.imagePath)) continue;
+            if (IsNeverLimitImage(child.imagePath)) continue;
             // 子进程本身就是 Dock 的另一个应用（Office 同目录的 Excel 等）：
             // 它是被拉起的独立应用，不是本应用的辅助进程。
             if (foreignAppKeys && child.imagePath != key &&
@@ -467,6 +501,7 @@ Selection SelectAppProcesses(
         ProcessRef ref;
         ref.pid = snapshot[i].pid;
         ref.creationTime = snapshot[i].creationTime;
+        ref.exactMatch = snapshot[i].imagePath == key;
         sel.processes.push_back(ref);
     }
     std::sort(sel.processes.begin(), sel.processes.end(),
@@ -480,85 +515,138 @@ Selection SelectAppProcesses(
     return sel;
 }
 
-struct Suspender::Impl {
-    bool persist = true;
+struct CpuLimiter::Impl {
     ULONGLONG minProcessAgeMs = kMinProcessAgeDefaultMs;
-    std::wstring stateValueName = L"SuspendedState";
     bool initialized = false;
-    NtProcessControlFn suspendFn = nullptr;
-    NtProcessControlFn resumeFn = nullptr;
+    NtResumeProcessFn resumeFn = nullptr;
 
-    std::unordered_map<std::wstring, std::vector<TrackedProcess>> apps;
-    std::unordered_map<ProcKey, std::wstring, ProcKeyHash> owner;
+    struct AppEntry {
+        HANDLE job = nullptr;
+        bool capOn = false;
+        std::vector<TrackedProcess> processes;
+    };
+    std::unordered_map<std::wstring, AppEntry> apps;
 
-    Impl(bool persistState, ULONGLONG minAge, std::wstring valueName)
-        : persist(persistState),
-          minProcessAgeMs(minAge),
-          stateValueName(std::move(valueName)) {}
+    explicit Impl(ULONGLONG minAge) : minProcessAgeMs(minAge) {}
+
+    ~Impl() { Shutdown(); }
 
     bool Initialize() {
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-        if (!ntdll) return false;
-        suspendFn = reinterpret_cast<NtProcessControlFn>(
-            GetProcAddress(ntdll, "NtSuspendProcess"));
-        resumeFn = reinterpret_cast<NtProcessControlFn>(
-            GetProcAddress(ntdll, "NtResumeProcess"));
-        initialized = suspendFn != nullptr && resumeFn != nullptr;
+        if (ntdll) {
+            resumeFn = reinterpret_cast<NtResumeProcessFn>(
+                GetProcAddress(ntdll, "NtResumeProcess"));
+        }
+        initialized = IsCpuRateControlSupported();
         return initialized;
     }
 
-    std::vector<SuspendResult> SuspendMany(
-        const std::vector<SuspendRequest>& requests,
+    static void AddTracked(std::vector<TrackedProcess>* list,
+                           const ProcessRef& ref) {
+        for (const TrackedProcess& t : *list) {
+            if (t.pid == ref.pid && t.creation == ref.creationTime) return;
+        }
+        list->push_back(TrackedProcess{ref.pid, ref.creationTime});
+    }
+
+    static bool AnyTrackedAlive(const std::vector<TrackedProcess>& list) {
+        for (const TrackedProcess& t : list) {
+            if (TrackedAlive(t)) return true;
+        }
+        return false;
+    }
+
+    // 创建一个新 Job：CPU hard cap + silent breakaway。先不打开 cap，
+    // 等进程都 Assign 完再打开，避免把 Assign 过程本身压到极慢。
+    HANDLE CreateAppJob() {
+        HANDLE job = CreateJobObjectW(nullptr, nullptr);
+        if (!job) return nullptr;
+        if (!EnableSilentBreakaway(job)) {
+            CloseHandle(job);
+            return nullptr;
+        }
+        return job;
+    }
+
+    // 把一个进程放进 Job。调用方负责 CloseHandle(proc)。
+    // 返回 0=失败，1=新加入，2=本来就在 Job 里。
+    int AssignVerifiedProcess(HANDLE job, const ProcessRef& ref,
+                              size_t* reusedPids, size_t* deniedPids,
+                              bool* critical) {
+        DWORD err = ERROR_SUCCESS;
+        HANDLE proc = OpenVerified(
+            ref.pid, ref.creationTime,
+            PROCESS_SET_QUOTA | PROCESS_TERMINATE |
+                PROCESS_QUERY_LIMITED_INFORMATION,
+            &err);
+        if (!proc) {
+            if (err == ERROR_NOT_FOUND || err == ERROR_INVALID_PARAMETER) {
+                if (reusedPids) ++*reusedPids;
+            } else if (deniedPids) {
+                ++*deniedPids;
+            }
+            return 0;
+        }
+        if (IsProcessCritical(proc)) {
+            if (critical) *critical = true;
+            CloseHandle(proc);
+            return 0;
+        }
+        BOOL inJob = FALSE;
+        if (IsProcessInJob(proc, job, &inJob) && inJob) {
+            CloseHandle(proc);
+            return 2;
+        }
+        const BOOL ok = AssignProcessToJobObject(job, proc);
+        CloseHandle(proc);
+        if (!ok) {
+            if (deniedPids) ++*deniedPids;
+            return 0;
+        }
+        return 1;
+    }
+
+    std::vector<LimitResult> LimitMany(
+        const std::vector<LimitRequest>& requests,
         const std::vector<std::wstring>& allAppKeys) {
-        std::vector<SuspendResult> results(requests.size());
+        std::vector<LimitResult> results(requests.size());
         if (!initialized) {
             for (auto& r : results) {
-                r.code = SuspendCode::Failed;
-                r.detail = L"NtSuspendProcess 不可用";
+                r.code = LimitCode::Failed;
+                r.detail = L"Job Object CPU 限速不可用";
             }
             return results;
         }
 
-        bool stateChanged = false;
         std::vector<size_t> todo;
         todo.reserve(requests.size());
         for (size_t i = 0; i < requests.size(); ++i) {
             const std::wstring key = NormalizePath(requests[i].appKey);
             if (key.empty()) {
-                results[i].code = SuspendCode::Failed;
+                results[i].code = LimitCode::Failed;
                 results[i].detail = L"空应用 key";
                 continue;
             }
-            auto existing = apps.find(key);
-            if (existing != apps.end()) {
-                // 应用可能在挂起期间被用户从任务管理器结束、或自行退出后
-                // 又以同一 exe 重新启动。清掉已死的跟踪项；否则新实例
-                // 会被误判为 AlreadySuspended，永远不会再被挂起。
-                std::vector<TrackedProcess> alive;
-                for (const TrackedProcess& t : existing->second) {
-                    if (TrackedAlive(t)) {
-                        alive.push_back(t);
-                    } else {
-                        owner.erase(ProcKey{t.pid, t.creation});
-                    }
-                }
-                if (!alive.empty()) {
-                    if (alive.size() != existing->second.size()) {
-                        existing->second = std::move(alive);
-                        stateChanged = true;
-                    }
-                    results[i].code = SuspendCode::AlreadySuspended;
+            auto it = apps.find(key);
+            if (it != apps.end() && it->second.capOn) {
+                if (AnyTrackedAlive(it->second.processes)) {
+                    results[i].code = LimitCode::AlreadyLimited;
                     continue;
                 }
-                apps.erase(existing);
-                stateChanged = true;
+                // 跟踪的进程都退出了：先解除旧 cap（不能带着 cap 关句柄），
+                // 保留 Job 供本轮/下次复用。
+                if (it->second.job &&
+                    !ApplyCpuRate(it->second.job, false)) {
+                    results[i].code = LimitCode::Failed;
+                    results[i].detail = L"解除旧 CPU 限制失败";
+                    continue;
+                }
+                it->second.capOn = false;
+                it->second.processes.clear();
             }
             todo.push_back(i);
         }
-        if (todo.empty()) {
-            if (stateChanged) Persist();
-            return results;
-        }
+        if (todo.empty()) return results;
 
         std::unordered_set<std::wstring> foreignAppKeys;
         for (const std::wstring& k : allAppKeys) {
@@ -569,10 +657,9 @@ struct Suspender::Impl {
         const std::vector<ProcessEntry> snapshot = SnapshotProcesses();
         if (snapshot.empty()) {
             for (size_t i : todo) {
-                results[i].code = SuspendCode::NoProcesses;
+                results[i].code = LimitCode::NoProcesses;
                 results[i].detail = L"进程快照为空";
             }
-            if (stateChanged) Persist();
             return results;
         }
 
@@ -582,7 +669,7 @@ struct Suspender::Impl {
         const ULONGLONG minAge100ns = minProcessAgeMs * 10000ull;
 
         for (size_t requestIndex : todo) {
-            SuspendResult& result = results[requestIndex];
+            LimitResult& result = results[requestIndex];
             const std::wstring key = NormalizePath(requests[requestIndex].appKey);
             const Selection sel = SelectAppProcesses(key, snapshot,
                                                     &foreignAppKeys);
@@ -590,12 +677,12 @@ struct Suspender::Impl {
             result.detail = sel.note;
 
             if (sel.processes.empty()) {
-                result.code = SuspendCode::NoProcesses;
+                result.code = LimitCode::NoProcesses;
                 continue;
             }
 
-            // 最小年龄保护：只要有一个成员刚启动，就整组延后，避免
-            // 主进程被冻住、辅助进程还没初始化完的半启动状态。
+            // 最小年龄保护：只要有一个成员刚启动，就整组延后，避免把
+            // 正在初始化的应用压到 0.01%。
             ULONGLONG maxRetry100ns = 0;
             bool tooYoung = false;
             for (const ProcessRef& ref : sel.processes) {
@@ -610,299 +697,233 @@ struct Suspender::Impl {
                 }
             }
             if (tooYoung) {
-                result.code = SuspendCode::TooYoung;
+                result.code = LimitCode::TooYoung;
                 const ULONGLONG retryMs = (maxRetry100ns + 9999) / 10000;
                 result.retryAfterMs =
                     static_cast<DWORD>(std::min<ULONGLONG>(retryMs + 100,
                                                           60000));
-                result.detail += L"；进程刚启动，延后挂起";
+                result.detail += L"；进程刚启动，延后限速";
                 continue;
             }
 
-            // 两阶段：先把整组进程都打开并核对，再统一挂起。
-            // 任意一个成员无权限/受保护就整组放弃 —— 只冻住一半（例如主
-            // 进程还在、渲染 helper 被冻）比不冻更容易把应用挂死。
-            std::vector<TrackedProcess> candidates;
-            std::vector<HANDLE> handles;
-            size_t accessDenied = 0;
-            size_t critical = 0;
-            size_t reused = 0;
-            size_t ownedByOther = 0;
-            bool aborted = false;
-
-            for (const ProcessRef& ref : sel.processes) {
-                if (ref.creationTime == 0) {
-                    ++accessDenied;
-                    aborted = true;
-                    break;
-                }
-                const ProcKey pk{ref.pid, ref.creationTime};
-                auto own = owner.find(pk);
-                if (own != owner.end()) {
-                    if (own->second != key) ++ownedByOther;
+            auto entryIt = apps.find(key);
+            if (entryIt == apps.end()) {
+                AppEntry fresh;
+                fresh.job = CreateAppJob();
+                if (!fresh.job) {
+                    result.code = LimitCode::Failed;
+                    result.detail += L"；创建限速 Job 失败";
                     continue;
                 }
+                entryIt = apps.emplace(key, std::move(fresh)).first;
+            } else if (!entryIt->second.job) {
+                entryIt->second.job = CreateAppJob();
+                if (!entryIt->second.job) {
+                    result.code = LimitCode::Failed;
+                    result.detail += L"；创建限速 Job 失败";
+                    continue;
+                }
+            }
+            AppEntry& entry = entryIt->second;
 
-                DWORD err = ERROR_SUCCESS;
-                HANDLE proc = OpenVerified(
-                    ref.pid, ref.creationTime,
-                    PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION,
-                    &err);
-                if (!proc) {
-                    if (err == ERROR_NOT_FOUND ||
-                        err == ERROR_INVALID_PARAMETER) {
-                        ++reused;  // 刚好退出/PID 已被复用：跳过即可
-                        continue;
-                    }
-                    ++accessDenied;
-                    aborted = true;
-                    break;
+            std::vector<TrackedProcess> tracked;
+            size_t added = 0;
+            size_t already = 0;
+            size_t reused = 0;
+            size_t denied = 0;
+            size_t exactLimited = 0;
+            bool critical = false;
+            for (const ProcessRef& ref : sel.processes) {
+                const int status = AssignVerifiedProcess(
+                    entry.job, ref, &reused, &denied, &critical);
+                if (critical) break;
+                if (status == 1) ++added;
+                if (status == 2) ++already;
+                if (status != 0) {
+                    tracked.push_back(TrackedProcess{ref.pid, ref.creationTime});
+                    if (ref.exactMatch) ++exactLimited;
                 }
-                if (IsProcessCritical(proc)) {
-                    ++critical;
-                    CloseHandle(proc);
-                    aborted = true;
-                    break;
-                }
-                candidates.push_back(
-                    TrackedProcess{ref.pid, ref.creationTime});
-                handles.push_back(proc);
             }
 
-            if (aborted) {
-                for (HANDLE h : handles) CloseHandle(h);
-                result.code = SuspendCode::AccessDenied;
+            if (critical) {
+                result.code = LimitCode::AccessDenied;
+                result.limited = 0;
                 result.skipped = sel.processes.size();
-                result.detail += L"；为保证整组一致，放弃本次挂起";
-                if (accessDenied > 0) {
-                    result.detail += L"（无权限/无法核对 " +
-                                     std::to_wstring(accessDenied) + L"）";
+                result.detail += L"；含受保护关键进程，放弃本组限速";
+                if (entry.job) {
+                    ApplyCpuRate(entry.job, false);
+                    CloseHandle(entry.job);
                 }
-                if (critical > 0) {
-                    result.detail += L"（受保护关键进程 " +
-                                     std::to_wstring(critical) + L"）";
-                }
+                apps.erase(key);
                 continue;
             }
 
-            if (handles.empty()) {
-                result.code = SuspendCode::NoProcesses;
-                result.detail += L"；进程均已退出";
-                if (reused > 0) {
-                    result.detail += L"（" + std::to_wstring(reused) +
-                                     L" 个已退出/PID 复用）";
-                }
-                if (ownedByOther > 0) {
-                    result.detail += L"（" + std::to_wstring(ownedByOther) +
-                                     L" 个已由其他应用挂起）";
-                }
-                continue;
-            }
-
-            size_t suspended = 0;
-            bool suspendFailed = false;
-            for (size_t i = 0; i < handles.size(); ++i) {
-                if (!NtSuccess(suspendFn(handles[i]))) {
-                    suspendFailed = true;
-                    break;
-                }
-                ++suspended;
-            }
-            if (suspendFailed) {
-                // 回滚已成功挂起的那部分，避免应用处于半冻结状态。
-                // 若回滚本身也失败，必须把失败项留在跟踪表里，退出时
-                // ResumeAll 还能再试，绝不能让进程无声地停在挂起态。
-                std::vector<TrackedProcess> stuck;
-                for (size_t i = 0; i < handles.size(); ++i) {
-                    if (!NtSuccess(resumeFn(handles[i]))) {
-                        stuck.push_back(candidates[i]);
-                    }
-                }
-                for (HANDLE h : handles) CloseHandle(h);
-                result.code = SuspendCode::Failed;
+            // 主进程一个都没进来：只限制 helper 会形成“主进程全速、子进程
+            // 饿死”的半吊子状态，整组放弃，等下一轮重试。
+            if (exactLimited == 0) {
+                result.code = denied > 0 ? LimitCode::AccessDenied
+                                         : LimitCode::NoProcesses;
                 result.skipped = sel.processes.size();
-                result.detail += L"；挂起中途失败";
-                if (!stuck.empty()) {
-                    for (const TrackedProcess& t : stuck) {
-                        owner[ProcKey{t.pid, t.creation}] = key;
-                    }
-                    apps[key] = std::move(stuck);
-                    stateChanged = true;
-                    result.detail += L"，回滚失败已保留跟踪";
-                } else {
-                    result.detail += L"，已回滚整组";
+                result.detail += denied > 0
+                                     ? L"；主进程无权限加入 CPU 限制"
+                                     : L"；主进程已退出";
+                if (entry.job) {
+                    ApplyCpuRate(entry.job, false);
+                    CloseHandle(entry.job);
                 }
+                apps.erase(key);
                 continue;
             }
 
-            for (HANDLE h : handles) CloseHandle(h);
-            for (const TrackedProcess& t : candidates) {
-                owner[ProcKey{t.pid, t.creation}] = key;
+            if (!ApplyCpuRate(entry.job, true)) {
+                result.code = LimitCode::Failed;
+                result.skipped = sel.processes.size();
+                result.detail += L"；设置 CPU 硬限制失败";
+                ApplyCpuRate(entry.job, false);
+                CloseHandle(entry.job);
+                apps.erase(key);
+                continue;
             }
-            apps[key] = std::move(candidates);
-            stateChanged = true;
-            result.code = SuspendCode::Suspended;
-            result.suspended = suspended;
-            result.skipped = sel.processes.size() - suspended;
-            result.detail += L"；已挂起 " + std::to_wstring(suspended);
+
+            entry.capOn = true;
+            entry.processes = std::move(tracked);
+            result.code = LimitCode::Limited;
+            result.limited = entry.processes.size();
+            result.skipped = sel.processes.size() - result.limited;
+            result.detail += L"；已限制 " + std::to_wstring(result.limited) +
+                             L" 个进程到 0.01% CPU";
+            if (added > 0) {
+                result.detail += L"，新加入 " + std::to_wstring(added);
+            }
+            if (already > 0) {
+                result.detail += L"，已在 Job " + std::to_wstring(already);
+            }
             if (reused > 0) {
                 result.detail += L"，已退出 " + std::to_wstring(reused);
             }
-            if (ownedByOther > 0) {
-                result.detail += L"，共享进程已在挂起态 " +
-                                 std::to_wstring(ownedByOther);
+            if (denied > 0) {
+                result.detail += L"，无权限 " + std::to_wstring(denied);
             }
         }
-
-        if (stateChanged) Persist();
         return results;
     }
 
-    bool Resume(const std::wstring& appKey, std::wstring* detail) {
+    size_t EnforceLimited(const std::vector<std::wstring>& appKeys,
+                          const std::vector<std::wstring>& allAppKeys,
+                          std::wstring* detail) {
+        if (!initialized) return 0;
+        std::vector<std::wstring> keys;
+        keys.reserve(appKeys.size());
+        for (const std::wstring& k : appKeys) {
+            const std::wstring normalized = NormalizePath(k);
+            auto it = apps.find(normalized);
+            if (it != apps.end() && it->second.capOn &&
+                it->second.job != nullptr) {
+                keys.push_back(normalized);
+            }
+        }
+        if (keys.empty()) return 0;
+
+        std::unordered_set<std::wstring> foreignAppKeys;
+        for (const std::wstring& k : allAppKeys) {
+            const std::wstring normalized = NormalizePath(k);
+            if (!normalized.empty()) foreignAppKeys.insert(normalized);
+        }
+
+        const std::vector<ProcessEntry> snapshot = SnapshotProcesses();
+        if (snapshot.empty()) return 0;
+
+        size_t totalAdded = 0;
+        for (const std::wstring& key : keys) {
+            auto entryIt = apps.find(key);
+            if (entryIt == apps.end() || !entryIt->second.capOn) continue;
+            const Selection sel = SelectAppProcesses(key, snapshot,
+                                                    &foreignAppKeys);
+            for (const ProcessRef& ref : sel.processes) {
+                size_t denied = 0;
+                size_t reused = 0;
+                bool critical = false;
+                const int status = AssignVerifiedProcess(
+                    entryIt->second.job, ref, &reused, &denied, &critical);
+                if (critical) break;
+                if (status == 1) {
+                    ++totalAdded;
+                    AddTracked(&entryIt->second.processes, ref);
+                } else if (status == 2) {
+                    AddTracked(&entryIt->second.processes, ref);
+                }
+            }
+        }
+        if (totalAdded > 0 && detail) {
+            *detail = L"已补限 " + std::to_wstring(totalAdded) + L" 个新进程";
+        }
+        return totalAdded;
+    }
+
+    bool Restore(const std::wstring& appKey, std::wstring* detail) {
         const std::wstring key = NormalizePath(appKey);
         auto it = apps.find(key);
-        if (it == apps.end()) {
-            if (detail) *detail = L"未挂起";
+        if (it == apps.end() || !it->second.capOn) {
+            if (detail) *detail = L"未处于限速状态";
             return true;
         }
-
-        std::vector<TrackedProcess> remain;
-        size_t resumed = 0;
-        size_t failed = 0;
-        std::wstring failedPids;
-        for (const TrackedProcess& t : it->second) {
-            const ProcKey pk{t.pid, t.creation};
-            DWORD err = ERROR_SUCCESS;
-            HANDLE proc = OpenVerified(
-                t.pid, t.creation,
-                PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION,
-                &err);
-            if (!proc) {
-                if (err == ERROR_NOT_FOUND || err == ERROR_INVALID_PARAMETER) {
-                    // 进程已退出或 PID 已复用：没有可恢复的对象了。
-                    owner.erase(pk);
-                    continue;
-                }
-                remain.push_back(t);
-                ++failed;
-                if (failedPids.size() < 160) {
-                    if (!failedPids.empty()) failedPids += L",";
-                    failedPids += std::to_wstring(t.pid);
-                }
-                continue;
-            }
-            const LONG status = resumeFn(proc);
-            CloseHandle(proc);
-            if (NtSuccess(status)) {
-                owner.erase(pk);
-                ++resumed;
-            } else {
-                remain.push_back(t);
-                ++failed;
-                if (failedPids.size() < 160) {
-                    if (!failedPids.empty()) failedPids += L",";
-                    failedPids += std::to_wstring(t.pid);
-                }
-            }
+        if (!ApplyCpuRate(it->second.job, false)) {
+            if (detail) *detail = L"解除 CPU 限制失败";
+            return false;
         }
-
-        if (remain.empty()) {
+        it->second.capOn = false;
+        // 解除后 Job 句柄仍保留，方便同一应用下次直接复用；若跟踪的
+        // 进程都已退出，关掉句柄释放资源（此时 cap 已关闭，安全）。
+        if (!AnyTrackedAlive(it->second.processes)) {
+            if (it->second.job) CloseHandle(it->second.job);
             apps.erase(it);
         } else {
-            it->second = std::move(remain);
+            it->second.processes.clear();
         }
-        Persist();
-        if (detail) {
-            *detail = L"恢复 " + std::to_wstring(resumed);
-            if (failed > 0) {
-                *detail += L"，失败 " + std::to_wstring(failed) +
-                           L"（pid " + failedPids + L"）";
-            }
-        }
-        return failed == 0;
+        if (detail) *detail = L"已解除 CPU 限制";
+        return true;
     }
 
-    void ResumeAll() {
+    void RestoreAll() {
         std::vector<std::wstring> keys;
         keys.reserve(apps.size());
-        for (const auto& kv : apps) keys.push_back(kv.first);
-        for (const auto& key : keys) {
-            std::wstring detail;
-            Resume(key, &detail);
+        for (const auto& kv : apps) {
+            if (kv.second.capOn) keys.push_back(kv.first);
+        }
+        for (const std::wstring& key : keys) {
+            Restore(key, nullptr);
         }
     }
 
-    bool IsSuspended(const std::wstring& appKey) const {
+    bool IsLimited(const std::wstring& appKey) const {
         auto it = apps.find(NormalizePath(appKey));
-        return it != apps.end() && !it->second.empty();
+        return it != apps.end() && it->second.capOn;
     }
 
     size_t TrackedProcessCount() const {
         size_t n = 0;
-        for (const auto& kv : apps) n += kv.second.size();
+        for (const auto& kv : apps) {
+            if (kv.second.capOn) n += kv.second.processes.size();
+        }
         return n;
     }
 
-    std::vector<std::wstring> SuspendedKeys() const {
+    std::vector<std::wstring> LimitedKeys() const {
         std::vector<std::wstring> keys;
         keys.reserve(apps.size());
         for (const auto& kv : apps) {
-            if (!kv.second.empty()) keys.push_back(kv.first);
+            if (kv.second.capOn) keys.push_back(kv.first);
         }
         std::sort(keys.begin(), keys.end());
         return keys;
     }
 
-    void Persist() {
-        if (!persist) return;
-        HKEY key = nullptr;
-        if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegPath, 0, nullptr, 0,
-                            KEY_WRITE, nullptr, &key, nullptr) !=
-            ERROR_SUCCESS) {
-            return;
+    size_t RecoverLegacySuspended(std::wstring* detail) {
+        size_t recovered = 0;
+        if (!resumeFn) {
+            if (detail) *detail = L"NtResumeProcess 不可用，无法恢复旧挂起表";
+            return 0;
         }
-
-        std::vector<PersistRecord> records;
-        for (const auto& kv : apps) {
-            for (const TrackedProcess& t : kv.second) {
-                records.push_back(PersistRecord{t.pid, t.creation, kv.first});
-            }
-        }
-        if (records.empty()) {
-            RegDeleteValueW(key, stateValueName.c_str());
-            RegCloseKey(key);
-            return;
-        }
-
-        std::vector<BYTE> buffer;
-        buffer.reserve(kPersistHeaderBytes + records.size() * 64);
-        const DWORD magic = kPersistMagic;
-        const DWORD version = kPersistVersion;
-        const DWORD count = static_cast<DWORD>(records.size());
-        auto append = [&buffer](const void* data, size_t bytes) {
-            const auto* p = static_cast<const BYTE*>(data);
-            buffer.insert(buffer.end(), p, p + bytes);
-        };
-        append(&magic, sizeof(magic));
-        append(&version, sizeof(version));
-        append(&count, sizeof(count));
-        for (const PersistRecord& r : records) {
-            const DWORD chars = static_cast<DWORD>(r.appKey.size());
-            append(&r.pid, sizeof(r.pid));
-            append(&r.creation, sizeof(r.creation));
-            append(&chars, sizeof(chars));
-            if (chars > 0) {
-                append(r.appKey.data(), chars * sizeof(wchar_t));
-            }
-        }
-        RegSetValueExW(key, stateValueName.c_str(), 0, REG_BINARY,
-                       buffer.data(),
-                       static_cast<DWORD>(buffer.size()));
-        RegCloseKey(key);
-    }
-
-    size_t RecoverPersisted(std::wstring* detail) {
-        if (!persist || !initialized) return 0;
         HKEY key = nullptr;
         if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegPath, 0, KEY_READ | KEY_WRITE,
                           &key) != ERROR_SUCCESS) {
@@ -910,72 +931,64 @@ struct Suspender::Impl {
         }
         DWORD type = 0;
         DWORD bytes = 0;
-        if (RegQueryValueExW(key, stateValueName.c_str(), nullptr, &type,
-                             nullptr, &bytes) != ERROR_SUCCESS ||
-            type != REG_BINARY || bytes < kPersistHeaderBytes) {
+        if (RegQueryValueExW(key, kLegacyStateValue, nullptr, &type, nullptr,
+                             &bytes) != ERROR_SUCCESS ||
+            type != REG_BINARY || bytes < kLegacyHeaderBytes) {
             RegCloseKey(key);
             return 0;
         }
         std::vector<BYTE> buffer(bytes);
-        if (RegQueryValueExW(key, stateValueName.c_str(), nullptr, &type,
+        if (RegQueryValueExW(key, kLegacyStateValue, nullptr, &type,
                              buffer.data(), &bytes) != ERROR_SUCCESS) {
             RegCloseKey(key);
             return 0;
         }
-        RegCloseKey(key);
 
-        if (bytes < kPersistHeaderBytes) return 0;
+        if (bytes < kLegacyHeaderBytes) {
+            RegCloseKey(key);
+            return 0;
+        }
         DWORD magic = 0;
         DWORD version = 0;
         DWORD count = 0;
         memcpy(&magic, buffer.data(), sizeof(magic));
         memcpy(&version, buffer.data() + 4, sizeof(version));
         memcpy(&count, buffer.data() + 8, sizeof(count));
-        if (magic != kPersistMagic || version != kPersistVersion ||
+        if (magic != kLegacyMagic || version != kLegacyVersion ||
             count > 100000) {
-            RegDeleteKeyValueW(HKEY_CURRENT_USER, kRegPath,
-                               stateValueName.c_str());
+            RegDeleteValueW(key, kLegacyStateValue);
+            RegCloseKey(key);
             return 0;
         }
 
-        size_t offset = kPersistHeaderBytes;
-        size_t recovered = 0;
+        size_t offset = kLegacyHeaderBytes;
         size_t failed = 0;
-        std::vector<PersistRecord> remain;
         for (DWORD i = 0; i < count; ++i) {
             if (offset + sizeof(DWORD) + sizeof(ULONGLONG) + sizeof(DWORD) >
                 buffer.size()) {
                 break;
             }
-            PersistRecord r;
-            memcpy(&r.pid, buffer.data() + offset, sizeof(r.pid));
-            offset += sizeof(r.pid);
-            memcpy(&r.creation, buffer.data() + offset, sizeof(r.creation));
-            offset += sizeof(r.creation);
+            DWORD pid = 0;
+            ULONGLONG creation = 0;
             DWORD chars = 0;
+            memcpy(&pid, buffer.data() + offset, sizeof(pid));
+            offset += sizeof(pid);
+            memcpy(&creation, buffer.data() + offset, sizeof(creation));
+            offset += sizeof(creation);
             memcpy(&chars, buffer.data() + offset, sizeof(chars));
             offset += sizeof(chars);
             const size_t keyBytes = static_cast<size_t>(chars) * sizeof(wchar_t);
             if (chars > 32768 || offset + keyBytes > buffer.size()) break;
-            if (chars > 0) {
-                r.appKey.assign(
-                    reinterpret_cast<const wchar_t*>(buffer.data() + offset),
-                    chars);
-            }
             offset += keyBytes;
 
-            const std::wstring normalized = NormalizePath(r.appKey);
             DWORD err = ERROR_SUCCESS;
             HANDLE proc = OpenVerified(
-                r.pid, r.creation,
+                pid, creation,
                 PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION,
                 &err);
             if (!proc) {
-                // 已退出/PID 复用：不需要恢复，直接丢弃。
                 if (err != ERROR_NOT_FOUND &&
                     err != ERROR_INVALID_PARAMETER) {
-                    r.appKey = normalized;
-                    remain.push_back(r);
                     ++failed;
                 }
                 continue;
@@ -985,74 +998,75 @@ struct Suspender::Impl {
             if (NtSuccess(status)) {
                 ++recovered;
             } else {
-                r.appKey = normalized;
-                remain.push_back(r);
                 ++failed;
             }
         }
 
-        if (remain.empty()) {
-            RegDeleteKeyValueW(HKEY_CURRENT_USER, kRegPath,
-                               stateValueName.c_str());
-        } else {
-            // 恢复失败的条目继续留在注册表里，下次启动再试。
-            apps.clear();
-            owner.clear();
-            for (const PersistRecord& r : remain) {
-                if (r.appKey.empty()) continue;
-                apps[r.appKey].push_back(
-                    TrackedProcess{r.pid, r.creation});
-                owner[ProcKey{r.pid, r.creation}] = r.appKey;
-            }
-            Persist();
+        if (failed == 0) {
+            RegDeleteValueW(key, kLegacyStateValue);
         }
+        RegCloseKey(key);
         if (detail) {
-            *detail = L"恢复 " + std::to_wstring(recovered);
+            *detail = L"恢复旧挂起进程 " + std::to_wstring(recovered);
             if (failed > 0) {
                 *detail += L"，仍失败 " + std::to_wstring(failed);
             }
         }
         return recovered;
     }
+
+    void Shutdown() {
+        RestoreAll();
+        for (auto& kv : apps) {
+            if (!kv.second.job) continue;
+            // 仍处于 capOn 的条目说明解除失败；不要关闭它的句柄（虽然
+            // 进程退出时 OS 仍会关，但至少不在代码里主动制造硬上限残留）。
+            if (!kv.second.capOn) CloseHandle(kv.second.job);
+            kv.second.job = nullptr;
+        }
+        apps.clear();
+    }
 };
 
-Suspender::Suspender(bool persist, ULONGLONG minProcessAgeMs,
-                     std::wstring stateValueName)
-    : impl_(std::make_unique<Impl>(persist, minProcessAgeMs,
-                                   std::move(stateValueName))) {}
+CpuLimiter::CpuLimiter(ULONGLONG minProcessAgeMs)
+    : impl_(std::make_unique<Impl>(minProcessAgeMs)) {}
 
-Suspender::~Suspender() {
-    if (impl_) impl_->ResumeAll();
-}
+CpuLimiter::~CpuLimiter() = default;
 
-bool Suspender::Initialize() { return impl_->Initialize(); }
+bool CpuLimiter::Initialize() { return impl_->Initialize(); }
 
-std::vector<SuspendResult> Suspender::SuspendMany(
-    const std::vector<SuspendRequest>& requests,
+std::vector<LimitResult> CpuLimiter::LimitMany(
+    const std::vector<LimitRequest>& requests,
     const std::vector<std::wstring>& allAppKeys) {
-    return impl_->SuspendMany(requests, allAppKeys);
+    return impl_->LimitMany(requests, allAppKeys);
 }
 
-bool Suspender::Resume(const std::wstring& appKey, std::wstring* detail) {
-    return impl_->Resume(appKey, detail);
+size_t CpuLimiter::EnforceLimited(
+    const std::vector<std::wstring>& appKeys,
+    const std::vector<std::wstring>& allAppKeys, std::wstring* detail) {
+    return impl_->EnforceLimited(appKeys, allAppKeys, detail);
 }
 
-void Suspender::ResumeAll() { impl_->ResumeAll(); }
-
-bool Suspender::IsSuspended(const std::wstring& appKey) const {
-    return impl_->IsSuspended(appKey);
+bool CpuLimiter::Restore(const std::wstring& appKey, std::wstring* detail) {
+    return impl_->Restore(appKey, detail);
 }
 
-size_t Suspender::TrackedProcessCount() const {
+void CpuLimiter::RestoreAll() { impl_->RestoreAll(); }
+
+bool CpuLimiter::IsLimited(const std::wstring& appKey) const {
+    return impl_->IsLimited(appKey);
+}
+
+size_t CpuLimiter::TrackedProcessCount() const {
     return impl_->TrackedProcessCount();
 }
 
-std::vector<std::wstring> Suspender::SuspendedKeys() const {
-    return impl_->SuspendedKeys();
+std::vector<std::wstring> CpuLimiter::LimitedKeys() const {
+    return impl_->LimitedKeys();
 }
 
-size_t Suspender::RecoverPersisted(std::wstring* detail) {
-    return impl_->RecoverPersisted(detail);
+size_t CpuLimiter::RecoverLegacySuspended(std::wstring* detail) {
+    return impl_->RecoverLegacySuspended(detail);
 }
 
-}  // namespace appsuspend
+}  // namespace appcpu

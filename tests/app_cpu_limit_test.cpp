@@ -1,9 +1,10 @@
-// app_suspend_test.cpp - app_suspend 的纯函数单元测试 + 真实挂起/恢复集成测试
+// app_cpu_limit_test.cpp - app_cpu_limit 的纯函数单元测试 + 真实 CPU 限速集成测试
 //
 // 集成测试不碰系统里已有的应用：把本测试 exe 复制成临时目录里的 app.exe /
 // helper.exe，由 app.exe 再派生 helper.exe（模拟“主进程 + 不同 exe 的辅助
-// 进程”），然后只对临时目录里的这一组进程调用 Suspender。通过两个心跳文件
-// 是否停止增长，验证“辅助进程真的被一起挂起”，再恢复并验证心跳继续。
+// 进程”），然后只对临时目录里的这一组进程调用 CpuLimiter。通过
+// GetProcessTimes 的 CPU 时间增量验证：限速后主进程/辅助进程都几乎不再
+// 消耗 CPU，Restore 后又恢复满速。
 
 #ifndef UNICODE
 #define UNICODE
@@ -23,7 +24,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "app_suspend.h"
+#include "app_cpu_limit.h"
 
 namespace {
 
@@ -46,18 +47,27 @@ std::wstring Join(const std::wstring& a, const std::wstring& b) {
 
 ULONGLONG Tick() { return GetTickCount64(); }
 
-void HeartbeatLoop(const std::wstring& path) {
+// 全速忙循环，同时每 100ms 往心跳文件写一个字节。
+// 0.01% CPU hard cap 下心跳几乎停止，正好用来观察限速是否生效。
+void BusyLoop(const std::wstring& path) {
     HANDLE file = CreateFileW(
         path.c_str(), FILE_APPEND_DATA,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return;
     const char byte = 'x';
+    ULONGLONG lastWrite = 0;
+    volatile ULONGLONG counter = 0;
     for (;;) {
-        DWORD written = 0;
-        WriteFile(file, &byte, 1, &written, nullptr);
-        FlushFileBuffers(file);
-        Sleep(80);
+        ++counter;
+        if ((counter & 0xFFFFF) != 0) continue;
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastWrite < 100) continue;
+        lastWrite = now;
+        if (file != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(file, &byte, 1, &written, nullptr);
+            FlushFileBuffers(file);
+        }
     }
 }
 
@@ -99,18 +109,8 @@ bool WaitForFile(const std::wstring& path, ULONGLONG minSize,
     return false;
 }
 
-bool WaitForGrowth(const std::wstring& path, ULONGLONG before,
-                   DWORD timeoutMs) {
-    const ULONGLONG deadline = Tick() + timeoutMs;
-    while (Tick() < deadline) {
-        if (FileSize(path) > before) return true;
-        Sleep(50);
-    }
-    return false;
-}
-
 void TerminateImage(const std::wstring& imagePath) {
-    const std::wstring want = appsuspend::NormalizePath(imagePath);
+    const std::wstring want = appcpu::NormalizePath(imagePath);
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return;
     PROCESSENTRY32W pe{};
@@ -124,7 +124,7 @@ void TerminateImage(const std::wstring& imagePath) {
             wchar_t image[32768] = {};
             DWORD len = 32760;
             if (QueryFullProcessImageNameW(proc, 0, image, &len) && len > 0 &&
-                appsuspend::NormalizePath(image) == want) {
+                appcpu::NormalizePath(image) == want) {
                 TerminateProcess(proc, 0);
             }
             CloseHandle(proc);
@@ -133,32 +133,69 @@ void TerminateImage(const std::wstring& imagePath) {
     CloseHandle(snap);
 }
 
-appsuspend::ProcessEntry MakeEntry(DWORD pid, DWORD parent,
-                                   const wchar_t* path,
-                                   ULONGLONG creation) {
-    appsuspend::ProcessEntry entry;
+DWORD FindPidByImage(const std::wstring& imagePath) {
+    const std::wstring want = appcpu::NormalizePath(imagePath);
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    DWORD found = 0;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            HANDLE proc =
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                            pe.th32ProcessID);
+            if (!proc) continue;
+            wchar_t image[32768] = {};
+            DWORD len = 32760;
+            if (QueryFullProcessImageNameW(proc, 0, image, &len) && len > 0 &&
+                appcpu::NormalizePath(image) == want) {
+                found = pe.th32ProcessID;
+                CloseHandle(proc);
+                break;
+            }
+            CloseHandle(proc);
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+ULONGLONG CpuTime(HANDLE proc) {
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!GetProcessTimes(proc, &created, &exited, &kernel, &user)) return 0;
+    return ((static_cast<ULONGLONG>(kernel.dwHighDateTime) << 32) |
+            kernel.dwLowDateTime) +
+           ((static_cast<ULONGLONG>(user.dwHighDateTime) << 32) |
+            user.dwLowDateTime);
+}
+
+appcpu::ProcessEntry MakeEntry(DWORD pid, DWORD parent,
+                               const wchar_t* path,
+                               ULONGLONG creation) {
+    appcpu::ProcessEntry entry;
     entry.pid = pid;
     entry.parentPid = parent;
     entry.creationTime = creation;
-    entry.imagePath = appsuspend::NormalizePath(path);
+    entry.imagePath = appcpu::NormalizePath(path);
     return entry;
 }
 
 void TestSelection() {
     {
-        std::vector<appsuspend::ProcessEntry> procs;
+        std::vector<appcpu::ProcessEntry> procs;
         procs.push_back(MakeEntry(10, 1, L"C:\\Apps\\Chrome\\chrome.exe", 100));
         procs.push_back(MakeEntry(11, 10, L"C:\\Apps\\Chrome\\chrome.exe", 200));
         procs.push_back(MakeEntry(12, 10, L"C:\\Apps\\Chrome\\chrome.exe", 300));
         procs.push_back(MakeEntry(13, 1, L"C:\\Apps\\Other\\chrome.exe", 400));
-        const auto sel = appsuspend::SelectAppProcesses(
+        const auto sel = appcpu::SelectAppProcesses(
             L"C:\\Apps\\Chrome\\chrome.exe", procs);
         Check(sel.processes.size() == 3, L"同一 exe 的全部实例都选中");
         Check(sel.exactMatches == 3, L"精确匹配计数正确");
     }
 
     {
-        std::vector<appsuspend::ProcessEntry> procs;
+        std::vector<appcpu::ProcessEntry> procs;
         procs.push_back(MakeEntry(20, 1, L"C:\\Apps\\WeChat\\WeChat.exe", 1000));
         procs.push_back(
             MakeEntry(21, 20, L"C:\\Apps\\WeChat\\WeChatAppEx.exe", 1100));
@@ -170,7 +207,7 @@ void TestSelection() {
             MakeEntry(24, 21, L"C:\\Apps\\WeChat\\sub\\helper.dll.exe", 1300));
         procs.push_back(
             MakeEntry(25, 20, L"C:\\Apps\\WeChat\\stale.exe", 900));
-        const auto sel = appsuspend::SelectAppProcesses(
+        const auto sel = appcpu::SelectAppProcesses(
             L"C:\\Apps\\WeChat\\WeChat.exe", procs);
         bool has21 = false, has24 = false, bad = false;
         for (const auto& p : sel.processes) {
@@ -184,13 +221,13 @@ void TestSelection() {
     }
 
     {
-        std::vector<appsuspend::ProcessEntry> procs;
+        std::vector<appcpu::ProcessEntry> procs;
         procs.push_back(
             MakeEntry(30, 1, L"C:\\Windows\\notepad.exe", 1000));
         procs.push_back(MakeEntry(31, 30, L"C:\\Windows\\same_dir.exe", 1100));
         procs.push_back(
             MakeEntry(32, 30, L"C:\\Windows\\subdir\\outside.exe", 1200));
-        const auto sel = appsuspend::SelectAppProcesses(
+        const auto sel = appcpu::SelectAppProcesses(
             L"C:\\Windows\\notepad.exe", procs);
         bool has31 = false, has32 = false;
         for (const auto& p : sel.processes) {
@@ -203,35 +240,34 @@ void TestSelection() {
     }
 
     {
-        std::vector<appsuspend::ProcessEntry> procs;
+        std::vector<appcpu::ProcessEntry> procs;
         procs.push_back(MakeEntry(40, 1, L"C:\\Apps\\A\\app.exe", 1000));
         procs.push_back(MakeEntry(41, 40, L"C:\\Apps\\B\\app.exe", 1100));
-        const auto sel = appsuspend::SelectAppProcesses(
+        const auto sel = appcpu::SelectAppProcesses(
             L"C:\\Apps\\A\\app.exe", procs);
         Check(sel.processes.size() == 1,
               L"同名但不同目录的 exe 不会被合并");
     }
 
     {
-        std::vector<appsuspend::ProcessEntry> procs;
+        std::vector<appcpu::ProcessEntry> procs;
         procs.push_back(MakeEntry(50, 1, L"C:\\Apps\\A\\launcher.exe", 900));
         procs.push_back(MakeEntry(51, 50, L"C:\\Apps\\A\\app.exe", 1000));
-        const auto sel = appsuspend::SelectAppProcesses(
+        const auto sel = appcpu::SelectAppProcesses(
             L"C:\\Apps\\A\\app.exe", procs);
         Check(sel.processes.size() == 1 && sel.processes[0].pid == 51,
               L"启动器父进程不会被当成应用进程");
     }
 
     {
-        std::vector<appsuspend::ProcessEntry> procs;
+        std::vector<appcpu::ProcessEntry> procs;
         procs.push_back(
             MakeEntry(60, 1, L"C:\\Office\\WINWORD.EXE", 1000));
         procs.push_back(
             MakeEntry(61, 60, L"C:\\Office\\EXCEL.EXE", 1100));
         std::unordered_set<std::wstring> foreign;
-        foreign.insert(
-            appsuspend::NormalizePath(L"C:\\Office\\EXCEL.EXE"));
-        const auto sel = appsuspend::SelectAppProcesses(
+        foreign.insert(appcpu::NormalizePath(L"C:\\Office\\EXCEL.EXE"));
+        const auto sel = appcpu::SelectAppProcesses(
             L"C:\\Office\\WINWORD.EXE", procs, &foreign);
         Check(sel.processes.size() == 1 && sel.processes[0].pid == 60,
               L"同目录但属于另一个 Dock 应用的后代不被吞并");
@@ -239,42 +275,42 @@ void TestSelection() {
 
     {
         bool broad = false;
-        const std::wstring root = appsuspend::InstallRootForApp(
+        const std::wstring root = appcpu::InstallRootForApp(
             L"C:\\Apps\\Product\\bin\\app.exe", &broad);
         Check(root == L"c:\\apps\\product" && !broad,
               L"bin 目录上提到产品安装根");
-        const std::wstring sysRoot = appsuspend::InstallRootForApp(
+        const std::wstring sysRoot = appcpu::InstallRootForApp(
             L"C:\\Windows\\System32\\notepad.exe", &broad);
         Check(sysRoot == L"c:\\windows\\system32" && broad,
               L"System32 被识别为宽泛根");
     }
 
     {
-        Check(appsuspend::IsNeverSuspendImage(L"C:\\Windows\\explorer.exe"),
-              L"explorer 永不可挂起");
-        Check(appsuspend::IsNeverSuspendImage(L"C:\\X\\conhost.exe"),
-              L"conhost 永不可挂起");
-        Check(!appsuspend::IsNeverSuspendImage(L"C:\\Apps\\App\\app.exe"),
-              L"普通应用可挂起");
+        Check(appcpu::IsNeverLimitImage(L"C:\\Windows\\explorer.exe"),
+              L"explorer 永不可限速");
+        Check(appcpu::IsNeverLimitImage(L"C:\\X\\conhost.exe"),
+              L"conhost 永不可限速");
+        Check(!appcpu::IsNeverLimitImage(L"C:\\Apps\\App\\app.exe"),
+              L"普通应用可限速");
     }
 }
 
-void TestPausePolicy() {
-    Check(!appsuspend::ShouldPauseApp(false, false, false),
-          L"未打开的应用没有暂停对象");
-    Check(!appsuspend::ShouldPauseApp(true, true, false),
-          L"有可见且未最小化窗口的应用不暂停");
-    Check(appsuspend::ShouldPauseApp(true, false, false),
-          L"窗口全部最小化或纯托盘（无可见窗口）可暂停");
-    Check(!appsuspend::ShouldPauseApp(true, false, true),
-          L"用户勾选「不暂停此应用」后永久豁免");
+void TestLimitPolicy() {
+    Check(!appcpu::ShouldLimitApp(false, false, false),
+          L"未打开的应用没有限速对象");
+    Check(!appcpu::ShouldLimitApp(true, true, false),
+          L"有可见且未最小化窗口的应用不限速");
+    Check(appcpu::ShouldLimitApp(true, false, false),
+          L"窗口全部最小化或纯托盘（无可见窗口）可限速");
+    Check(!appcpu::ShouldLimitApp(true, false, true),
+          L"用户勾选「不限制此应用」后永久豁免");
 }
 
-bool TestSuspendResume() {
+bool TestLimitRestore() {
     wchar_t temp[MAX_PATH] = {};
     if (GetTempPathW(MAX_PATH, temp) == 0) return false;
     const std::wstring dir =
-        Join(temp, L"mywigets_suspend_test_" +
+        Join(temp, L"mywigets_cpu_limit_test_" +
                        std::to_wstring(GetCurrentProcessId()) + L"_" +
                        std::to_wstring(GetTickCount64()));
     if (!CreateDirectoryW(dir.c_str(), nullptr)) return false;
@@ -304,101 +340,74 @@ bool TestSuspendResume() {
     } else {
         ok = WaitForFile(appBeat, 1, 6000) &&
              WaitForFile(helperBeat, 1, 6000);
-        Check(ok, L"测试应用与辅助进程心跳已启动");
+        Check(ok, L"测试应用与辅助进程忙循环已启动");
     }
 
-    appsuspend::Suspender suspender(false, 0);
-    if (!suspender.Initialize()) {
-        wprintf(L"[FAIL] NtSuspendProcess/NtResumeProcess 不可用\n");
+    appcpu::CpuLimiter limiter(0);
+    if (!limiter.Initialize()) {
+        wprintf(L"[FAIL] Job Object CPU rate control 不可用\n");
         ok = false;
     }
 
     if (ok) {
-        const std::wstring key = appsuspend::NormalizePath(appExe);
-        std::vector<appsuspend::SuspendRequest> requests;
-        requests.push_back({key, L"suspend-test"});
-        auto results = suspender.SuspendMany(requests);
+        const std::wstring key = appcpu::NormalizePath(appExe);
+        std::vector<appcpu::LimitRequest> requests;
+        requests.push_back({key, L"cpu-limit-test"});
+        auto results = limiter.LimitMany(requests);
         ok = results.size() == 1 &&
-             results[0].code == appsuspend::SuspendCode::Suspended &&
-             results[0].matched >= 2 && results[0].suspended >= 2;
-        Check(ok, L"主进程与不同 exe 的辅助进程一起挂起");
+             results[0].code == appcpu::LimitCode::Limited &&
+             results[0].matched >= 2 && results[0].limited >= 2;
+        Check(ok, L"主进程与不同 exe 的辅助进程一起加入 CPU 限速");
         if (!ok && !results.empty()) {
-            wprintf(L"  result: matched=%zu suspended=%zu detail=%ls\n",
-                    results[0].matched, results[0].suspended,
+            wprintf(L"  result: matched=%zu limited=%zu detail=%ls\n",
+                    results[0].matched, results[0].limited,
                     results[0].detail.c_str());
         }
 
         if (ok) {
-            const ULONGLONG appBefore = FileSize(appBeat);
-            const ULONGLONG helperBefore = FileSize(helperBeat);
-            Sleep(300);
-            const ULONGLONG appFrozen = FileSize(appBeat);
-            const ULONGLONG helperFrozen = FileSize(helperBeat);
-            Sleep(700);
-            Check(FileSize(appBeat) == appFrozen,
-                  L"挂起后主进程心跳停止");
-            Check(FileSize(helperBeat) == helperFrozen,
-                  L"挂起后辅助进程心跳停止");
-            Check(appFrozen > appBefore && helperFrozen > helperBefore,
-                  L"挂起前心跳确实在增长");
+            Check(limiter.IsLimited(key), L"限速状态已记录");
+            const DWORD helperPid = FindPidByImage(helperExe);
+            HANDLE helperProc =
+                helperPid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                        FALSE, helperPid)
+                          : nullptr;
+            Sleep(2500);
+            const ULONGLONG appBefore = CpuTime(appPi.hProcess);
+            const ULONGLONG helperBefore =
+                helperProc ? CpuTime(helperProc) : 0;
+            Sleep(5000);
+            const ULONGLONG appCapped = CpuTime(appPi.hProcess) - appBefore;
+            const ULONGLONG helperCapped =
+                helperProc ? CpuTime(helperProc) - helperBefore : 0;
+            wprintf(L"  capped cpu delta: app=%llu helper=%llu\n",
+                    appCapped, helperCapped);
+            // 0.01% of 5s ≈ 5000（100ns 单位）；Windows 每个调度区间可能
+            // 给一个最小时间片，留出 ~0.5% 的余量。
+            Check(appCapped < 250000,
+                  L"限速后主进程 CPU 占用接近停摆");
+            Check(helperProc != nullptr && helperCapped < 250000,
+                  L"限速后辅助进程 CPU 占用接近停摆");
 
             std::wstring detail;
-            const bool resumed = suspender.Resume(key, &detail);
-            Check(resumed, L"恢复调用成功");
-            Check(!suspender.IsSuspended(key), L"恢复后管理表已清空");
-            Check(WaitForGrowth(appBeat, appFrozen, 2500),
-                  L"恢复后主进程心跳继续");
-            Check(WaitForGrowth(helperBeat, helperFrozen, 2500),
-                  L"恢复后辅助进程心跳继续");
+            const bool restored = limiter.Restore(key, &detail);
+            Check(restored, L"解除 CPU 限制调用成功");
+            Check(!limiter.IsLimited(key), L"解除后限速状态已清空");
 
-            // 持久化 + 异常退出恢复：用独立的注册表值名，不碰真实配置。
-            // owner 故意保持在作用域内（模拟“崩溃前持有挂起表”），由另一个
-            // Suspender 实例读注册表把进程恢复出来。
-            {
-                appsuspend::Suspender owner(true, 0,
-                                           L"SuspendedStateTest");
-                const bool ownerInit = owner.Initialize();
-                Check(ownerInit, L"持久化挂起控制器初始化");
-                if (ownerInit) {
-                    auto again = owner.SuspendMany(requests);
-                    const bool suspendedAgain =
-                        again.size() == 1 &&
-                        again[0].code ==
-                            appsuspend::SuspendCode::Suspended;
-                    Check(suspendedAgain, L"再次挂起用于崩溃恢复测试");
-                    if (suspendedAgain) {
-                        Sleep(250);
-                        const ULONGLONG appFrozen2 = FileSize(appBeat);
-                        const ULONGLONG helperFrozen2 = FileSize(helperBeat);
-                        Sleep(500);
-                        Check(FileSize(appBeat) == appFrozen2 &&
-                                  FileSize(helperBeat) == helperFrozen2,
-                              L"崩溃恢复测试前进程确实处于冻结");
-                        {
-                            appsuspend::Suspender recoverer(
-                                true, 0, L"SuspendedStateTest");
-                            if (recoverer.Initialize()) {
-                                std::wstring recoverDetail;
-                                const size_t recovered =
-                                    recoverer.RecoverPersisted(&recoverDetail);
-                                Check(recovered >= 2,
-                                      L"启动时从持久化表恢复挂起进程");
-                                Check(WaitForGrowth(appBeat, appFrozen2, 2500),
-                                      L"恢复后主进程心跳继续（持久化路径）");
-                                Check(WaitForGrowth(helperBeat, helperFrozen2,
-                                                    2500),
-                                      L"恢复后辅助进程心跳继续（持久化路径）");
-                            } else {
-                                Check(false, L"恢复控制器初始化");
-                            }
-                        }
-                        // owner 析构时会再次 Resume（幂等）并清空测试键。
-                    }
-                }
-            }
-            RegDeleteKeyValueW(HKEY_CURRENT_USER,
-                               L"Software\\DesktopSuite\\Dock",
-                               L"SuspendedStateTest");
+            Sleep(300);
+            const ULONGLONG appBefore2 = CpuTime(appPi.hProcess);
+            const ULONGLONG helperBefore2 =
+                helperProc ? CpuTime(helperProc) : 0;
+            Sleep(1000);
+            const ULONGLONG appFull = CpuTime(appPi.hProcess) - appBefore2;
+            const ULONGLONG helperFull =
+                helperProc ? CpuTime(helperProc) - helperBefore2 : 0;
+            wprintf(L"  restored cpu delta: app=%llu helper=%llu\n",
+                    appFull, helperFull);
+            Check(appFull > 500000, L"解除后主进程恢复满速");
+            Check(helperProc != nullptr && helperFull > 500000,
+                  L"解除后辅助进程恢复满速");
+
+            if (helperProc) CloseHandle(helperProc);
         }
     }
 
@@ -421,18 +430,18 @@ bool TestSuspendResume() {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc >= 3 && _wcsicmp(argv[1], L"--heartbeat") == 0) {
-        HeartbeatLoop(argv[2]);
+    if (argc >= 2 && _wcsicmp(argv[1], L"--busy") == 0) {
+        BusyLoop(argc >= 3 ? argv[2] : L"");
         return 0;
     }
     if (argc >= 3 && _wcsicmp(argv[1], L"--spawn-helper") == 0) {
         const std::wstring dir = argv[2];
         const std::wstring helper = Join(dir, L"helper.exe");
         const std::wstring helperCmd =
-            L"\"" + helper + L"\" --heartbeat \"" + Join(dir, L"helper.heartbeat") +
-            L"\"";
+            L"\"" + helper + L"\" --busy \"" +
+            Join(dir, L"helper.heartbeat") + L"\"";
         SpawnProcess(helper, helperCmd, dir, nullptr);
-        HeartbeatLoop(Join(dir, L"app.heartbeat"));
+        BusyLoop(Join(dir, L"app.heartbeat"));
         return 0;
     }
     if (argc >= 2 && _wcsicmp(argv[1], L"--dump") == 0) {
@@ -440,7 +449,7 @@ int wmain(int argc, wchar_t** argv) {
         _setmode(_fileno(stdout), _O_U8TEXT);
         DWORD selfSession = 0;
         ProcessIdToSessionId(GetCurrentProcessId(), &selfSession);
-        const auto snapshot = appsuspend::SnapshotProcesses();
+        const auto snapshot = appcpu::SnapshotProcesses();
         wprintf(L"self_pid=%lu self_session=%lu snapshot=%zu\n",
                 GetCurrentProcessId(), selfSession, snapshot.size());
         for (const auto& e : snapshot) {
@@ -451,16 +460,15 @@ int wmain(int argc, wchar_t** argv) {
         }
         return 0;
     }
-    // 诊断：只打印某 exe 会被归入哪些进程，不执行任何挂起。
+    // 诊断：只打印某 exe 会被归入哪些进程，不执行任何限速。
     if (argc >= 3 && _wcsicmp(argv[1], L"--probe") == 0) {
         SetConsoleOutputCP(CP_UTF8);
         _setmode(_fileno(stdout), _O_U8TEXT);
-        const auto snapshot = appsuspend::SnapshotProcesses();
-        const auto sel =
-            appsuspend::SelectAppProcesses(argv[2], snapshot);
+        const auto snapshot = appcpu::SnapshotProcesses();
+        const auto sel = appcpu::SelectAppProcesses(argv[2], snapshot);
         wprintf(L"snapshot=%zu key=%ls\nroot=%ls broad=%d exact=%zu "
                 L"helper=%zu total=%zu\n",
-                snapshot.size(), appsuspend::NormalizePath(argv[2]).c_str(),
+                snapshot.size(), appcpu::NormalizePath(argv[2]).c_str(),
                 sel.installRoot.c_str(), sel.broadRoot ? 1 : 0,
                 sel.exactMatches, sel.helperMatches, sel.processes.size());
         for (const auto& ref : sel.processes) {
@@ -482,12 +490,12 @@ int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
     _setmode(_fileno(stdout), _O_U8TEXT);
     setvbuf(stdout, nullptr, _IONBF, 0);
-    wprintf(L"== app_suspend selection tests ==\n");
+    wprintf(L"== app_cpu_limit selection tests ==\n");
     TestSelection();
-    wprintf(L"== app_suspend pause policy tests ==\n");
-    TestPausePolicy();
-    wprintf(L"== app_suspend suspend/resume integration ==\n");
-    TestSuspendResume();
+    wprintf(L"== app_cpu_limit policy tests ==\n");
+    TestLimitPolicy();
+    wprintf(L"== app_cpu_limit limit/restore integration ==\n");
+    TestLimitRestore();
 
     if (g_failures == 0) {
         wprintf(L"\nALL PASS\n");

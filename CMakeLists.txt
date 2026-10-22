@@ -21,7 +21,7 @@ add_executable(MyWigets WIN32
     src/launcher_main.cpp # 应用管理
     src/topbar_main.cpp   # 顶栏
     src/dock_main.cpp     # Dock 栏
-    src/app_suspend.cpp   # 未聚焦应用挂起
+    src/app_cpu_limit.cpp # 后台应用 CPU 限速
     src/app.rc
 )
 
