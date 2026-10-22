@@ -1,10 +1,10 @@
-// app_cpu_limit_test.cpp - app_cpu_limit 的纯函数单元测试 + 真实 CPU 限速集成测试
+// app_cpu_limit_test.cpp - app_cpu_limit 的纯函数单元测试 + 真实效率模式集成测试
 //
 // 集成测试不碰系统里已有的应用：把本测试 exe 复制成临时目录里的 app.exe /
 // helper.exe，由 app.exe 再派生 helper.exe（模拟“主进程 + 不同 exe 的辅助
 // 进程”），然后只对临时目录里的这一组进程调用 CpuLimiter。通过
-// GetProcessTimes 的 CPU 时间增量验证：限速后主进程/辅助进程都几乎不再
-// 消耗 CPU，Restore 后又恢复满速。
+// GetProcessInformation(ProcessPowerThrottling) 验证主进程/辅助进程都进入
+// EcoQoS 效率模式，Restore 后又都退出。
 
 #ifndef UNICODE
 #define UNICODE
@@ -47,8 +47,8 @@ std::wstring Join(const std::wstring& a, const std::wstring& b) {
 
 ULONGLONG Tick() { return GetTickCount64(); }
 
-// 全速忙循环，同时每 100ms 往心跳文件写一个字节。
-// 0.01% CPU hard cap 下心跳几乎停止，正好用来观察限速是否生效。
+// 全速忙循环，同时每 100ms 往心跳文件写一个字节；保证进程持续存活，
+// 便于验证 EcoQoS 状态与恢复。
 void BusyLoop(const std::wstring& path) {
     HANDLE file = CreateFileW(
         path.c_str(), FILE_APPEND_DATA,
@@ -161,13 +161,28 @@ DWORD FindPidByImage(const std::wstring& imagePath) {
     return found;
 }
 
-ULONGLONG CpuTime(HANDLE proc) {
-    FILETIME created{}, exited{}, kernel{}, user{};
-    if (!GetProcessTimes(proc, &created, &exited, &kernel, &user)) return 0;
-    return ((static_cast<ULONGLONG>(kernel.dwHighDateTime) << 32) |
-            kernel.dwLowDateTime) +
-           ((static_cast<ULONGLONG>(user.dwHighDateTime) << 32) |
-            user.dwLowDateTime);
+// 查询进程是否启用了 EcoQoS（PROCESS_POWER_THROTTLING_EXECUTION_SPEED）。
+// 测试进程本身不在 Job 里，SetProcessInformation 可用；动态取函数以避免
+// 旧 _WIN32_WINNT 下声明缺失。
+bool IsEcoQoSOn(HANDLE proc) {
+    struct PowerState {
+        DWORD Version;
+        DWORD ControlMask;
+        DWORD StateMask;
+    };
+    using GetProcessInformationFn =
+        BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+    static GetProcessInformationFn fn = []() -> GetProcessInformationFn {
+        HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+        if (!kernel) return nullptr;
+        return reinterpret_cast<GetProcessInformationFn>(
+            GetProcAddress(kernel, "GetProcessInformation"));
+    }();
+    if (!fn) return false;
+    PowerState st{};
+    st.Version = 1;
+    if (!fn(proc, 4, &st, sizeof(st))) return false;  // ProcessPowerThrottling
+    return (st.ControlMask & 1) != 0 && (st.StateMask & 1) != 0;
 }
 
 appcpu::ProcessEntry MakeEntry(DWORD pid, DWORD parent,
@@ -287,23 +302,23 @@ void TestSelection() {
 
     {
         Check(appcpu::IsNeverLimitImage(L"C:\\Windows\\explorer.exe"),
-              L"explorer 永不可限速");
+              L"explorer 永不启用效率模式");
         Check(appcpu::IsNeverLimitImage(L"C:\\X\\conhost.exe"),
-              L"conhost 永不可限速");
+              L"conhost 永不启用效率模式");
         Check(!appcpu::IsNeverLimitImage(L"C:\\Apps\\App\\app.exe"),
-              L"普通应用可限速");
+              L"普通应用可启用效率模式");
     }
 }
 
 void TestLimitPolicy() {
     Check(!appcpu::ShouldLimitApp(false, false, false),
-          L"未打开的应用没有限速对象");
+          L"未打开的应用没有可切换对象");
     Check(!appcpu::ShouldLimitApp(true, true, false),
-          L"有可见且未最小化窗口的应用不限速");
+          L"有可见且未最小化窗口的应用不启用效率模式");
     Check(appcpu::ShouldLimitApp(true, false, false),
-          L"窗口全部最小化或纯托盘（无可见窗口）可限速");
+          L"窗口全部最小化或纯托盘（无可见窗口）可启用效率模式");
     Check(!appcpu::ShouldLimitApp(true, false, true),
-          L"用户勾选「不限制此应用」后永久豁免");
+          L"用户勾选「不对此应用启用效率模式」后永久豁免");
 }
 
 bool TestLimitRestore() {
@@ -345,19 +360,19 @@ bool TestLimitRestore() {
 
     appcpu::CpuLimiter limiter(0);
     if (!limiter.Initialize()) {
-        wprintf(L"[FAIL] Job Object CPU rate control 不可用\n");
+        wprintf(L"[FAIL] SetProcessInformation/EcoQoS 不可用\n");
         ok = false;
     }
 
     if (ok) {
         const std::wstring key = appcpu::NormalizePath(appExe);
         std::vector<appcpu::LimitRequest> requests;
-        requests.push_back({key, L"cpu-limit-test"});
+        requests.push_back({key, L"ecoqos-test"});
         auto results = limiter.LimitMany(requests);
         ok = results.size() == 1 &&
              results[0].code == appcpu::LimitCode::Limited &&
              results[0].matched >= 2 && results[0].limited >= 2;
-        Check(ok, L"主进程与不同 exe 的辅助进程一起加入 CPU 限速");
+        Check(ok, L"主进程与不同 exe 的辅助进程一起启用效率模式");
         if (!ok && !results.empty()) {
             wprintf(L"  result: matched=%zu limited=%zu detail=%ls\n",
                     results[0].matched, results[0].limited,
@@ -365,47 +380,25 @@ bool TestLimitRestore() {
         }
 
         if (ok) {
-            Check(limiter.IsLimited(key), L"限速状态已记录");
+            Check(limiter.IsLimited(key), L"效率模式状态已记录");
             const DWORD helperPid = FindPidByImage(helperExe);
             HANDLE helperProc =
                 helperPid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
                                         FALSE, helperPid)
                           : nullptr;
-            Sleep(2500);
-            const ULONGLONG appBefore = CpuTime(appPi.hProcess);
-            const ULONGLONG helperBefore =
-                helperProc ? CpuTime(helperProc) : 0;
-            Sleep(5000);
-            const ULONGLONG appCapped = CpuTime(appPi.hProcess) - appBefore;
-            const ULONGLONG helperCapped =
-                helperProc ? CpuTime(helperProc) - helperBefore : 0;
-            wprintf(L"  capped cpu delta: app=%llu helper=%llu\n",
-                    appCapped, helperCapped);
-            // 0.01% of 5s ≈ 5000（100ns 单位）；Windows 每个调度区间可能
-            // 给一个最小时间片，留出 ~0.5% 的余量。
-            Check(appCapped < 250000,
-                  L"限速后主进程 CPU 占用接近停摆");
-            Check(helperProc != nullptr && helperCapped < 250000,
-                  L"限速后辅助进程 CPU 占用接近停摆");
+            Check(IsEcoQoSOn(appPi.hProcess),
+                  L"主进程已进入 EcoQoS 效率模式");
+            Check(helperProc != nullptr && IsEcoQoSOn(helperProc),
+                  L"辅助进程已进入 EcoQoS 效率模式");
 
             std::wstring detail;
             const bool restored = limiter.Restore(key, &detail);
-            Check(restored, L"解除 CPU 限制调用成功");
-            Check(!limiter.IsLimited(key), L"解除后限速状态已清空");
-
-            Sleep(300);
-            const ULONGLONG appBefore2 = CpuTime(appPi.hProcess);
-            const ULONGLONG helperBefore2 =
-                helperProc ? CpuTime(helperProc) : 0;
-            Sleep(1000);
-            const ULONGLONG appFull = CpuTime(appPi.hProcess) - appBefore2;
-            const ULONGLONG helperFull =
-                helperProc ? CpuTime(helperProc) - helperBefore2 : 0;
-            wprintf(L"  restored cpu delta: app=%llu helper=%llu\n",
-                    appFull, helperFull);
-            Check(appFull > 500000, L"解除后主进程恢复满速");
-            Check(helperProc != nullptr && helperFull > 500000,
-                  L"解除后辅助进程恢复满速");
+            Check(restored, L"恢复效率模式调用成功");
+            Check(!limiter.IsLimited(key), L"恢复后效率模式状态已清空");
+            Check(!IsEcoQoSOn(appPi.hProcess),
+                  L"主进程已退出 EcoQoS 效率模式");
+            Check(helperProc != nullptr && !IsEcoQoSOn(helperProc),
+                  L"辅助进程已退出 EcoQoS 效率模式");
 
             if (helperProc) CloseHandle(helperProc);
         }
@@ -460,7 +453,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         return 0;
     }
-    // 诊断：只打印某 exe 会被归入哪些进程，不执行任何限速。
+    // 诊断：只打印某 exe 会被归入哪些进程，不执行任何切换。
     if (argc >= 3 && _wcsicmp(argv[1], L"--probe") == 0) {
         SetConsoleOutputCP(CP_UTF8);
         _setmode(_fileno(stdout), _O_U8TEXT);

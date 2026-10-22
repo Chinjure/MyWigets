@@ -1,22 +1,27 @@
-// app_cpu_limit.h - 「后台应用 CPU 限速」的进程归属与限速/恢复
+// app_cpu_limit.h - 「后台应用效率模式（EcoQoS）」的进程归属与启用/恢复
 //
 // 需求：Dock 里已经没有可见窗口的应用（窗口全部最小化，或纯托盘驻留），
-// 一旦不再处于顶栏当前焦点，就把它的 CPU 占用硬限制到 0.01%（万分之一），
-// 重新成为焦点或被交互时恢复正常。单个应用可以由用户在图标右键菜单里
-// 豁免（不限制）。
+// 一旦不再处于顶栏当前焦点，就把进程的 QoS 切到效率模式（EcoQoS，即
+// 任务管理器里的“效率模式”）；重新成为焦点或被交互时恢复正常。单个应用
+// 可以由用户在图标右键菜单里豁免（不启用效率模式）。
 //
-// 为什么不再直接挂起进程：整进程 NtSuspendProcess 会冻结持有 WH_KEYBOARD_LL
-// / WH_MOUSE_LL 低级钩子的线程。Windows 每次输入都要等该线程执行钩子回调，
-// 线程被冻住时只能等 LowLevelHooksTimeout 才跳过，表现为键盘/鼠标输入明显
-// 卡顿甚至无法输入。Job Object 的 CPU hard cap 只限制调度配额，线程仍会
-// 运行，低级钩子可以按时执行。
+// 为什么不再挂起/硬限速：
+//   1. 整进程 NtSuspendProcess 会冻结持有 WH_KEYBOARD_LL / WH_MOUSE_LL
+//      低级钩子的线程。Windows 每次输入都要等该线程执行钩子回调，线程
+//      被冻住时只能等 LowLevelHooksTimeout 才跳过，表现为键盘/鼠标输入
+//      明显卡顿甚至无法输入。
+//   2. Job Object 的 0.01% CPU hard cap 虽然不冻结线程，但把钩子线程也
+//      饿到几乎得不到调度；实测微信仍能感到输入延迟。
+//   3. EcoQoS 使用 SetProcessInformation(ProcessPowerThrottling) 只降低
+//      进程的调度/能效等级，不硬性截断线程；UI/低级钩子线程仍能按时运行。
+//      它等价于任务管理器手动开启“效率模式”，也是系统推荐的背景任务做法。
 //
-// 真正容易出错的地方不是限速 API，而是「哪些进程算这个应用」：
+// 真正容易出错的地方不是 QoS API，而是「哪些进程算这个应用」：
 //
 //   1. 不能用窗口数量/进程数量判断：Chrome、Edge、Electron、微信、钉钉
 //      都是多进程应用，主窗只是其中一个进程。
 //   2. 不能只看进程树：应用启动的外部程序（浏览器、终端、安装器）也会
-//      是它的子进程；把整棵子树限速会误伤无关应用。
+//      是它的子进程；把整棵子树降速会误伤无关应用。
 //   3. 不能只看 exe 名字：同名 exe 可能来自不同目录、根本不是同一个应用
 //      （例如用户自己编译的 chrome.exe）。
 //   4. 不能只用 AppUserModelID：Dock 当前的分组主键是归一化 exe 路径，
@@ -40,30 +45,28 @@
 //       的安装目录内，它和它的后代都不会被选中；A 的启动器父进程也不会
 //       被选中（只收后代，不收祖先）。
 //
-// 另外用进程创建时间做 PID 复用防护：限速/恢复前重新打开进程并核对
-// 创建时间，绝不把「同 PID 的新进程」当成原来那个进程。
+// 另外用进程创建时间做 PID 复用防护：启用/恢复效率模式前重新打开进程并
+// 核对创建时间，绝不把「同 PID 的新进程」当成原来那个进程。
 //
-// 限速实现：
-//   - 每个应用一个 Job Object，JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
-//     使用 JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | HARD_CAP，CpuRate=1
-//     （1/10000 = 0.01%）；Windows 8+ 支持，Windows 7 上初始化失败并降级。
-//   - 已在该 Job 里的进程/其子进程不重复 Assign；解除限制只需把
-//     ControlFlags 设为 0，进程立刻恢复全额 CPU。
-//   - Job 句柄在 Dock 生命周期内保留以便反复开关；Dock 正常退出/组件重启
-//     会先解除限制再关闭句柄。
-//
-// 注意：Job 的 CPU 硬上限是附着在进程上的。若 Dock 被强杀/崩溃，最后一个
-// Job 句柄关闭后上限仍会留在进程上（Windows 没有公开的反向 API），此时
-// 需要重启对应应用才能恢复。正常退出路径会清理干净。
+// 效率模式实现：
+//   - 对应用中每个选中进程调用 SetProcessInformation(ProcessPowerThrottling)，
+//     ControlMask |= EXECUTION_SPEED，StateMask |= EXECUTION_SPEED。
+//   - 记录启用前的 ControlMask/StateMask；恢复时原样写回，不把用户或系统
+//     本来设置好的效率模式误关掉。
+//   - 子进程不会继承 EcoQoS，所以 Dock 会周期性重新选中并补挂新出现的
+//     helper（见 EnforceLimited）。
+//   - 不使用 Job Object，不存在“崩溃后硬上限留在进程上”的问题。正常退出/
+//     组件重启会恢复全部；Dock 被强杀时应用最多停在低功耗效率模式，仍然
+//     可响应输入，下次启动/重新聚焦时会恢复。
 //
 // 安全边界（由 Dock 在调用前再叠加一层）：
 //   - 只把「没有可见窗口」（窗口全部最小化或纯托盘）且未被用户豁免的
 //     应用交给本模块；
 //   - 不碰 MyWigets 自身、explorer、conhost 等系统基础设施；
 //   - 不碰当前系统前台应用（即使顶栏目标暂时粘在别的应用上）；
-//   - 不碰安全桌面（UAC/锁屏）期间的新限速请求；
-//   - 刚启动的进程有最小年龄保护，避免把正在初始化的应用限速；
-//   - 正常退出/组件重启时恢复所有自己限制的进程。
+//   - 不碰安全桌面（UAC/锁屏）期间的新效率模式请求；
+//   - 刚启动的进程有最小年龄保护，避免把正在初始化的应用切到效率模式；
+//   - 正常退出/组件重启时恢复所有自己启用过效率模式的进程。
 
 #pragma once
 
@@ -91,13 +94,13 @@ struct ProcessRef {
     DWORD pid = 0;
     ULONGLONG creationTime = 0;
     // true = 与应用 key 完全同镜像的主进程；false = 安装目录树内的辅助进程。
-    // 限速时要求至少有一个主进程能加入 Job，避免只把 helper 限死而主进程
-    // 全速运行，造成“限了但没限到点子上”的半吊子状态。
+    // 启用效率模式时要求至少有一个主进程成功切换，避免只把 helper 限死而
+    // 主进程全速运行，造成“限了但没限到点子上”的半吊子状态。
     bool exactMatch = false;
 };
 
-// 选择结果：processes 是最终要限速的进程；installRoot/broadRoot 仅用于
-// 日志与测试，说明本次按哪个目录树收拢辅助进程。
+// 选择结果：processes 是最终要启用效率模式的进程；installRoot/broadRoot
+// 仅用于日志与测试，说明本次按哪个目录树收拢辅助进程。
 struct Selection {
     std::vector<ProcessRef> processes;
     std::wstring installRoot;
@@ -119,13 +122,13 @@ std::wstring InstallRootForApp(const std::wstring& appKey, bool* broadRoot);
 
 bool IsBroadInstallRoot(const std::wstring& dir);
 
-// 永不属于任何可限速应用集合的系统/套件进程（按 exe 基名）。
+// 永不属于任何可启用效率模式应用集合的系统/套件进程（按 exe 基名）。
 bool IsNeverLimitImage(const std::wstring& imagePath);
 
-// Dock 侧的限速策略（纯函数，便于单元测试）：只有「仍然打开、当前没有
-// 任何“可见且未最小化”的窗口、且没有被用户单独豁免」的应用才允许限速。
+// Dock 侧的效率模式策略（纯函数，便于单元测试）：只有「仍然打开、当前
+// 没有“可见且未最小化”的窗口、且没有被用户单独豁免」的应用才启用。
 // hasVisibleWindow 为 true 表示至少有一张可见且未最小化的顶层窗口；
-// 窗口全部最小化、或纯托盘驻留（根本没有窗口）时都为 false，可以限速。
+// 窗口全部最小化、或纯托盘驻留（根本没有窗口）时都为 false，可以启用。
 bool ShouldLimitApp(bool opened, bool hasVisibleWindow, bool userExcluded);
 
 // 全量进程快照（忽略其他登录会话、系统基础设施与自身）。
@@ -142,12 +145,12 @@ Selection SelectAppProcesses(
     const std::unordered_set<std::wstring>* foreignAppKeys = nullptr);
 
 enum class LimitCode {
-    Limited,          // 至少把一个进程纳入 CPU 限制（或已在限制中）
-    AlreadyLimited,   // 该应用已经在限速表中
+    Limited,          // 至少一个进程已切到效率模式（或本来就在）
+    AlreadyLimited,   // 该应用已经在效率模式表中
     NoProcesses,      // 找不到属于该应用的进程
     TooYoung,         // 进程刚启动，等过了最小年龄再试
-    AccessDenied,     // 有匹配进程，但一个也打不开/加不进 Job（权限/受保护）
-    Failed,           // 其他失败（Job 创建/CPU 限制设置失败）
+    AccessDenied,     // 有匹配进程，但一个也打不开/无法设置（权限/受保护）
+    Failed,           // 其他失败（SetProcessInformation 不可用等）
 };
 
 struct LimitRequest {
@@ -158,17 +161,17 @@ struct LimitRequest {
 struct LimitResult {
     LimitCode code = LimitCode::Failed;
     size_t matched = 0;
-    size_t limited = 0;   // 已纳入 CPU 限制的进程数
+    size_t limited = 0;   // 已启用效率模式的进程数
     size_t skipped = 0;
     DWORD retryAfterMs = 0;
     std::wstring detail;
 };
 
-// CPU 限速控制器。只应由 Dock 的 UI 线程调用；内部不创建线程。
+// 后台应用效率模式控制器。只应由 Dock 的 UI 线程调用；内部不创建线程。
 //
-// 每个应用对应一个长期保留的 Job Object：限制时把进程加入 Job 并打开
-// hard cap；恢复时只关闭 CPU rate control（不关 Job 句柄），这样同一个
-// 应用反复开关不会不断创建新 Job。析构/正常退出时解除所有限制并关闭句柄。
+// 每个应用维护一组已启用 EcoQoS 的进程（PID+创建时间+启用前状态）。启用
+// 时逐个 SetProcessInformation；恢复时把启用前的状态原样写回。析构/正常
+// 退出时恢复所有进程。
 class CpuLimiter {
 public:
     explicit CpuLimiter(ULONGLONG minProcessAgeMs = 8000);
@@ -183,22 +186,22 @@ public:
     // 返回与 requests 一一对应的结果。
     // allAppKeys = Dock 当前全部应用 key（含固定但未运行的），用于让
     // SelectAppProcesses 区分「辅助进程」与「被本应用拉起的另一个应用」。
-    // 同一应用重复调用时：已在限制中返回 AlreadyLimited；已解除限制但
-    // Job 仍在的应用会重新加入新出现的进程并再次打开 hard cap。
+    // 同一应用重复调用时：已在效率模式返回 AlreadyLimited；已恢复的应用
+    // 会重新选中新出现的进程并再次启用。
     std::vector<LimitResult> LimitMany(
         const std::vector<LimitRequest>& requests,
         const std::vector<std::wstring>& allAppKeys = {});
 
-    // 给已经在限制中的应用补挂新出现的进程（主进程新开的 helper、重启后
-    // 的新实例等）。Job 设置了 SILENT_BREAKAWAY_OK，子进程不会自动继承，
-    // 必须由 Dock 周期性重新按“同 exe + 安装目录树”口径选中并 Assign。
-    // 返回本次新加入 Job 的进程数；detail 仅在确有新增时填写。
+    // 给已经在效率模式中的应用补挂新出现的进程（主进程新开的 helper、
+    // 重启后的新实例等）。EcoQoS 不随进程创建继承，必须由 Dock 周期性
+    // 重新按“同 exe + 安装目录树”口径选中并 SetProcessInformation。
+    // 返回本次新启用效率模式的进程数；detail 仅在确有新增时填写。
     size_t EnforceLimited(const std::vector<std::wstring>& appKeys,
                           const std::vector<std::wstring>& allAppKeys,
                           std::wstring* detail = nullptr);
 
-    // 解除该应用的 CPU 限制。个别进程已退出视为成功；解除失败会保留
-    // Job 句柄和跟踪表，等待下次重试（绝不带着 hard cap 关掉句柄）。
+    // 退出该应用的效率模式。个别进程已退出视为成功；恢复失败会保留记录，
+    // 等待下次重试。
     bool Restore(const std::wstring& appKey, std::wstring* detail = nullptr);
 
     void RestoreAll();

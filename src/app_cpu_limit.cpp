@@ -2,12 +2,11 @@
 //
 // 这里做四件事：
 //   1. 从全量进程快照中按「同一 exe + 安装目录树内的后代」选出应用进程；
-//   2. 为每个应用维护一个 Job Object，用 CPU rate control 的 hard cap
-//      把它的 CPU 占用限制到 0.01%；
-//   3. 用 SILENT_BREAKAWAY_OK 防止应用拉起的外部程序继承限速 Job，
-//      并周期性把新出现的同应用辅助进程补进 Job；
-//   4. 用 PID + 创建时间双保险，恢复时只关闭 rate control、不带着 hard cap
-//      关闭 Job 句柄。
+//   2. 对每个应用进程调用 SetProcessInformation(ProcessPowerThrottling)，
+//      把 QoS 切到效率模式（EcoQoS）；
+//   3. 记录启用前的 PowerThrottling 状态，恢复时原样写回；
+//   4. 用 PID + 创建时间双保险，并周期性把新出现的同应用辅助进程补进
+//      效率模式（EcoQoS 不会随进程创建继承）。
 //
 // 不按进程树整棵挂起、不按 exe 名字合并、不碰系统基础设施，原因见头文件。
 
@@ -35,12 +34,12 @@ constexpr DWORD kLegacyMagic = 0x50555353;  // "SSUP"
 constexpr DWORD kLegacyVersion = 1;
 constexpr DWORD kLegacyHeaderBytes = sizeof(DWORD) * 3;
 
-// 刚启动的进程先不限速：Chrome/Electron/UWP 启动阶段会连续创建子进程，
-// 太早压到 0.01% 会把「正在打开的应用」卡在启动中。
+// 刚启动的进程先不切效率模式：Chrome/Electron/UWP 启动阶段会连续创建
+// 子进程，太早降速会把「正在打开的应用」卡在启动中。
 constexpr ULONGLONG kMinProcessAgeDefaultMs = 8000;
 
 // 硬件断点/调试器挂起等场景不属于这里；只列常见的系统基础设施。
-// 基名均小写。应用自己的主 exe 若命中这里，Dock 侧也不会把它当可限速项。
+// 基名均小写。应用自己的主 exe 若命中这里，Dock 侧也不会把它当可降速项。
 const wchar_t* const kNeverLimitBasenames[] = {
     L"system", L"smss.exe", L"csrss.exe", L"wininit.exe", L"winlogon.exe",
     L"services.exe", L"lsass.exe", L"svchost.exe", L"dwm.exe",
@@ -62,25 +61,27 @@ const wchar_t* const kNeverLimitBasenames[] = {
     L"desktoplauncher-x64.exe", L"desktoplauncher-x86.exe",
 };
 
-// ---- Job Object CPU rate control ----
+// ---- Process Power Throttling (EcoQoS) ----
 // _WIN32_WINNT 可能仍按 0x0601 编译，SDK 不一定导出 Windows 8 的新枚举名，
-// 这里用 ABI 值：JobObjectCpuRateControlInformation = 15。
-constexpr JOBOBJECTINFOCLASS kJobCpuRateControlInformation =
-    static_cast<JOBOBJECTINFOCLASS>(15);
-constexpr DWORD kCpuRateControlEnable = 0x1;
-constexpr DWORD kCpuRateControlHardCap = 0x4;
-// CpuRate 单位是 1/10000（万分之一）。1 = 0.01%。
-constexpr DWORD kCpuRateOneHundredthPercent = 1;
+// 这里用 ABI 值：ProcessPowerThrottling = 4。
+constexpr PROCESS_INFORMATION_CLASS kProcessPowerThrottling =
+    static_cast<PROCESS_INFORMATION_CLASS>(4);
+constexpr DWORD kPowerThrottlingVersion = 1;
+constexpr DWORD kPowerThrottlingExecutionSpeed = 0x1;
 
-// 与 JOBOBJECT_CPU_RATE_CONTROL_INFORMATION 同布局；不直接使用 SDK 类型，
-// 避免旧 _WIN32_WINNT 下结构体/枚举缺失。
-struct JobCpuRateInfo {
-    DWORD ControlFlags;
-    union {
-        DWORD CpuRate;
-        DWORD Weight;
-    };
+// 与 PROCESS_POWER_THROTTLING_STATE 同布局，避免旧 _WIN32_WINNT 下类型缺失。
+struct PowerThrottlingState {
+    DWORD Version;
+    DWORD ControlMask;
+    DWORD StateMask;
 };
+
+using SetProcessInformationFn = BOOL(WINAPI*)(HANDLE,
+                                              PROCESS_INFORMATION_CLASS, LPVOID,
+                                              DWORD);
+using GetProcessInformationFn = BOOL(WINAPI*)(HANDLE,
+                                              PROCESS_INFORMATION_CLASS, LPVOID,
+                                              DWORD);
 
 std::wstring TrimTrailingSlash(std::wstring path) {
     while (path.size() > 3 && path.back() == L'\\') path.pop_back();
@@ -191,6 +192,10 @@ std::vector<std::wstring> BroadRoots() {
 struct TrackedProcess {
     DWORD pid = 0;
     ULONGLONG creation = 0;
+    // 启用 EcoQoS 前的 PowerThrottling 状态，恢复时原样写回，避免把
+    // 用户/系统本来就设好的效率模式误关掉。
+    DWORD prevControlMask = 0;
+    DWORD prevStateMask = 0;
 };
 
 using NtResumeProcessFn = LONG(NTAPI*)(HANDLE);
@@ -260,40 +265,67 @@ bool IsProcessCritical(HANDLE proc) {
     return critical != FALSE;
 }
 
-// 打开/关闭 Job 的 CPU rate control。enable=false 时 ControlFlags=0，
-// 解除硬上限；这是唯一安全的“还进程自由”的方式。
-bool ApplyCpuRate(HANDLE job, bool enable) {
-    JobCpuRateInfo info{};
-    if (enable) {
-        info.ControlFlags = kCpuRateControlEnable | kCpuRateControlHardCap;
-        info.CpuRate = kCpuRateOneHundredthPercent;
-    }
-    return SetInformationJobObject(
-               job, kJobCpuRateControlInformation, &info, sizeof(info)) != FALSE;
+// 动态取 kernel32!SetProcessInformation / GetProcessInformation：
+// 项目仍按 _WIN32_WINNT=0x0601 编译，直接引用可能被 SDK 声明屏蔽；
+// Windows 7 上没有这两个函数，功能降级为关闭。
+SetProcessInformationFn SetProcessInformationPtr() {
+    static SetProcessInformationFn fn = []() -> SetProcessInformationFn {
+        HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+        if (!kernel) return nullptr;
+        return reinterpret_cast<SetProcessInformationFn>(
+            GetProcAddress(kernel, "SetProcessInformation"));
+    }();
+    return fn;
 }
 
-// 让 Job 里的进程创建子进程时不自动继承 Job：否则应用拉起的浏览器/
-// 终端/安装器会被一起压到 0.01%。代价是新出现的同应用 helper 需要由
-// Dock 周期性重新选中并 Assign（见 EnforceLimited）。
-bool EnableSilentBreakaway(HANDLE job) {
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION ext{};
-    ext.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
-    return SetInformationJobObject(
-               job, JobObjectExtendedLimitInformation, &ext, sizeof(ext)) !=
-           FALSE;
+GetProcessInformationFn GetProcessInformationPtr() {
+    static GetProcessInformationFn fn = []() -> GetProcessInformationFn {
+        HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+        if (!kernel) return nullptr;
+        return reinterpret_cast<GetProcessInformationFn>(
+            GetProcAddress(kernel, "GetProcessInformation"));
+    }();
+    return fn;
 }
 
-bool IsCpuRateControlSupported() {
-    HANDLE job = CreateJobObjectW(nullptr, nullptr);
-    if (!job) return false;
-    // 先在空 Job 上真正打开一次 hard cap，再关闭：部分系统对“从未启用过
-    // CPU rate control 的 Job 直接 ControlFlags=0”会返回 INVALID_ARGS，
-    // 用它探测支持性会误判为不可用。
-    const bool supported = ApplyCpuRate(job, true);
-    if (supported) ApplyCpuRate(job, false);
-    CloseHandle(job);
-    return supported;
+bool QueryPowerState(HANDLE proc, DWORD* control, DWORD* state) {
+    const GetProcessInformationFn fn = GetProcessInformationPtr();
+    if (!fn) return false;
+    PowerThrottlingState st{};
+    st.Version = kPowerThrottlingVersion;
+    if (!fn(proc, kProcessPowerThrottling, &st, sizeof(st))) return false;
+    *control = st.ControlMask;
+    *state = st.StateMask;
+    return true;
 }
+
+bool SetPowerState(HANDLE proc, DWORD control, DWORD state) {
+    const SetProcessInformationFn fn = SetProcessInformationPtr();
+    if (!fn) return false;
+    PowerThrottlingState st{};
+    st.Version = kPowerThrottlingVersion;
+    st.ControlMask = control;
+    st.StateMask = state;
+    return fn(proc, kProcessPowerThrottling, &st, sizeof(st)) != FALSE;
+}
+
+// 打开效率模式（EcoQoS）：保留调用前的 ControlMask/StateMask，恢复时
+// 原样写回。返回 false 表示系统不支持或进程拒绝。
+bool EnableEcoQoS(HANDLE proc, DWORD* prevControl, DWORD* prevState) {
+    DWORD control = 0;
+    DWORD state = 0;
+    QueryPowerState(proc, &control, &state);  // 查询失败时按 0/0 处理
+    *prevControl = control;
+    *prevState = state;
+    return SetPowerState(proc, control | kPowerThrottlingExecutionSpeed,
+                         state | kPowerThrottlingExecutionSpeed);
+}
+
+bool RestorePowerState(HANDLE proc, DWORD control, DWORD state) {
+    return SetPowerState(proc, control, state);
+}
+
+bool IsEcoQoSSupported() { return SetProcessInformationPtr() != nullptr; }
 
 }  // namespace
 
@@ -368,9 +400,9 @@ bool IsNeverLimitImage(const std::wstring& imagePath) {
 }
 
 bool ShouldLimitApp(bool opened, bool hasVisibleWindow, bool userExcluded) {
-    // 没打开（进程已退出）没有可限速对象；只要还有一张可见且未最小化的
-    // 窗口就保持运行；窗口全部最小化或纯托盘驻留时可以限速。用户显式
-    // 勾选「不限制此应用」时永久豁免，即使之后收起窗口变成托盘应用。
+    // 没打开（进程已退出）没有可切换对象；只要还有一张可见且未最小化的
+    // 窗口就保持正常；窗口全部最小化或纯托盘驻留时可以切效率模式。用户
+    // 显式勾选「不对此应用启用效率模式」时永久豁免。
     return opened && !hasVisibleWindow && !userExcluded;
 }
 
@@ -521,8 +553,7 @@ struct CpuLimiter::Impl {
     NtResumeProcessFn resumeFn = nullptr;
 
     struct AppEntry {
-        HANDLE job = nullptr;
-        bool capOn = false;
+        bool ecoOn = false;
         std::vector<TrackedProcess> processes;
     };
     std::unordered_map<std::wstring, AppEntry> apps;
@@ -537,16 +568,8 @@ struct CpuLimiter::Impl {
             resumeFn = reinterpret_cast<NtResumeProcessFn>(
                 GetProcAddress(ntdll, "NtResumeProcess"));
         }
-        initialized = IsCpuRateControlSupported();
+        initialized = IsEcoQoSSupported();
         return initialized;
-    }
-
-    static void AddTracked(std::vector<TrackedProcess>* list,
-                           const ProcessRef& ref) {
-        for (const TrackedProcess& t : *list) {
-            if (t.pid == ref.pid && t.creation == ref.creationTime) return;
-        }
-        list->push_back(TrackedProcess{ref.pid, ref.creationTime});
     }
 
     static bool AnyTrackedAlive(const std::vector<TrackedProcess>& list) {
@@ -556,28 +579,22 @@ struct CpuLimiter::Impl {
         return false;
     }
 
-    // 创建一个新 Job：CPU hard cap + silent breakaway。先不打开 cap，
-    // 等进程都 Assign 完再打开，避免把 Assign 过程本身压到极慢。
-    HANDLE CreateAppJob() {
-        HANDLE job = CreateJobObjectW(nullptr, nullptr);
-        if (!job) return nullptr;
-        if (!EnableSilentBreakaway(job)) {
-            CloseHandle(job);
-            return nullptr;
+    static bool ContainsTracked(const std::vector<TrackedProcess>& list,
+                                DWORD pid, ULONGLONG creation) {
+        for (const TrackedProcess& t : list) {
+            if (t.pid == pid && t.creation == creation) return true;
         }
-        return job;
+        return false;
     }
 
-    // 把一个进程放进 Job。调用方负责 CloseHandle(proc)。
-    // 返回 0=失败，1=新加入，2=本来就在 Job 里。
-    int AssignVerifiedProcess(HANDLE job, const ProcessRef& ref,
-                              size_t* reusedPids, size_t* deniedPids,
-                              bool* critical) {
+    // 对一个进程启用 EcoQoS。成功时 out 记录恢复所需的原始状态。
+    bool ApplyProcess(DWORD pid, ULONGLONG creation, TrackedProcess* out,
+                      size_t* reusedPids, size_t* deniedPids,
+                      bool* critical) {
         DWORD err = ERROR_SUCCESS;
         HANDLE proc = OpenVerified(
-            ref.pid, ref.creationTime,
-            PROCESS_SET_QUOTA | PROCESS_TERMINATE |
-                PROCESS_QUERY_LIMITED_INFORMATION,
+            pid, creation,
+            PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
             &err);
         if (!proc) {
             if (err == ERROR_NOT_FOUND || err == ERROR_INVALID_PARAMETER) {
@@ -585,25 +602,59 @@ struct CpuLimiter::Impl {
             } else if (deniedPids) {
                 ++*deniedPids;
             }
-            return 0;
+            return false;
         }
         if (IsProcessCritical(proc)) {
             if (critical) *critical = true;
             CloseHandle(proc);
-            return 0;
+            return false;
         }
-        BOOL inJob = FALSE;
-        if (IsProcessInJob(proc, job, &inJob) && inJob) {
-            CloseHandle(proc);
-            return 2;
-        }
-        const BOOL ok = AssignProcessToJobObject(job, proc);
+        DWORD prevControl = 0;
+        DWORD prevState = 0;
+        const bool ok = EnableEcoQoS(proc, &prevControl, &prevState);
         CloseHandle(proc);
         if (!ok) {
             if (deniedPids) ++*deniedPids;
-            return 0;
+            return false;
         }
-        return 1;
+        out->pid = pid;
+        out->creation = creation;
+        out->prevControlMask = prevControl;
+        out->prevStateMask = prevState;
+        return true;
+    }
+
+    enum class RestoreOutcome { Restored, Gone, Failed };
+
+    // 恢复一个进程的原始 PowerThrottling 状态。进程已退出视为 Gone；
+    // 仍存活但恢复失败返回 Failed，调用方保留记录等待重试。
+    static RestoreOutcome RestoreOne(const TrackedProcess& t) {
+        DWORD err = ERROR_SUCCESS;
+        HANDLE proc = OpenVerified(
+            t.pid, t.creation,
+            PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+            &err);
+        if (!proc) {
+            if (err == ERROR_NOT_FOUND || err == ERROR_INVALID_PARAMETER) {
+                return RestoreOutcome::Gone;
+            }
+            return RestoreOutcome::Failed;
+        }
+        const bool ok =
+            RestorePowerState(proc, t.prevControlMask, t.prevStateMask);
+        CloseHandle(proc);
+        return ok ? RestoreOutcome::Restored : RestoreOutcome::Failed;
+    }
+
+    static std::vector<TrackedProcess> Rollback(
+        const std::vector<TrackedProcess>& tracked) {
+        std::vector<TrackedProcess> stuck;
+        for (const TrackedProcess& t : tracked) {
+            if (RestoreOne(t) == RestoreOutcome::Failed) {
+                stuck.push_back(t);
+            }
+        }
+        return stuck;
     }
 
     std::vector<LimitResult> LimitMany(
@@ -613,7 +664,7 @@ struct CpuLimiter::Impl {
         if (!initialized) {
             for (auto& r : results) {
                 r.code = LimitCode::Failed;
-                r.detail = L"Job Object CPU 限速不可用";
+                r.detail = L"EcoQoS/SetProcessInformation 不可用";
             }
             return results;
         }
@@ -628,21 +679,13 @@ struct CpuLimiter::Impl {
                 continue;
             }
             auto it = apps.find(key);
-            if (it != apps.end() && it->second.capOn) {
+            if (it != apps.end() && it->second.ecoOn) {
                 if (AnyTrackedAlive(it->second.processes)) {
                     results[i].code = LimitCode::AlreadyLimited;
                     continue;
                 }
-                // 跟踪的进程都退出了：先解除旧 cap（不能带着 cap 关句柄），
-                // 保留 Job 供本轮/下次复用。
-                if (it->second.job &&
-                    !ApplyCpuRate(it->second.job, false)) {
-                    results[i].code = LimitCode::Failed;
-                    results[i].detail = L"解除旧 CPU 限制失败";
-                    continue;
-                }
-                it->second.capOn = false;
-                it->second.processes.clear();
+                // 跟踪的进程都退出了：没有需要恢复的进程，直接丢掉条目。
+                apps.erase(it);
             }
             todo.push_back(i);
         }
@@ -670,7 +713,8 @@ struct CpuLimiter::Impl {
 
         for (size_t requestIndex : todo) {
             LimitResult& result = results[requestIndex];
-            const std::wstring key = NormalizePath(requests[requestIndex].appKey);
+            const std::wstring key =
+                NormalizePath(requests[requestIndex].appKey);
             const Selection sel = SelectAppProcesses(key, snapshot,
                                                     &foreignAppKeys);
             result.matched = sel.processes.size();
@@ -682,7 +726,7 @@ struct CpuLimiter::Impl {
             }
 
             // 最小年龄保护：只要有一个成员刚启动，就整组延后，避免把
-            // 正在初始化的应用压到 0.01%。
+            // 正在初始化的应用切到效率模式。
             ULONGLONG maxRetry100ns = 0;
             bool tooYoung = false;
             for (const ProcessRef& ref : sel.processes) {
@@ -702,101 +746,63 @@ struct CpuLimiter::Impl {
                 result.retryAfterMs =
                     static_cast<DWORD>(std::min<ULONGLONG>(retryMs + 100,
                                                           60000));
-                result.detail += L"；进程刚启动，延后限速";
+                result.detail += L"；进程刚启动，延后进入效率模式";
                 continue;
             }
 
-            auto entryIt = apps.find(key);
-            if (entryIt == apps.end()) {
-                AppEntry fresh;
-                fresh.job = CreateAppJob();
-                if (!fresh.job) {
-                    result.code = LimitCode::Failed;
-                    result.detail += L"；创建限速 Job 失败";
-                    continue;
-                }
-                entryIt = apps.emplace(key, std::move(fresh)).first;
-            } else if (!entryIt->second.job) {
-                entryIt->second.job = CreateAppJob();
-                if (!entryIt->second.job) {
-                    result.code = LimitCode::Failed;
-                    result.detail += L"；创建限速 Job 失败";
-                    continue;
-                }
-            }
-            AppEntry& entry = entryIt->second;
-
+            AppEntry& entry = apps[key];  // 不存在则默认构造
             std::vector<TrackedProcess> tracked;
             size_t added = 0;
-            size_t already = 0;
             size_t reused = 0;
             size_t denied = 0;
-            size_t exactLimited = 0;
+            size_t exactApplied = 0;
             bool critical = false;
             for (const ProcessRef& ref : sel.processes) {
-                const int status = AssignVerifiedProcess(
-                    entry.job, ref, &reused, &denied, &critical);
-                if (critical) break;
-                if (status == 1) ++added;
-                if (status == 2) ++already;
-                if (status != 0) {
-                    tracked.push_back(TrackedProcess{ref.pid, ref.creationTime});
-                    if (ref.exactMatch) ++exactLimited;
+                TrackedProcess t;
+                if (!ApplyProcess(ref.pid, ref.creationTime, &t, &reused,
+                                  &denied, &critical)) {
+                    if (critical) break;
+                    continue;
                 }
+                tracked.push_back(t);
+                ++added;
+                if (ref.exactMatch) ++exactApplied;
             }
 
-            if (critical) {
-                result.code = LimitCode::AccessDenied;
+            // 主进程一个都没进来：只把 helper 切到效率模式会形成“主进程
+            // 全速、子进程低功耗”的半吊子状态，整组回滚，等下一轮重试。
+            if (critical || exactApplied == 0) {
+                result.code = critical
+                                  ? LimitCode::AccessDenied
+                                  : (denied > 0 ? LimitCode::AccessDenied
+                                                : LimitCode::NoProcesses);
                 result.limited = 0;
                 result.skipped = sel.processes.size();
-                result.detail += L"；含受保护关键进程，放弃本组限速";
-                if (entry.job) {
-                    ApplyCpuRate(entry.job, false);
-                    CloseHandle(entry.job);
+                result.detail += critical
+                                     ? L"；含受保护关键进程，放弃本组"
+                                     : (denied > 0
+                                            ? L"；主进程无权限启用效率模式"
+                                            : L"；主进程已退出");
+                std::vector<TrackedProcess> stuck = Rollback(tracked);
+                if (!stuck.empty()) {
+                    entry.ecoOn = true;
+                    entry.processes = std::move(stuck);
+                } else {
+                    apps.erase(key);
                 }
-                apps.erase(key);
                 continue;
             }
 
-            // 主进程一个都没进来：只限制 helper 会形成“主进程全速、子进程
-            // 饿死”的半吊子状态，整组放弃，等下一轮重试。
-            if (exactLimited == 0) {
-                result.code = denied > 0 ? LimitCode::AccessDenied
-                                         : LimitCode::NoProcesses;
-                result.skipped = sel.processes.size();
-                result.detail += denied > 0
-                                     ? L"；主进程无权限加入 CPU 限制"
-                                     : L"；主进程已退出";
-                if (entry.job) {
-                    ApplyCpuRate(entry.job, false);
-                    CloseHandle(entry.job);
-                }
-                apps.erase(key);
-                continue;
-            }
-
-            if (!ApplyCpuRate(entry.job, true)) {
-                result.code = LimitCode::Failed;
-                result.skipped = sel.processes.size();
-                result.detail += L"；设置 CPU 硬限制失败";
-                ApplyCpuRate(entry.job, false);
-                CloseHandle(entry.job);
-                apps.erase(key);
-                continue;
-            }
-
-            entry.capOn = true;
+            entry.ecoOn = true;
             entry.processes = std::move(tracked);
             result.code = LimitCode::Limited;
             result.limited = entry.processes.size();
             result.skipped = sel.processes.size() - result.limited;
-            result.detail += L"；已限制 " + std::to_wstring(result.limited) +
-                             L" 个进程到 0.01% CPU";
+            result.detail += L"；已对 " +
+                             std::to_wstring(result.limited) +
+                             L" 个进程启用效率模式（EcoQoS）";
             if (added > 0) {
-                result.detail += L"，新加入 " + std::to_wstring(added);
-            }
-            if (already > 0) {
-                result.detail += L"，已在 Job " + std::to_wstring(already);
+                result.detail += L"，新启用 " + std::to_wstring(added);
             }
             if (reused > 0) {
                 result.detail += L"，已退出 " + std::to_wstring(reused);
@@ -817,8 +823,7 @@ struct CpuLimiter::Impl {
         for (const std::wstring& k : appKeys) {
             const std::wstring normalized = NormalizePath(k);
             auto it = apps.find(normalized);
-            if (it != apps.end() && it->second.capOn &&
-                it->second.job != nullptr) {
+            if (it != apps.end() && it->second.ecoOn) {
                 keys.push_back(normalized);
             }
         }
@@ -836,26 +841,29 @@ struct CpuLimiter::Impl {
         size_t totalAdded = 0;
         for (const std::wstring& key : keys) {
             auto entryIt = apps.find(key);
-            if (entryIt == apps.end() || !entryIt->second.capOn) continue;
+            if (entryIt == apps.end() || !entryIt->second.ecoOn) continue;
             const Selection sel = SelectAppProcesses(key, snapshot,
                                                     &foreignAppKeys);
             for (const ProcessRef& ref : sel.processes) {
+                if (ContainsTracked(entryIt->second.processes, ref.pid,
+                                    ref.creationTime)) {
+                    continue;
+                }
                 size_t denied = 0;
                 size_t reused = 0;
                 bool critical = false;
-                const int status = AssignVerifiedProcess(
-                    entryIt->second.job, ref, &reused, &denied, &critical);
-                if (critical) break;
-                if (status == 1) {
+                TrackedProcess t;
+                if (ApplyProcess(ref.pid, ref.creationTime, &t, &reused,
+                                 &denied, &critical)) {
+                    entryIt->second.processes.push_back(t);
                     ++totalAdded;
-                    AddTracked(&entryIt->second.processes, ref);
-                } else if (status == 2) {
-                    AddTracked(&entryIt->second.processes, ref);
                 }
+                if (critical) break;
             }
         }
         if (totalAdded > 0 && detail) {
-            *detail = L"已补限 " + std::to_wstring(totalAdded) + L" 个新进程";
+            *detail = L"已对 " + std::to_wstring(totalAdded) +
+                      L" 个新进程启用效率模式";
         }
         return totalAdded;
     }
@@ -863,32 +871,46 @@ struct CpuLimiter::Impl {
     bool Restore(const std::wstring& appKey, std::wstring* detail) {
         const std::wstring key = NormalizePath(appKey);
         auto it = apps.find(key);
-        if (it == apps.end() || !it->second.capOn) {
-            if (detail) *detail = L"未处于限速状态";
+        if (it == apps.end() || !it->second.ecoOn) {
+            if (detail) *detail = L"未处于效率模式";
             return true;
         }
-        if (!ApplyCpuRate(it->second.job, false)) {
-            if (detail) *detail = L"解除 CPU 限制失败";
-            return false;
+
+        std::vector<TrackedProcess> remain;
+        size_t restored = 0;
+        size_t failed = 0;
+        for (const TrackedProcess& t : it->second.processes) {
+            switch (RestoreOne(t)) {
+                case RestoreOutcome::Restored:
+                    ++restored;
+                    break;
+                case RestoreOutcome::Gone:
+                    break;
+                case RestoreOutcome::Failed:
+                    remain.push_back(t);
+                    ++failed;
+                    break;
+            }
         }
-        it->second.capOn = false;
-        // 解除后 Job 句柄仍保留，方便同一应用下次直接复用；若跟踪的
-        // 进程都已退出，关掉句柄释放资源（此时 cap 已关闭，安全）。
-        if (!AnyTrackedAlive(it->second.processes)) {
-            if (it->second.job) CloseHandle(it->second.job);
+        if (remain.empty()) {
             apps.erase(it);
         } else {
-            it->second.processes.clear();
+            it->second.processes = std::move(remain);
         }
-        if (detail) *detail = L"已解除 CPU 限制";
-        return true;
+        if (detail) {
+            *detail = L"已退出效率模式 " + std::to_wstring(restored);
+            if (failed > 0) {
+                *detail += L"，仍失败 " + std::to_wstring(failed);
+            }
+        }
+        return failed == 0;
     }
 
     void RestoreAll() {
         std::vector<std::wstring> keys;
         keys.reserve(apps.size());
         for (const auto& kv : apps) {
-            if (kv.second.capOn) keys.push_back(kv.first);
+            if (kv.second.ecoOn) keys.push_back(kv.first);
         }
         for (const std::wstring& key : keys) {
             Restore(key, nullptr);
@@ -897,13 +919,13 @@ struct CpuLimiter::Impl {
 
     bool IsLimited(const std::wstring& appKey) const {
         auto it = apps.find(NormalizePath(appKey));
-        return it != apps.end() && it->second.capOn;
+        return it != apps.end() && it->second.ecoOn;
     }
 
     size_t TrackedProcessCount() const {
         size_t n = 0;
         for (const auto& kv : apps) {
-            if (kv.second.capOn) n += kv.second.processes.size();
+            if (kv.second.ecoOn) n += kv.second.processes.size();
         }
         return n;
     }
@@ -912,7 +934,7 @@ struct CpuLimiter::Impl {
         std::vector<std::wstring> keys;
         keys.reserve(apps.size());
         for (const auto& kv : apps) {
-            if (kv.second.capOn) keys.push_back(kv.first);
+            if (kv.second.ecoOn) keys.push_back(kv.first);
         }
         std::sort(keys.begin(), keys.end());
         return keys;
@@ -1017,13 +1039,6 @@ struct CpuLimiter::Impl {
 
     void Shutdown() {
         RestoreAll();
-        for (auto& kv : apps) {
-            if (!kv.second.job) continue;
-            // 仍处于 capOn 的条目说明解除失败；不要关闭它的句柄（虽然
-            // 进程退出时 OS 仍会关，但至少不在代码里主动制造硬上限残留）。
-            if (!kv.second.capOn) CloseHandle(kv.second.job);
-            kv.second.job = nullptr;
-        }
         apps.clear();
     }
 };

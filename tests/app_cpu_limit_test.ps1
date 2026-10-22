@@ -1,11 +1,11 @@
-# app_cpu_limit_test.ps1 - 编译并运行 app_cpu_limit 的单元 + 真实 CPU 限速测试
+# app_cpu_limit_test.ps1 - 编译并运行 app_cpu_limit 的单元 + 真实效率模式测试
 #
 # 用法（脚本执行策略可能禁止直接运行）：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tests\app_cpu_limit_test.ps1
 #
 # 测试只操作临时目录里由测试自己派生/复制的 app.exe、helper.exe，不会碰
-# 系统里正在运行的其它应用。集成测试会真实创建 Job Object 并把两个忙循环
-# 进程限制到 0.01%，用 GetProcessTimes 的 CPU 时间增量验证限速/恢复。
+# 系统里正在运行的其它应用。集成测试会真实对两个忙循环进程调用
+# SetProcessInformation(ProcessPowerThrottling)，验证 EcoQoS 启用/恢复。
 
 param(
     [ValidateSet('Debug', 'Release')]

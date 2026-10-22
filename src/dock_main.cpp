@@ -42,14 +42,15 @@
 //      SW_RESTORE → SetWindowPos → SW_MAXIMIZE）。
 //      Dock 自身的贴底摆放/命中判定一律以整幅画面为准（不是工作区），
 //      否则会被自己预留出来的空间顶上去（越让越高的正反馈）。
-//   9. 后台应用 CPU 限速（默认关闭，右键菜单开启）：窗口全部最小化或
-//      纯托盘驻留（没有可见窗口）的应用，一旦不再处于顶栏焦点，就把
-//      它的 CPU 占用硬限制到 0.01%；还有可见且未最小化窗口的应用保持
-//      全速。按「同一 exe 的全部进程 + 安装目录树内的后代辅助进程」加入
-//      每个应用独立的 Job Object（见 app_cpu_limit.h），重新聚焦/交互时
-//      恢复。单个应用可在图标右键菜单勾选「不限制此应用 CPU」永久豁免。
+//   9. 后台应用效率模式（默认关闭，右键菜单开启）：窗口全部最小化或
+//      纯托盘驻留（没有可见窗口）的应用，一旦不再处于顶栏焦点，就把它的
+//      QoS 切到效率模式（EcoQoS，任务管理器同款），不冻结线程、不硬压
+//      CPU 配额，低级键盘/鼠标钩子仍能按时回调；还有可见且未最小化窗口
+//      的应用保持正常。按「同一 exe 的全部进程 + 安装目录树内的后代辅助
+//      进程」逐个启用（见 app_cpu_limit.h），重新聚焦/交互时恢复。单个
+//      应用可在图标右键菜单勾选「不对此应用启用效率模式」永久豁免。
 //      离开焦点有 1.2s 宽限，交互/关闭前先恢复，正常退出/组件重启时
-//      解除全部限制。
+//      恢复全部。
 //
 // 日志写入 ..\logs\dock.log
 
@@ -95,7 +96,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "app_cpu_limit.h"    // 后台应用 CPU 限速（进程归属判定 + 限速/恢复）
+#include "app_cpu_limit.h"    // 后台应用效率模式 EcoQoS（进程归属 + 启用/恢复）
 #include "fullscreen_guard.h"  // 全屏应用让位判定（与宿主托盘共用）
 #include "keep_top.h"         // 「保持顶栏」模式（注册表开关 + 预留区计算）
 #include "widgets.h"
@@ -157,19 +158,19 @@ constexpr int kMenuExit = 1001;
 constexpr int kMenuToggleAutoCollapse = 1002;  // 空白区右键：自动收起开关
 constexpr int kMenuToggleLog = 1003;           // 右键菜单：运行日志开关
 constexpr int kMenuToggleKeepTop = 1004;       // 右键菜单：「保持顶栏」模式开关
-constexpr int kMenuToggleCpuLimit = 1005;  // 右键菜单：后台应用 CPU 限速
-constexpr int kMenuToggleCpuLimitExclude = 1006;  // 图标菜单：不限制此应用
+constexpr int kMenuToggleCpuLimit = 1005;  // 右键菜单：后台应用效率模式
+constexpr int kMenuToggleCpuLimitExclude = 1006;  // 图标菜单：不启用效率模式
 constexpr int kDockStripHeightLogical = 2;     // 展开触发条高度（逻辑像素，与 Dock 同宽）
 constexpr UINT_PTR kTooltipTimerId = 4;        // 悬停提示一次性定时器（停帧模式下到期踢帧）
 constexpr UINT_PTR kCollapseWatchTimerId = 5;  // 收起状态监视（诊断专用：本应收起未收起）
 constexpr UINT_PTR kCpuLimitTimerId = 6;       // 后台应用：宽限期/延后重试一次性定时器
 constexpr UINT kCollapseWatchMs = 2000;        // 监视周期（2s，只记录不干预）
-// 焦点离开应用后先等一小段再限速：应用切换、启动器拉起主窗、顶栏目标
-// 短暂清空都可能产生一闪而过的“未聚焦”，立即压到 0.01% 会把切换过程卡住。
+// 焦点离开应用后先等一小段再启用效率模式：应用切换、启动器拉起主窗、
+// 顶栏目标短暂清空都可能产生一闪而过的“未聚焦”，立即切换会打断后台任务。
 constexpr ULONGLONG kLimitGraceMs = 1200;
 constexpr ULONGLONG kLimitLogRepeatMs = 30000;  // 同一应用失败日志限频
-// 限速中的应用新开 helper（或重启）时，Job 的 SILENT_BREAKAWAY_OK 不会
-// 自动收编它们。每 5s 做一次补挂，兼顾及时性与全进程枚举开销。
+// 效率模式应对新开的 helper（或重启）补启用：EcoQoS 不随进程创建继承。
+// 每 5s 做一次补挂，兼顾及时性与全进程枚举开销。
 constexpr ULONGLONG kLimitEnforceMs = 5000;
 
 // 事件驱动消息（WinEvent 回调/注册表监听线程 → 主窗口）
@@ -214,12 +215,12 @@ constexpr UINT kMsgFullscreen = WM_APP + 17;
 // wParam = 0 仅重读 / 1 强制打开 / 2 强制关闭。与 mywigets_main.cpp 同值。
 constexpr UINT kMsgDockKeepTopSet = WM_APP + 18;
 // → 顶栏：查询「顶栏当前焦点窗口」的 HWND（0 = 当前无聚焦应用）。
-// 后台应用 CPU 限速只认顶栏目标，而不是 GetForegroundWindow —— 目标被
+// 后台应用效率模式只认顶栏目标，而不是 GetForegroundWindow —— 目标被
 // 最小化后 Windows 会把前台自动让给别的应用，而顶栏按设计继续粘住目标。
 // 与 topbar_main.cpp 的 kDockTargetQueryMsg 同值。
 constexpr UINT kMsgTopBarTargetQuery = WM_APP + 19;
 // ← 顶栏：目标窗口发生变化（lParam = 新目标 HWND，0 = 无目标）。
-// Dock 收到后立即复核限速状态：新目标立刻恢复，旧目标进入宽限期。
+// Dock 收到后立即复核效率模式状态：新目标立刻恢复，旧目标进入宽限期。
 // 与 topbar_main.cpp 的 kDockTargetChangedMsg 同值。
 constexpr UINT kMsgTopBarTargetChanged = WM_APP + 20;
 
@@ -379,15 +380,15 @@ struct AppState {
     ULONGLONG runningExeCacheAt = 0;
     bool needsRedraw = true;
     bool autoCollapse = true;     // 自动收起开关（右键菜单，注册表持久化）
-    // ---- 后台应用 CPU 限速（默认关闭，右键菜单开启）----
+    // ---- 后台应用效率模式（默认关闭，右键菜单开启）----
     bool cpuLimitInactive = false;  // 开关（注册表持久化）
-    // 应用级限速豁免（图标右键菜单「不限制此应用 CPU」）：记录被用户
-    // 关闭了自动限速的应用 key（归一化 exe / 固定项 key）。值名沿用早期
-    // 版本的 SuspendException*，改版后旧勾选继续生效。
+    // 应用级效率模式豁免（图标右键菜单「不对此应用启用效率模式」）：记录
+    // 被用户关闭了自动效率模式的应用 key（归一化 exe / 固定项 key）。值名
+    // 沿用早期版本的 SuspendException*，改版后旧勾选继续生效。
     std::unordered_set<std::wstring> cpuLimitExceptions;
     std::unordered_map<std::wstring, ULONGLONG> limitSince;  // 未聚焦起点
     std::unordered_map<std::wstring, ULONGLONG> limitLogAt;  // 失败日志限频
-    ULONGLONG lastCpuLimitEnforce = 0;  // 上次补挂限速应用新进程的时刻
+    ULONGLONG lastCpuLimitEnforce = 0;  // 上次补启用效率模式新进程的时刻
     bool hideRequested = false;   // 收起目标态（光标离开 Dock / 触碰下缘触发条）
     float collapseOffset = 0;     // 当前收起偏移（0=展开，winH=完全滑出屏幕底）
     std::atomic<bool> menuOpen{false};  // 右键菜单打开期间不收起（低层钩子线程也会读取）
@@ -444,7 +445,7 @@ float DockBarBottomMargin(const AppState& s) {
 }
 
 AppState g_state;
-// CPU 限速控制器：每个应用一个常驻 Job，正常退出/组件重启时解除全部限制。
+// 后台应用效率模式控制器：逐个进程 SetProcessInformation；正常退出时恢复。
 appcpu::CpuLimiter g_cpuLimiter;
 
 // ============================== 字符串 / 路径工具 ==============================
@@ -719,8 +720,8 @@ void LoadConfig(AppState& s, bool* existed) {
     // 默认关闭，由 Dock 右键菜单显式开启；老配置没有该值时保持关闭。
     // 注册表值名沿用 SuspendInactive，避免升级后开关状态被重置。
     s.cpuLimitInactive = ReadRegDword(key, L"SuspendInactive", 0) != 0;
-    // 应用级限速豁免（图标右键菜单写入）：沿用 SuspendException* 值名，
-    // 兼容早期窗口最小化版留下的勾选，不让用户的“永不限速”设置丢失。
+    // 应用级效率模式豁免（图标右键菜单写入）：沿用 SuspendException* 值名，
+    // 兼容早期窗口最小化版留下的勾选，不让用户的“永不降速”设置丢失。
     const DWORD exceptionCount = std::clamp<DWORD>(
         ReadRegDword(key, L"SuspendExceptionCount", 0), 0, 500);
     for (DWORD i = 0; i < exceptionCount; ++i) {
@@ -3793,20 +3794,20 @@ bool AppOwnsForeground(const DockItem& item) {
     return false;
 }
 
-// ============================== 后台应用 CPU 限速 ==============================
+// ============================== 后台应用效率模式 ==============================
 //
 // 口径（详见 app_cpu_limit.h）：
 //   应用身份 = DockItem.key（归一化 exe 完整路径）
 //   进程集合 = 同 exe 的全部进程 + 安装目录树内由它们派生的辅助进程
-//   限速条件 = 窗口全部最小化，或纯托盘驻留（没有任何可见窗口）且用户
-//              未单独豁免；还有可见且未最小化窗口的应用不限速
+//   启用条件 = 窗口全部最小化，或纯托盘驻留（没有任何可见窗口）且用户
+//              未单独豁免；还有可见且未最小化窗口的应用保持正常
 // 顶栏焦点 = 顶栏当前 targetHwnd 所属的应用，而不是 GetForegroundWindow；
-// 但系统前台应用永远额外保护，避免顶栏粘住旧目标时把用户正在操作的应用限速。
+// 但系统前台应用永远额外保护，避免顶栏粘住旧目标时把用户正在操作的应用降速。
 //
 // 三条时间/安全边界：
 //   1. 焦点离开后等 kLimitGraceMs，避免切换瞬间的假“未聚焦”；
 //   2. 刚启动的进程由 CpuLimiter 的最小年龄保护挡下；
-//   3. UAC/锁屏安全桌面期间不发新的限速请求。
+//   3. UAC/锁屏安全桌面期间不发新的效率模式请求。
 
 HWND QueryTopBarTargetHwnd() {
     HWND bar = FindWindowW(L"DesktopTopBarWindow", nullptr);
@@ -3822,7 +3823,7 @@ HWND QueryTopBarTargetHwnd() {
 
 // 把一个窗口映射回 Dock 的分组 key：与 EnumAppWindowProc 完全同口径。
 // UWP 穿透 ApplicationFrameHost 取真实 CoreWindow 进程；Steam 等 UI 宿主
-// 辅助进程沿父链归并到宿主应用。返回空 = 该窗口不属于任何可限速应用。
+// 辅助进程沿父链归并到宿主应用。返回空 = 该窗口不属于任何可降速应用。
 std::wstring AppIdentityKeyForWindow(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd) || IsCloaked(hwnd)) return L"";
     if (IsShellSystemClass(hwnd)) return L"";
@@ -3853,13 +3854,13 @@ std::wstring AppIdentityKeyForWindow(HWND hwnd) {
     return identity;
 }
 
-// 该条目是否属于“可被限速的应用”（与是否正在运行无关：固定但未运行的
-// 应用也可以先设置偏好，启动后生效）。系统/套件进程本来就不会限速，
-// 不显示应用级开关。
+// 该条目是否属于“可切效率模式的应用”（与是否正在运行无关：固定但未
+// 运行的应用也可以先设置偏好，启动后生效）。系统/套件进程本来就不会
+// 降速，不显示应用级开关。
 bool IsCpuLimitAppItem(const DockItem& item) {
     const std::wstring base = ToLower(PathBasename(item.key));
-    // 只对真实 exe 应用显示开关：目录/未解析的 .lnk 固定项没有可限速的
-    // 进程，给它们显示“限速”开关只会让人误以为设置生效了。
+    // 只对真实 exe 应用显示开关：目录/未解析的 .lnk 固定项没有可降速的
+    // 进程，给它们显示“效率模式”开关只会让人误以为设置生效了。
     if (base.size() <= 4 ||
         base.compare(base.size() - 4, 4, L".exe") != 0) {
         return false;
@@ -3867,10 +3868,10 @@ bool IsCpuLimitAppItem(const DockItem& item) {
     return !IsSelfSuiteBinary(base) && !IsInfraBaseline(base);
 }
 
-// 用户是否在图标右键菜单里勾选了「不限制此应用」。同时检查运行 key 与
-// 固定项 key：名称合并后的条目（如钉钉 dingtalk.exe ↔ 启动器 lnk）两个
-// key 不同，任一命中都算用户已经豁免；旧版 SuspendException* 里也混有
-// 这两种 key。
+// 用户是否在图标右键菜单里勾选了「不对此应用启用效率模式」。同时检查
+// 运行 key 与固定项 key：名称合并后的条目（如钉钉 dingtalk.exe ↔ 启动器
+// lnk）两个 key 不同，任一命中都算用户已经豁免；旧版 SuspendException*
+// 里也混有这两种 key。
 bool IsCpuLimitExcluded(const AppState& s, const std::wstring& key,
                        const std::wstring& pinKey) {
     const std::wstring normalized = appcpu::NormalizePath(key);
@@ -3900,10 +3901,10 @@ bool AppWindowsAllMinimized(const DockItem& item) {
     return true;
 }
 
-// 限速条件：应用仍然打开（有窗口或托盘驻留）、所有窗口都已最小化或根本
-// 没有窗口、且没有被用户单独豁免。只要还有一张可见且未最小化的窗口就
-// 不限速 —— 用户正在看/随时会切回，压到 0.01% 会让界面无法操作；
-// 最小化表示用户暂时不用，和纯托盘应用一样可以限速。基础设施/套件除外。
+// 效率模式条件：应用仍然打开（有窗口或托盘驻留）、所有窗口都已最小化或
+// 根本没有窗口、且没有被用户单独豁免。只要还有一张可见且未最小化的窗口
+// 就保持正常 —— 用户正在看/随时会切回，切到效率模式会让界面明显变慢；
+// 最小化表示用户暂时不用，和纯托盘应用一样可以降速。基础设施/套件除外。
 bool ShouldManageAppCpuLimit(const AppState& s, const DockItem& item) {
     if (!IsCpuLimitAppItem(item)) return false;
     const bool excluded = IsCpuLimitExcluded(s, item.key, item.pinKey);
@@ -3911,8 +3912,8 @@ bool ShouldManageAppCpuLimit(const AppState& s, const DockItem& item) {
                                   !AppWindowsAllMinimized(item), excluded);
 }
 
-// UAC/锁屏会切到安全桌面：此时不做新的限速。否则 UAC 确认框背后的
-// 安装程序会被压到 0.01%，用户点“是”之后几乎等不到它继续。
+// UAC/锁屏会切到安全桌面：此时不做新的效率模式切换。否则 UAC 确认框
+// 背后的安装程序被降速后，用户点“是”之后会明显变慢。
 bool IsInteractiveDesktopAvailable() {
     HDESK desk = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
     if (!desk) return false;
@@ -3931,15 +3932,15 @@ bool IsLaunchPending(const AppState& s, const std::wstring& key) {
     return false;
 }
 
-// Dock 图标点击/菜单动作前先把应用解除限速，否则 0.01% 配额下窗口线程
-// 几乎不推进，SendMessageTimeout 聚焦/关窗都会超时。
+// Dock 图标点击/菜单动作前先把应用退出效率模式，否则被降速的窗口线程
+// 响应变慢，SendMessageTimeout 聚焦/关窗可能超时。
 bool EnsureAppRestoredForInteraction(AppState& s, const std::wstring& key) {
     if (!g_cpuLimiter.IsLimited(key)) return true;
     std::wstring detail;
     const bool ok = g_cpuLimiter.Restore(key, &detail);
     s.limitSince.erase(key);
-    Logf(ok ? L"[限速] 交互前恢复：%ls（%ls）"
-            : L"[限速] 交互前恢复失败：%ls（%ls）",
+    Logf(ok ? L"[效率] 交互前恢复：%ls（%ls）"
+            : L"[效率] 交互前恢复失败：%ls（%ls）",
          key.c_str(), detail.c_str());
     return ok;
 }
@@ -3957,7 +3958,7 @@ void LogLimitResultThrottled(AppState& s, const std::wstring& key,
     Logf(fmt, a.c_str(), b.c_str());
 }
 
-// 复核所有 Dock 应用的限速/恢复状态。restore 立即执行，limit 先过宽限期。
+// 复核所有 Dock 应用的效率模式/恢复状态。restore 立即执行，切换先过宽限期。
 // focusHint/useHint：顶栏目标变化消息直接带来的目标（避免再查询一次）；
 // 其余路径（2s 保底、开关切换）传 false 由本函数向顶栏查询。
 void ReconcileAppCpuLimit(AppState& s, HWND focusHint = nullptr,
@@ -3967,31 +3968,31 @@ void ReconcileAppCpuLimit(AppState& s, HWND focusHint = nullptr,
     if (!s.cpuLimitInactive) {
         if (g_cpuLimiter.TrackedProcessCount() > 0) {
             g_cpuLimiter.RestoreAll();
-            Logf(L"[限速] 功能关闭 → 已恢复全部被限速进程");
+            Logf(L"[效率] 功能关闭 → 已恢复全部效率模式进程");
         }
         s.limitSince.clear();
         return;
     }
 
     // 顶栏是“当前焦点”的唯一来源；顶栏被关掉时没有判定依据，恢复全部，
-    // 不能把“无顶栏”当成“所有应用都未聚焦”而限速整个后台。
+    // 不能把“无顶栏”当成“所有应用都未聚焦”而降速整个后台。
     if (!FindWindowW(L"DesktopTopBarWindow", nullptr)) {
         if (g_cpuLimiter.TrackedProcessCount() > 0) {
             g_cpuLimiter.RestoreAll();
-            Logf(L"[限速] 顶栏未运行 → 已恢复全部被限速进程");
+            Logf(L"[效率] 顶栏未运行 → 已恢复全部效率模式进程");
         }
         s.limitSince.clear();
         return;
     }
 
-    // 安全桌面/锁屏：只维持现状，不发新限速。等回到 Default 桌面后，
+    // 安全桌面/锁屏：只维持现状，不发新切换。等回到 Default 桌面后，
     // 下一次 2s 保底会继续。
     if (!IsInteractiveDesktopAvailable()) return;
 
     const HWND focusWnd = useHint ? focusHint : QueryTopBarTargetHwnd();
     const HWND foregroundWnd = GetForegroundWindow();
     const std::wstring focusKey = AppIdentityKeyForWindow(focusWnd);
-    // 安全兜底：即使顶栏还粘着旧目标，也绝不限速系统当前前台应用。
+    // 安全兜底：即使顶栏还粘着旧目标，也绝不把系统当前前台应用降速。
     const std::wstring foregroundKey =
         AppIdentityKeyForWindow(foregroundWnd);
     const DWORD focusPid = focusWnd ? PidOf(focusWnd) : 0;
@@ -4001,7 +4002,7 @@ void ReconcileAppCpuLimit(AppState& s, HWND focusHint = nullptr,
     if (!focusKey.empty()) keep.insert(focusKey);
     if (!foregroundKey.empty()) keep.insert(foregroundKey);
     // key 映射失败时的第二道保险：只要目标/前台窗口的进程出现在条目
-    // 已收集的窗口里，也按“聚焦”处理，绝不把用户正在看的应用限速。
+    // 已收集的窗口里，也按“聚焦”处理，绝不把用户正在看的应用降速。
     auto itemHasPid = [](const DockItem& item, DWORD pid) {
         if (pid == 0) return false;
         for (HWND w : item.windows) {
@@ -4020,13 +4021,13 @@ void ReconcileAppCpuLimit(AppState& s, HWND focusHint = nullptr,
         const std::wstring& key = item.key;
         if (!ShouldManageAppCpuLimit(s, item)) {
             // 还有可见且未最小化的窗口 / 用户已豁免 / 非后台应用：
-            // 绝不限速，且如果之前已被限速（条件在运行中发生了变化）
+            // 不启用效率模式，且如果之前已启用（条件在运行中发生了变化）
             // 立即恢复。
             if (g_cpuLimiter.IsLimited(key)) {
                 std::wstring detail;
                 g_cpuLimiter.Restore(key, &detail);
-                Logf(L"[限速] 不符合限速条件 → 恢复 %ls（%ls）", key.c_str(),
-                     detail.c_str());
+                Logf(L"[效率] 不符合效率模式条件 → 恢复 %ls（%ls）",
+                     key.c_str(), detail.c_str());
             }
             s.limitSince.erase(key);
             continue;
@@ -4039,8 +4040,8 @@ void ReconcileAppCpuLimit(AppState& s, HWND focusHint = nullptr,
             if (g_cpuLimiter.IsLimited(key)) {
                 std::wstring detail;
                 const bool ok = g_cpuLimiter.Restore(key, &detail);
-                Logf(ok ? L"[限速] 重新聚焦 → 恢复 %ls（%ls）"
-                        : L"[限速] 重新聚焦 → 恢复失败 %ls（%ls）",
+                Logf(ok ? L"[效率] 重新聚焦 → 恢复 %ls（%ls）"
+                        : L"[效率] 重新聚焦 → 恢复失败 %ls（%ls）",
                      key.c_str(), detail.c_str());
             }
             s.limitSince.erase(key);
@@ -4048,7 +4049,7 @@ void ReconcileAppCpuLimit(AppState& s, HWND focusHint = nullptr,
         }
 
         if (IsLaunchPending(s, key)) {
-            // 启动流程还没结束，绝不在这时候限速；启动完成后再从 0 计宽限。
+            // 启动流程还没结束，绝不在这时候切效率模式；启动完成后再从 0 计宽限。
             s.limitSince.erase(key);
             continue;
         }
@@ -4069,12 +4070,12 @@ void ReconcileAppCpuLimit(AppState& s, HWND focusHint = nullptr,
         dueNames.push_back(item.displayName);
     }
 
-    // 已经不在 Dock（应用退出/被隐藏）但仍处于限速表的 key：立即恢复。
+    // 已经不在 Dock（应用退出/被隐藏）但仍处于效率模式的 key：立即恢复。
     for (const std::wstring& key : g_cpuLimiter.LimitedKeys()) {
         if (managed.count(key)) continue;
         std::wstring detail;
         g_cpuLimiter.Restore(key, &detail);
-        Logf(L"[限速] 离开 Dock → 恢复 %ls（%ls）", key.c_str(),
+        Logf(L"[效率] 离开 Dock → 恢复 %ls（%ls）", key.c_str(),
              detail.c_str());
         s.limitSince.erase(key);
     }
@@ -4100,7 +4101,7 @@ void ReconcileAppCpuLimit(AppState& s, HWND focusHint = nullptr,
             const std::wstring& name = dueNames[i];
             switch (r.code) {
                 case appcpu::LimitCode::Limited:
-                    Logf(L"[限速] %ls：%ls（%ls）", name.c_str(),
+                    Logf(L"[效率] %ls：%ls（%ls）", name.c_str(),
                          r.detail.c_str(), key.c_str());
                     s.limitLogAt.erase(key);
                     break;
@@ -4116,14 +4117,14 @@ void ReconcileAppCpuLimit(AppState& s, HWND focusHint = nullptr,
                 case appcpu::LimitCode::AccessDenied:
                 case appcpu::LimitCode::Failed:
                     LogLimitResultThrottled(
-                        s, key, L"[限速] 跳过 %ls：%ls", name, r.detail);
+                        s, key, L"[效率] 跳过 %ls：%ls", name, r.detail);
                     break;
             }
         }
     }
 
-    // 限速中的应用可能新开 helper 或重启。Job 设置了 SILENT_BREAKAWAY_OK，
-    // 子进程不会自动继承限速，必须周期性按同一口径重新选中并加入 Job。
+    // 效率模式中的应用可能新开 helper 或重启。EcoQoS 不随进程创建继承，
+    // 必须周期性按同一口径重新选中并补启用。
     if (g_cpuLimiter.TrackedProcessCount() > 0 &&
         (s.lastCpuLimitEnforce == 0 ||
          now - s.lastCpuLimitEnforce >= kLimitEnforceMs)) {
@@ -4134,7 +4135,7 @@ void ReconcileAppCpuLimit(AppState& s, HWND focusHint = nullptr,
             const size_t added = g_cpuLimiter.EnforceLimited(
                 limited, allAppKeys, &enforceDetail);
             if (added > 0) {
-                Logf(L"[限速] %ls", enforceDetail.c_str());
+                Logf(L"[效率] %ls", enforceDetail.c_str());
             }
         }
     }
@@ -4153,21 +4154,21 @@ void ToggleCpuLimit(AppState& s) {
         g_cpuLimiter.RestoreAll();
         s.limitSince.clear();
         s.limitLogAt.clear();
-        Logf(L"[限速] 后台应用 CPU 限速：关闭 → 已恢复全部");
+        Logf(L"[效率] 后台应用效率模式：关闭 → 已恢复全部");
         return;
     }
-    Logf(L"[限速] 后台应用 CPU 限速：开启（窗口最小化或无窗口时；焦点离开 "
-         L"%llu ms 后限制到 0.01%）",
+    Logf(L"[效率] 后台应用效率模式：开启（窗口最小化或无窗口时；焦点离开 "
+         L"%llu ms 后启用 EcoQoS）",
          static_cast<unsigned long long>(kLimitGraceMs));
-    // 开启后不立即限速：Reconcile 会从当前时刻起算宽限期。
+    // 开启后不立即切换：Reconcile 会从当前时刻起算宽限期。
     ReconcileAppCpuLimit(s);
 }
 
-// 图标右键菜单「不限制此应用」：把应用 key 写入/移出豁免集合并持久化。
-// 有固定项 key（名称合并条目）时优先记 pinKey —— 与旧版 SuspendException*
-// 的存法一致，也保证不同运行 key（启动器/主程序）都能命中。勾选时如果
-// 该应用正被限速，立即恢复（用户的本意就是别压它）；取消勾选后交给
-// Reconcile 重新计宽限期，不会瞬间压到 0.01%。
+// 图标右键菜单「不对此应用启用效率模式」：把应用 key 写入/移出豁免集合
+// 并持久化。有固定项 key（名称合并条目）时优先记 pinKey —— 与旧版
+// SuspendException* 的存法一致，也保证不同运行 key（启动器/主程序）都能
+// 命中。勾选时如果该应用正被降速，立即恢复；取消勾选后交给 Reconcile
+// 重新计宽限期。
 void ToggleCpuLimitExclude(AppState& s, const std::wstring& appKey,
                           const std::wstring& pinKey,
                           const std::wstring& displayName) {
@@ -4185,7 +4186,7 @@ void ToggleCpuLimitExclude(AppState& s, const std::wstring& appKey,
         s.limitSince.erase(key);
         if (!normalizedPin.empty()) s.limitSince.erase(normalizedPin);
         SaveConfig(s);
-        Logf(L"[限速] 应用级开关：%ls → 恢复自动限速（%ls）",
+        Logf(L"[效率] 应用级开关：%ls → 恢复自动效率模式（%ls）",
              displayName.c_str(), storedKey.c_str());
         ReconcileAppCpuLimit(s);
         return;
@@ -4199,11 +4200,11 @@ void ToggleCpuLimitExclude(AppState& s, const std::wstring& appKey,
     if (g_cpuLimiter.IsLimited(key)) {
         std::wstring detail;
         const bool ok = g_cpuLimiter.Restore(key, &detail);
-        Logf(ok ? L"[限速] 应用级开关：%ls → 永不限速，已恢复（%ls）"
-                : L"[限速] 应用级开关：%ls → 永不限速，恢复失败（%ls）",
+        Logf(ok ? L"[效率] 应用级开关：%ls → 永不启用效率模式，已恢复（%ls）"
+                : L"[效率] 应用级开关：%ls → 永不启用效率模式，恢复失败（%ls）",
              displayName.c_str(), detail.c_str());
     } else {
-        Logf(L"[限速] 应用级开关：%ls → 永不限速（%ls）",
+        Logf(L"[效率] 应用级开关：%ls → 永不启用效率模式（%ls）",
              displayName.c_str(), storedKey.c_str());
     }
     ReconcileAppCpuLimit(s);
@@ -4490,7 +4491,7 @@ void RequestCloseByIndex(AppState& s, size_t idx) {
     const std::wstring displayName = item.displayName;
     const bool pinned = item.pinned;
 
-    // 被限速的进程处理 WM_CLOSE 极慢；先恢复再走优雅关闭，失败也没关系，
+    // 被降速的进程处理 WM_CLOSE 可能变慢；先恢复再走优雅关闭，失败也没关系，
     // 后面的超时 TerminateProcess 对内核对过创建时间，仍能安全终止。
     EnsureAppRestoredForInteraction(s, key);
 
@@ -5493,7 +5494,7 @@ void TrayIconTriggerAsync(AppState& s, const std::wstring& nameHint,
 void WakeTrayOnlyApp(AppState& s, size_t idx) {
     DockItem& item = s.items[idx];
     if (!EnsureAppRestoredForInteraction(s, item.key)) {
-        Logf(L"托盘唤起已取消：%ls 仍处于限速态且恢复失败",
+        Logf(L"托盘唤起已取消：%ls 仍处于效率模式且恢复失败",
              item.displayName.c_str());
         return;
     }
@@ -5695,10 +5696,10 @@ void ToggleFocusOrLaunch(AppState& s, size_t idx) {
     if (idx >= s.items.size()) return;
     DockItem& item = s.items[idx];
 
-    // 点击被限速的应用 = 用户要切过去：先恢复，否则随后的
+    // 点击被降速的应用 = 用户要切过去：先恢复，否则随后的
     // SendMessageTimeout(SC_RESTORE)/SetForegroundWindow 都会打空。
     if (!EnsureAppRestoredForInteraction(s, item.key)) {
-        Logf(L"切换已取消：%ls 仍处于限速态且恢复失败",
+        Logf(L"切换已取消：%ls 仍处于效率模式且恢复失败",
              item.displayName.c_str());
         return;
     }
@@ -6143,14 +6144,14 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
         AppendMenuW(menu, MF_STRING, hidId, L"从 Dock 隐藏此后台程序");
     }
 
-    // 应用级 CPU 限速开关：勾选 = 该应用永不自动限速（如果当前正被限速，
-    // 立即恢复）；取消勾选 = 重新允许“窗口全部最小化/无窗口时限制到 0.01%”。
-    // 系统/套件进程本来就不会限速，不显示这个容易误解的开关。
+    // 应用级效率模式开关：勾选 = 该应用永不自动切效率模式（如果当前正被
+    // 降速，立即恢复）；取消勾选 = 重新允许“窗口全部最小化/无窗口时启用”。
+    // 系统/套件进程本来就不会降速，不显示这个容易误解的开关。
     if (limitSupported) {
         AppendMenuW(menu,
                     MF_STRING | (limitExcluded ? MF_CHECKED : MF_UNCHECKED),
                     kMenuToggleCpuLimitExclude,
-                    L"不限制此应用 CPU（后台保持运行）");
+                    L"不对此应用启用效率模式（后台保持正常）");
     }
 
     // 打开文件位置（固定项有意义：定位到 lnk/exe）
@@ -6170,7 +6171,7 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
     AppendMenuW(menu,
                 MF_STRING | (s.cpuLimitInactive ? MF_CHECKED : MF_UNCHECKED),
                 kMenuToggleCpuLimit,
-                L"限制后台应用 CPU（窗口最小化或无窗口时限制到 0.01%，切回恢复）");
+                L"后台应用效率模式（窗口最小化或无窗口时启用 EcoQoS，切回恢复）");
     AppendMenuW(menu,
                 MF_STRING | (g_logEnabled.load(std::memory_order_relaxed)
                                  ? MF_CHECKED
@@ -6292,7 +6293,7 @@ void ShowBlankContextMenu(AppState& s) {
     AppendMenuW(menu,
                 MF_STRING | (s.cpuLimitInactive ? MF_CHECKED : MF_UNCHECKED),
                 kMenuToggleCpuLimit,
-                L"限制后台应用 CPU（窗口最小化或无窗口时限制到 0.01%，切回恢复）");
+                L"后台应用效率模式（窗口最小化或无窗口时启用 EcoQoS，切回恢复）");
     AppendMenuW(menu,
                 MF_STRING | (g_logEnabled.load(std::memory_order_relaxed)
                                  ? MF_CHECKED
@@ -6495,7 +6496,7 @@ void DoPoll(AppState& s) {
     HealMinimizedSuiteWindows();   // 保底（正常由 WinEvent 即时触发）
     RefreshPrimaryWorkArea();      // 保底刷新工作区缓存（分辨率/任务栏变化）
     UpdateFullscreenState(s);      // 全屏让位保底复核（事件路径之外的兜底）
-    ReconcileAppCpuLimit(s);     // 限速状态保底复核（事件路径之外的兜底）
+    ReconcileAppCpuLimit(s);     // 效率模式状态保底复核（事件路径之外的兜底）
     // 停帧安全网：收起偏移与目标不一致说明事件路径漏踢帧，重启帧驱动
     if (s.collapseOffset != CollapseTargetOf(s)) SetFrameCadence(s, true);
     if (s.needsRedraw) {
@@ -6622,7 +6623,7 @@ bool ReloadDockConfigFromRegistry(AppState& s) {
             s.limitSince.clear();
             s.limitLogAt.clear();
         }
-        Logf(L"[限速] 配置被外部改为 %d", s.cpuLimitInactive ? 1 : 0);
+        Logf(L"[效率] 配置被外部改为 %d", s.cpuLimitInactive ? 1 : 0);
         changed = true;
     }
     return changed;
@@ -7058,7 +7059,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         UpdateKeepTopWorkArea(*s, /*refitMaximized=*/true);
                     }
                 }
-                // 后台应用 CPU 限速：放在配置重读之后，外部把开关改掉时
+                // 后台应用效率模式：放在配置重读之后，外部把开关改掉时
                 // 同一拍就能生效；顶栏目标消息丢失、应用新开辅助进程等
                 // 情况也在这里保底复核（幂等；宽限计时在 Reconcile 内）。
                 ReconcileAppCpuLimit(*s);
@@ -7105,7 +7106,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         // 顶栏目标变化（lParam = 新目标 HWND）：新目标立即恢复，旧目标
-        // 进入宽限期。比等 2s 保底及时得多，也避免在切换瞬间限速。
+        // 进入宽限期。比等 2s 保底及时得多，也避免在切换瞬间降速。
         case kMsgTopBarTargetChanged:
             ReconcileAppCpuLimit(*s, reinterpret_cast<HWND>(lParam), true);
             return 0;
@@ -7158,8 +7159,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd, kSafetyTimerId);
             KillTimer(hwnd, kCollapseWatchTimerId);
             KillTimer(hwnd, kCpuLimitTimerId);
-            // 退出前必须解除所有 CPU 限速；Job 的 hard cap 会附着在进程上，
-            // 带着 cap 关句柄会让应用永久停在 0.01%（只能重启应用恢复）。
+            // 退出前恢复所有自己启用过效率模式的进程。
             g_cpuLimiter.RestoreAll();
             UninstallDockWinEventHook();
             UninstallShowDesktopHook();
@@ -7195,8 +7195,8 @@ namespace {
 // 进程内重启（托盘关闭后再次打开）时重建全部全局状态：
 // g_state 里累积的 items/geoms/orderMap/缓存等都来自上一运行周期。
 void ResetDockGlobalsForRestart() {
-    // 组件重启（托盘里关掉 Dock 再打开）时，上一轮若还在限速某些应用，
-    // 先全部解除，避免新实例启动时应用仍停在 0.01%。
+    // 组件重启（托盘里关掉 Dock 再打开）时，上一轮若还对某些应用启用了
+    // 效率模式，先全部恢复，避免新实例启动时应用仍处于低功耗状态。
     g_cpuLimiter.RestoreAll();
     g_state.~AppState();
     ::new (static_cast<void*>(&g_state)) AppState();
@@ -7246,15 +7246,15 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
     }
     LogInit();
     if (DedupePins(s)) SaveConfig(s);  // 去重后立即持久化（收敛历史重复固定项）
-    Logf(L"配置载入：固定 %zu 项，隐藏 %zu 项，CPU 限速豁免 %zu 项，"
-         L"后台应用 CPU 限速=%d",
+    Logf(L"配置载入：固定 %zu 项，隐藏 %zu 项，效率模式豁免 %zu 项，"
+         L"后台应用效率模式=%d",
          s.pins.size(), s.hiddenKeys.size(), s.cpuLimitExceptions.size(),
          s.cpuLimitInactive ? 1 : 0);
 
-    // CPU 限速控制器初始化。Windows 7 没有 Job CPU rate control，功能降级
-    // 为关闭；之后仍尝试恢复旧版“挂起”留下的残留进程（升级清理）。
+    // 效率模式控制器初始化。Windows 7 没有 SetProcessInformation，功能
+    // 降级为关闭；之后仍尝试恢复旧版“挂起”留下的残留进程（升级清理）。
     if (!g_cpuLimiter.Initialize()) {
-        Logf(L"[限速] Job Object CPU rate control 不可用，功能降级为关闭");
+        Logf(L"[效率] SetProcessInformation/EcoQoS 不可用，功能降级为关闭");
         s.cpuLimitInactive = false;
     }
     {
@@ -7262,7 +7262,7 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
         const size_t recovered =
             g_cpuLimiter.RecoverLegacySuspended(&recoveredDetail);
         if (recovered > 0 || !recoveredDetail.empty()) {
-            Logf(L"[限速] 旧版挂起残留：%ls", recoveredDetail.c_str());
+            Logf(L"[效率] 旧版挂起残留：%ls", recoveredDetail.c_str());
         }
     }
 
@@ -7354,7 +7354,7 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
 
     KillTimer(s.hwnd, kFrameTimerId);
     KillTimer(s.hwnd, kCpuLimitTimerId);
-    g_cpuLimiter.RestoreAll();  // 幂等兜底：确保没有进程被留在限速态
+    g_cpuLimiter.RestoreAll();  // 幂等兜底：确保没有进程被留在效率模式
     UninstallShowDesktopHook();
     delete s.uiFont;
     ClearIconCache(s);
