@@ -53,12 +53,15 @@
 //     ControlMask |= EXECUTION_SPEED，StateMask |= EXECUTION_SPEED。
 //   - 记录启用前的 ControlMask/StateMask；恢复时原样写回，不把用户或系统
 //     本来设置好的效率模式误关掉。
-//   - 子进程不会继承 EcoQoS。本实现不做周期轮询：只对应用进入效率模式
-//     当时选中的进程生效；之后新开的 helper 需要等应用重新进入效率模式
-//     （重新聚焦后再最小化/收托盘）时由 LimitMany 重新选中。
-//   - 不使用 Job Object，不存在“崩溃后硬上限留在进程上”的问题。正常退出/
-//     组件重启会恢复全部；Dock 被强杀时应用最多停在低功耗效率模式，仍然
-//     可响应输入，下次启动/重新聚焦时会恢复。
+//   - 子进程不会继承 EcoQoS。为覆盖应用之后新开的 helper，本模块给每个
+//     应用挂一个 **无任何限制** 的 Job Object，并关联 I/O 完成端口；
+//     子进程创建时系统发送 JOB_OBJECT_MSG_NEW_PROCESS，监控线程只把
+//     (appId,pid) PostMessage 给 Dock，由 UI 线程补启用 EcoQoS。
+//     这是事件驱动，不做定时轮询。Job 只用于进程创建通知，不设置 CPU/
+//     内存/UI 限制，并允许 CREATE_BREAKAWAY_FROM_JOB 的进程照常脱离。
+//   - 不使用 Job 的 CPU 硬上限，不存在“崩溃后硬上限留在进程上”的问题。
+//     正常退出/组件重启会恢复全部；Dock 被强杀时应用最多停在低功耗效率
+//     模式，仍然可响应输入，下次启动/重新聚焦时会恢复。
 //
 // 安全边界（由 Dock 在调用前再叠加一层）：
 //   - 只把「没有可见窗口」（窗口全部最小化或纯托盘）且未被用户豁免的
@@ -81,6 +84,10 @@
 #include <vector>
 
 namespace appcpu {
+
+// 监控线程 → Dock 主窗口：应用的监控 Job 里出现了新进程。
+// wParam = appId，lParam = pid。
+constexpr UINT kCpuLimitNewProcessMessage = WM_APP + 21;
 
 // 进程快照中的一项。imagePath 为归一化小写完整路径；creationTime 为
 // FILETIME 的 64 位值（100ns），0 表示查询失败。
@@ -183,6 +190,17 @@ public:
 
     bool Initialize();
 
+    // 在 Dock 主窗口创建后调用：创建 I/O 完成端口并启动一次监控线程，
+    // 线程阻塞在 GetQueuedCompletionStatus 上等待
+    // JOB_OBJECT_MSG_NEW_PROCESS，不做任何轮询。组件重启时再次调用只更新
+    // 通知窗口，不重复建线程。
+    void StartMonitoring(HWND notifyWnd);
+
+    // 监控线程收到新进程事件后，把 (appId, pid) PostMessage 给 Dock 主
+    // 窗口；由 UI 线程调用本函数校验 PID 是否属于该应用（同 exe 或安装
+    // 目录树内的 helper），是则补启用 EcoQoS。返回是否新切换了进程。
+    bool OnNewProcess(uintptr_t appId, DWORD pid);
+
     // 一次快照处理多个应用，避免桌面/无焦点时逐个应用重复枚举全进程。
     // 返回与 requests 一一对应的结果。
     // allAppKeys = Dock 当前全部应用 key（含固定但未运行的），用于让
@@ -193,11 +211,9 @@ public:
         const std::vector<LimitRequest>& requests,
         const std::vector<std::wstring>& allAppKeys = {});
 
-    // 注意：EcoQoS 不随进程创建继承。本实现不做轮询，只对进入效率模式
-    // 当时选中的进程生效；之后新开的 helper 需要等应用重新进入效率模式
-    //（重新聚焦后再最小化/收托盘）时由 LimitMany 重新选中。
-    // 如需“新 helper 出现即生效”且不轮询，可改用 Job Object 完成端口的
-    // JOB_OBJECT_MSG_NEW_PROCESS 事件（本项目暂不引入该线程）。
+    // 注意：EcoQoS 不随进程创建继承。启用时先把当前进程加入“仅通知”的
+    // Job；之后应用新开的 helper 会通过 JOB_OBJECT_MSG_NEW_PROCESS 事件
+    // 触发 OnNewProcess，由 UI 线程补启用，不做定时轮询。
 
     // 退出该应用的效率模式。个别进程已退出视为成功；恢复失败会保留记录，
     // 等待下次重试。

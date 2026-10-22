@@ -15,10 +15,12 @@
 #include <tlhelp32.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
 #include <queue>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -553,10 +555,27 @@ struct CpuLimiter::Impl {
     NtResumeProcessFn resumeFn = nullptr;
 
     struct AppEntry {
+        uintptr_t id = 0;       // 完成端口 CompletionKey
+        HANDLE job = nullptr;   // 仅用于进程创建通知，不设任何限制
         bool ecoOn = false;
+        std::wstring key;
+        std::wstring installRoot;
+        bool broadRoot = false;
         std::vector<TrackedProcess> processes;
     };
     std::unordered_map<std::wstring, AppEntry> apps;
+
+    // 事件驱动监控：一个完成端口 + 一个阻塞线程，所有 Job 共用。
+    HANDLE ioPort = nullptr;
+    std::thread monitorThread;
+    bool monitorStarted = false;
+    std::atomic<HWND> notifyWnd{nullptr};
+    static constexpr ULONG_PTR kMonitorStopKey =
+        static_cast<ULONG_PTR>(-1);
+    uintptr_t nextAppId = 1;
+    std::unordered_map<uintptr_t, std::wstring> idToKey;
+    // 最近一次 LimitMany 传入的 Dock 全部应用 key，用于新 helper 归属校验。
+    std::unordered_set<std::wstring> foreignKeys;
 
     explicit Impl(ULONGLONG minAge) : minProcessAgeMs(minAge) {}
 
@@ -572,6 +591,79 @@ struct CpuLimiter::Impl {
         return initialized;
     }
 
+    void StartMonitoring(HWND wnd) {
+        notifyWnd.store(wnd);
+        if (monitorStarted) return;
+        ioPort = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
+        if (!ioPort) return;
+        try {
+            monitorThread = std::thread([this]() { MonitorLoop(); });
+            monitorStarted = true;
+        } catch (...) {
+            monitorStarted = false;
+            CloseHandle(ioPort);
+            ioPort = nullptr;
+        }
+    }
+
+    // 只阻塞等待 Job 通知，不做任何定时轮询。
+    void MonitorLoop() {
+        for (;;) {
+            DWORD bytes = 0;
+            ULONG_PTR key = 0;
+            LPOVERLAPPED overlapped = nullptr;
+            if (!GetQueuedCompletionStatus(ioPort, &bytes, &key, &overlapped,
+                                           INFINITE)) {
+                if (!ioPort) break;
+                continue;
+            }
+            if (key == kMonitorStopKey) break;
+            if (bytes != JOB_OBJECT_MSG_NEW_PROCESS) continue;
+            const DWORD pid = static_cast<DWORD>(
+                reinterpret_cast<uintptr_t>(overlapped));
+            if (pid == 0) continue;
+            HWND wnd = notifyWnd.load();
+            if (wnd) {
+                PostMessageW(wnd, kCpuLimitNewProcessMessage,
+                             static_cast<WPARAM>(key),
+                             static_cast<LPARAM>(pid));
+            }
+        }
+    }
+
+    // 创建一个只做进程创建通知的 Job：BREAKAWAY_OK 允许应用照常使用
+    // CREATE_BREAKAWAY_FROM_JOB；不设置任何 CPU/内存/UI 限制。
+    HANDLE CreateAppJob(AppEntry& entry) {
+        if (!ioPort || entry.id == 0) return nullptr;
+        HANDLE job = CreateJobObjectW(nullptr, nullptr);
+        if (!job) return nullptr;
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION ext{};
+        ext.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                     &ext, sizeof(ext))) {
+            CloseHandle(job);
+            return nullptr;
+        }
+        JOBOBJECT_ASSOCIATE_COMPLETION_PORT portInfo{};
+        portInfo.CompletionKey = reinterpret_cast<PVOID>(entry.id);
+        portInfo.CompletionPort = ioPort;
+        if (!SetInformationJobObject(job,
+                                     JobObjectAssociateCompletionPortInformation,
+                                     &portInfo, sizeof(portInfo))) {
+            CloseHandle(job);
+            return nullptr;
+        }
+        return job;
+    }
+
+    static bool TrackedContains(const std::vector<TrackedProcess>& list,
+                                DWORD pid, ULONGLONG creation) {
+        for (const TrackedProcess& t : list) {
+            if (t.pid == pid && t.creation == creation) return true;
+        }
+        return false;
+    }
+
     static bool AnyTrackedAlive(const std::vector<TrackedProcess>& list) {
         for (const TrackedProcess& t : list) {
             if (TrackedAlive(t)) return true;
@@ -579,9 +671,11 @@ struct CpuLimiter::Impl {
         return false;
     }
 
-    // 对一个进程启用 EcoQoS。成功时 out 记录恢复所需的原始状态。
-    bool ApplyProcess(DWORD pid, ULONGLONG creation, TrackedProcess* out,
-                      size_t* reusedPids, size_t* deniedPids,
+    // 对一个进程启用 EcoQoS，并尽量把它加入应用的“仅通知”Job。
+    // 成功时 out 记录恢复所需的原始状态。Job 加入失败不影响 EcoQoS。
+    bool ApplyProcess(DWORD pid, ULONGLONG creation, HANDLE job,
+                      TrackedProcess* out, size_t* reusedPids,
+                      size_t* deniedPids, size_t* monitorDenied,
                       bool* critical) {
         DWORD err = ERROR_SUCCESS;
         HANDLE proc = OpenVerified(
@@ -608,6 +702,25 @@ struct CpuLimiter::Impl {
         if (!ok) {
             if (deniedPids) ++*deniedPids;
             return false;
+        }
+        if (job) {
+            DWORD jobErr = ERROR_SUCCESS;
+            HANDLE jobProc = OpenVerified(
+                pid, creation,
+                PROCESS_SET_QUOTA | PROCESS_TERMINATE |
+                    PROCESS_QUERY_LIMITED_INFORMATION,
+                &jobErr);
+            if (!jobProc) {
+                if (monitorDenied) ++*monitorDenied;
+            } else {
+                BOOL inJob = FALSE;
+                if (!IsProcessInJob(jobProc, job, &inJob) || !inJob) {
+                    if (!AssignProcessToJobObject(job, jobProc)) {
+                        if (monitorDenied) ++*monitorDenied;
+                    }
+                }
+                CloseHandle(jobProc);
+            }
         }
         out->pid = pid;
         out->creation = creation;
@@ -676,17 +789,19 @@ struct CpuLimiter::Impl {
                     results[i].code = LimitCode::AlreadyLimited;
                     continue;
                 }
-                // 跟踪的进程都退出了：没有需要恢复的进程，直接丢掉条目。
-                apps.erase(it);
+                // 跟踪的进程都退出了：没有需要恢复的进程。保留 Job 句柄
+                // 和 id（继续接收后续进程创建事件，下次启用直接复用）。
+                it->second.ecoOn = false;
+                it->second.processes.clear();
             }
             todo.push_back(i);
         }
         if (todo.empty()) return results;
 
-        std::unordered_set<std::wstring> foreignAppKeys;
+        foreignKeys.clear();
         for (const std::wstring& k : allAppKeys) {
             const std::wstring normalized = NormalizePath(k);
-            if (!normalized.empty()) foreignAppKeys.insert(normalized);
+            if (!normalized.empty()) foreignKeys.insert(normalized);
         }
 
         const std::vector<ProcessEntry> snapshot = SnapshotProcesses();
@@ -708,7 +823,7 @@ struct CpuLimiter::Impl {
             const std::wstring key =
                 NormalizePath(requests[requestIndex].appKey);
             const Selection sel = SelectAppProcesses(key, snapshot,
-                                                    &foreignAppKeys);
+                                                    &foreignKeys);
             result.matched = sel.processes.size();
             result.detail = sel.note;
 
@@ -742,17 +857,40 @@ struct CpuLimiter::Impl {
                 continue;
             }
 
-            AppEntry& entry = apps[key];  // 不存在则默认构造
+            auto entryIt = apps.find(key);
+            if (entryIt == apps.end()) {
+                AppEntry fresh;
+                fresh.key = key;
+                fresh.id = nextAppId++;
+                fresh.installRoot =
+                    InstallRootForApp(key, &fresh.broadRoot);
+                fresh.job = CreateAppJob(fresh);
+                entryIt = apps.emplace(key, std::move(fresh)).first;
+                idToKey[entryIt->second.id] = key;
+            } else if (!entryIt->second.job) {
+                entryIt->second.key = key;
+                if (entryIt->second.id == 0) {
+                    entryIt->second.id = nextAppId++;
+                }
+                entryIt->second.installRoot =
+                    InstallRootForApp(key, &entryIt->second.broadRoot);
+                entryIt->second.job = CreateAppJob(entryIt->second);
+                idToKey[entryIt->second.id] = key;
+            }
+            AppEntry& entry = entryIt->second;
+
             std::vector<TrackedProcess> tracked;
             size_t added = 0;
             size_t reused = 0;
             size_t denied = 0;
+            size_t monitorDenied = 0;
             size_t exactApplied = 0;
             bool critical = false;
             for (const ProcessRef& ref : sel.processes) {
                 TrackedProcess t;
-                if (!ApplyProcess(ref.pid, ref.creationTime, &t, &reused,
-                                  &denied, &critical)) {
+                if (!ApplyProcess(ref.pid, ref.creationTime, entry.job, &t,
+                                  &reused, &denied, &monitorDenied,
+                                  &critical)) {
                     if (critical) break;
                     continue;
                 }
@@ -802,8 +940,86 @@ struct CpuLimiter::Impl {
             if (denied > 0) {
                 result.detail += L"，无权限 " + std::to_wstring(denied);
             }
+            if (monitorDenied > 0) {
+                result.detail += L"，无法加入进程监控 " +
+                                 std::to_wstring(monitorDenied);
+            }
         }
         return results;
+    }
+
+    // 处理 JOB_OBJECT_MSG_NEW_PROCESS：只对“同 exe 或安装目录树内”的
+    // helper 补启用 EcoQoS。外部的浏览器/终端虽然也继承了监控 Job，但
+    // 会被这里过滤掉，不会降速。
+    bool OnNewProcess(uintptr_t appId, DWORD pid) {
+        if (!initialized || pid == 0) return false;
+        auto idIt = idToKey.find(appId);
+        if (idIt == idToKey.end()) return false;
+        auto entryIt = apps.find(idIt->second);
+        if (entryIt == apps.end() || !entryIt->second.ecoOn ||
+            !entryIt->second.job) {
+            return false;
+        }
+        AppEntry& entry = entryIt->second;
+
+        HANDLE proc = OpenProcess(
+            PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+            FALSE, pid);
+        if (!proc) return false;
+        ULONGLONG creation = 0;
+        if (!QueryCreationTime(proc, &creation) || creation == 0) {
+            CloseHandle(proc);
+            return false;
+        }
+        if (TrackedContains(entry.processes, pid, creation)) {
+            CloseHandle(proc);
+            return false;
+        }
+        BOOL inJob = FALSE;
+        if (!IsProcessInJob(proc, entry.job, &inJob) || !inJob) {
+            CloseHandle(proc);
+            return false;
+        }
+
+        wchar_t image[32768] = {};
+        DWORD imageLen = 32760;
+        if (!QueryFullProcessImageNameW(proc, 0, image, &imageLen) ||
+            imageLen == 0) {
+            CloseHandle(proc);
+            return false;
+        }
+        const std::wstring path = NormalizePath(image);
+        if (path.empty()) {
+            CloseHandle(proc);
+            return false;
+        }
+        if (path != entry.key) {
+            if (foreignKeys.count(path) != 0) {
+                CloseHandle(proc);
+                return false;
+            }
+            const bool sameDir =
+                !entry.installRoot.empty() &&
+                ParentDirOf(path) == entry.installRoot;
+            const bool inside =
+                !entry.broadRoot && !entry.installRoot.empty() &&
+                IsInsideDir(path, entry.installRoot);
+            if (!sameDir && !inside) {
+                CloseHandle(proc);
+                return false;
+            }
+        }
+
+        DWORD prevControl = 0;
+        DWORD prevState = 0;
+        if (!EnableEcoQoS(proc, &prevControl, &prevState)) {
+            CloseHandle(proc);
+            return false;
+        }
+        CloseHandle(proc);
+        entry.processes.push_back(
+            TrackedProcess{pid, creation, prevControl, prevState});
+        return true;
     }
 
     bool Restore(const std::wstring& appKey, std::wstring* detail) {
@@ -831,8 +1047,12 @@ struct CpuLimiter::Impl {
             }
         }
         if (remain.empty()) {
-            apps.erase(it);
+            it->second.ecoOn = false;
+            it->second.processes.clear();
         } else {
+            // 仍有进程恢复失败：保持效率模式状态并保留失败项，等待下次
+            // Restore 重试；期间新进程事件仍按“应用在效率模式中”处理。
+            it->second.ecoOn = true;
             it->second.processes = std::move(remain);
         }
         if (detail) {
@@ -977,7 +1197,26 @@ struct CpuLimiter::Impl {
 
     void Shutdown() {
         RestoreAll();
+        if (monitorStarted) {
+            if (ioPort) {
+                PostQueuedCompletionStatus(ioPort, 0, kMonitorStopKey,
+                                           nullptr);
+            }
+            if (monitorThread.joinable()) monitorThread.join();
+            monitorStarted = false;
+        }
+        if (ioPort) {
+            CloseHandle(ioPort);
+            ioPort = nullptr;
+        }
+        for (auto& kv : apps) {
+            if (kv.second.job) {
+                CloseHandle(kv.second.job);
+                kv.second.job = nullptr;
+            }
+        }
         apps.clear();
+        idToKey.clear();
     }
 };
 
@@ -987,6 +1226,14 @@ CpuLimiter::CpuLimiter(ULONGLONG minProcessAgeMs)
 CpuLimiter::~CpuLimiter() = default;
 
 bool CpuLimiter::Initialize() { return impl_->Initialize(); }
+
+void CpuLimiter::StartMonitoring(HWND notifyWnd) {
+    impl_->StartMonitoring(notifyWnd);
+}
+
+bool CpuLimiter::OnNewProcess(uintptr_t appId, DWORD pid) {
+    return impl_->OnNewProcess(appId, pid);
+}
 
 std::vector<LimitResult> CpuLimiter::LimitMany(
     const std::vector<LimitRequest>& requests,

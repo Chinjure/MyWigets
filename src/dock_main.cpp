@@ -7090,6 +7090,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ReconcileAppCpuLimit(*s, reinterpret_cast<HWND>(lParam), true);
             return 0;
 
+        // 效率模式监控线程：Job 里出现新进程（应用新开了 helper）。
+        // wParam = appId，lParam = pid；由 UI 线程校验归属并补启用 EcoQoS。
+        case appcpu::kCpuLimitNewProcessMessage: {
+            const DWORD pid = static_cast<DWORD>(lParam);
+            if (g_cpuLimiter.OnNewProcess(
+                    static_cast<uintptr_t>(wParam), pid)) {
+                Logf(L"[效率] 新 helper 已进入效率模式：pid=%lu",
+                     static_cast<unsigned long>(pid));
+            }
+            return 0;
+        }
+
         // 托盘图标触发完成（worker 线程）：确保任务栏保持隐藏并收尾
         // （溢出触发会临时显示过任务栏，这里清截止时刻并做兜底自愈）
         case kMsgTriggerDone: {
@@ -7276,6 +7288,10 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
     }
 
     g_dockHwnd.store(s.hwnd);  // 先发布窗口句柄，宿主可立即隐藏/关闭
+
+    // 效率模式事件监控：完成端口/线程只建一次；组件重启时这里只更新
+    // 通知窗口。线程阻塞等待 Job 的 JOB_OBJECT_MSG_NEW_PROCESS，不轮询。
+    g_cpuLimiter.StartMonitoring(s.hwnd);
 
     DragAcceptFiles(s.hwnd, TRUE);
 
