@@ -259,6 +259,17 @@ void TestSelection() {
     }
 }
 
+void TestPausePolicy() {
+    Check(!appsuspend::ShouldPauseApp(false, false, false),
+          L"未打开的应用没有暂停对象");
+    Check(!appsuspend::ShouldPauseApp(true, true, false),
+          L"有可见且未最小化窗口的应用不暂停");
+    Check(appsuspend::ShouldPauseApp(true, false, false),
+          L"窗口全部最小化或纯托盘（无可见窗口）可暂停");
+    Check(!appsuspend::ShouldPauseApp(true, false, true),
+          L"用户勾选「不暂停此应用」后永久豁免");
+}
+
 bool TestSuspendResume() {
     wchar_t temp[MAX_PATH] = {};
     if (GetTempPathW(MAX_PATH, temp) == 0) return false;
@@ -473,6 +484,8 @@ int wmain(int argc, wchar_t** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     wprintf(L"== app_suspend selection tests ==\n");
     TestSelection();
+    wprintf(L"== app_suspend pause policy tests ==\n");
+    TestPausePolicy();
     wprintf(L"== app_suspend suspend/resume integration ==\n");
     TestSuspendResume();
 

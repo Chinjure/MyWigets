@@ -42,12 +42,15 @@
 //      SW_RESTORE → SetWindowPos → SW_MAXIMIZE）。
 //      Dock 自身的贴底摆放/命中判定一律以整幅画面为准（不是工作区），
 //      否则会被自己预留出来的空间顶上去（越让越高的正反馈）。
-//   9. 未聚焦应用挂起（默认关闭，右键菜单开启）：顶栏当前焦点不是某个
-//      已打开应用时，按「同一 exe 的全部进程 + 安装目录树内的后代辅助
-//      进程」整组 NtSuspendProcess；重新聚焦时整组恢复。应用进程的界定
-//      见 app_suspend.h（不按进程树整棵、不按 exe 名字合并、排除系统进程
-//      与另一个 Dock 应用）。焦点离开有 1.2s 宽限，交互/关闭前先恢复，
-//      退出或异常退出后由挂起表恢复，绝不把应用永久留在挂起态。
+//   9. 后台应用挂起（默认关闭，右键菜单开启）：只暂停「没有可见窗口」的
+//      应用（窗口全部最小化，或纯托盘驻留）；还有可见且未最小化窗口的
+//      应用即使不在前台也保持运行。暂停对象按「同一 exe 的全部进程 +
+//      安装目录树内的后代辅助进程」整组 NtSuspendProcess，重新聚焦/交互
+//      时整组恢复。应用进程的界定见 app_suspend.h（不按进程树整棵、不按
+//      exe 名字合并、排除系统进程与另一个 Dock 应用）。单个应用可在图标
+//      右键菜单勾选「不暂停此应用」永久豁免。离开焦点有 1.2s 宽限，
+//      交互/关闭前先恢复，退出或异常退出后由挂起表恢复，绝不把应用永久
+//      留在挂起态。
 //
 // 日志写入 ..\logs\dock.log
 
@@ -93,7 +96,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "app_suspend.h"      // 未聚焦应用挂起（进程归属判定 + 恢复）
+#include "app_suspend.h"      // 后台应用挂起（进程归属判定 + 恢复）
 #include "fullscreen_guard.h"  // 全屏应用让位判定（与宿主托盘共用）
 #include "keep_top.h"         // 「保持顶栏」模式（注册表开关 + 预留区计算）
 #include "widgets.h"
@@ -156,10 +159,11 @@ constexpr int kMenuToggleAutoCollapse = 1002;  // 空白区右键：自动收起
 constexpr int kMenuToggleLog = 1003;           // 右键菜单：运行日志开关
 constexpr int kMenuToggleKeepTop = 1004;       // 右键菜单：「保持顶栏」模式开关
 constexpr int kMenuToggleSuspendInactive = 1005;  // 右键菜单：暂停未聚焦应用
+constexpr int kMenuToggleSuspendExclude = 1006;   // 图标菜单：不暂停此应用
 constexpr int kDockStripHeightLogical = 2;     // 展开触发条高度（逻辑像素，与 Dock 同宽）
 constexpr UINT_PTR kTooltipTimerId = 4;        // 悬停提示一次性定时器（停帧模式下到期踢帧）
 constexpr UINT_PTR kCollapseWatchTimerId = 5;  // 收起状态监视（诊断专用：本应收起未收起）
-constexpr UINT_PTR kSuspendTimerId = 6;        // 未聚焦应用：宽限期/延后重试一次性定时器
+constexpr UINT_PTR kSuspendTimerId = 6;        // 后台应用：宽限期/延后重试一次性定时器
 constexpr UINT kCollapseWatchMs = 2000;        // 监视周期（2s，只记录不干预）
 // 焦点离开应用后先等一小段再挂起：应用切换、启动器拉起主窗、顶栏目标
 // 短暂清空都可能产生一闪而过的“未聚焦”，立即冻进程会把切换过程卡死。
@@ -208,7 +212,7 @@ constexpr UINT kMsgFullscreen = WM_APP + 17;
 // wParam = 0 仅重读 / 1 强制打开 / 2 强制关闭。与 mywigets_main.cpp 同值。
 constexpr UINT kMsgDockKeepTopSet = WM_APP + 18;
 // → 顶栏：查询「顶栏当前焦点窗口」的 HWND（0 = 当前无聚焦应用）。
-// 未聚焦应用挂起只认顶栏目标，而不是 GetForegroundWindow —— 目标被
+// 后台应用挂起只认顶栏目标，而不是 GetForegroundWindow —— 目标被
 // 最小化后 Windows 会把前台自动让给别的应用，而顶栏按设计继续粘住目标。
 // 与 topbar_main.cpp 的 kDockTargetQueryMsg 同值。
 constexpr UINT kMsgTopBarTargetQuery = WM_APP + 19;
@@ -373,8 +377,12 @@ struct AppState {
     ULONGLONG runningExeCacheAt = 0;
     bool needsRedraw = true;
     bool autoCollapse = true;     // 自动收起开关（右键菜单，注册表持久化）
-    // ---- 未聚焦应用挂起（默认关闭，右键菜单开启）----
+    // ---- 后台应用挂起（默认关闭，右键菜单开启）----
     bool suspendInactive = false;  // 开关（注册表持久化）
+    // 应用级暂停豁免（图标右键菜单「不暂停此应用」）：记录被用户关闭了
+    // 自动暂停的应用 key（归一化 exe / 固定项 key）。值名沿用早期版本的
+    // SuspendException*，改版后旧勾选继续生效。
+    std::unordered_set<std::wstring> suspendExceptions;
     std::unordered_map<std::wstring, ULONGLONG> suspendSince;  // 未聚焦起点
     std::unordered_map<std::wstring, ULONGLONG> suspendLogAt;  // 失败日志限频
     bool hideRequested = false;   // 收起目标态（光标离开 Dock / 触碰下缘触发条）
@@ -707,6 +715,16 @@ void LoadConfig(AppState& s, bool* existed) {
     // 挂起后台进程属于破坏性操作（消息/下载/渲染会冻结），默认关闭，
     // 由 Dock 右键菜单显式开启；老配置没有该值时保持关闭。
     s.suspendInactive = ReadRegDword(key, L"SuspendInactive", 0) != 0;
+    // 应用级暂停豁免（图标右键菜单写入）：沿用 SuspendException* 值名，
+    // 兼容早期窗口最小化版留下的勾选，不让用户的“永不挂起”设置丢失。
+    const DWORD exceptionCount = std::clamp<DWORD>(
+        ReadRegDword(key, L"SuspendExceptionCount", 0), 0, 500);
+    for (DWORD i = 0; i < exceptionCount; ++i) {
+        wchar_t name[32] = {};
+        swprintf_s(name, L"SuspendException%02u", i);
+        const std::wstring p = NormalizePath(ReadRegString(key, name));
+        if (!p.empty()) s.suspendExceptions.insert(p);
+    }
     g_logEnabled.store(ReadRegDword(key, L"LogEnabled", 1) != 0,
                        std::memory_order_relaxed);
     RegCloseKey(key);
@@ -753,6 +771,29 @@ void SaveConfig(AppState& s) {
     RegSetValueExW(key, L"SuspendInactive", 0, REG_DWORD,
                    reinterpret_cast<const BYTE*>(&suspendInactive),
                    sizeof(suspendInactive));
+    const DWORD exceptionCount =
+        static_cast<DWORD>(s.suspendExceptions.size());
+    RegSetValueExW(key, L"SuspendExceptionCount", 0, REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&exceptionCount),
+                   sizeof(exceptionCount));
+    DWORD exceptionIndex = 0;
+    for (const auto& exception : s.suspendExceptions) {
+        wchar_t name[32] = {};
+        swprintf_s(name, L"SuspendException%02u", exceptionIndex++);
+        RegSetValueExW(
+            key, name, 0, REG_SZ,
+            reinterpret_cast<const BYTE*>(exception.c_str()),
+            static_cast<DWORD>((exception.size() + 1) * sizeof(wchar_t)));
+    }
+    // 从 3 项删到 1 项时清掉尾部残留值（LoadConfig 按 count 读取不会越界，
+    // 但注册表里不该留下已删除应用的脏数据）。值总是连续写到 count-1，
+    // 因此从 count 开始删到第一个不存在的项即可。
+    for (DWORD cleanupIndex = exceptionCount; cleanupIndex < 500;
+         ++cleanupIndex) {
+        wchar_t name[32] = {};
+        swprintf_s(name, L"SuspendException%02u", cleanupIndex);
+        if (RegDeleteValueW(key, name) != ERROR_SUCCESS) break;
+    }
     const DWORD logOn = g_logEnabled.load(std::memory_order_relaxed) ? 1 : 0;
     RegSetValueExW(key, L"LogEnabled", 0, REG_DWORD,
                    reinterpret_cast<const BYTE*>(&logOn), sizeof(logOn));
@@ -3748,11 +3789,13 @@ bool AppOwnsForeground(const DockItem& item) {
     return false;
 }
 
-// ============================== 未聚焦应用挂起 ==============================
+// ============================== 后台应用挂起 ==============================
 //
 // 口径（详见 app_suspend.h）：
 //   应用身份 = DockItem.key（归一化 exe 完整路径）
 //   进程集合 = 同 exe 的全部进程 + 安装目录树内由它们派生的辅助进程
+//   暂停条件 = 窗口全部最小化，或纯托盘驻留（没有任何可见窗口）且用户
+//              未单独豁免；还有可见且未最小化窗口的应用不暂停
 // 顶栏焦点 = 顶栏当前 targetHwnd 所属的应用，而不是 GetForegroundWindow；
 // 但系统前台应用永远额外保护，避免顶栏粘住旧目标时把用户正在操作的应用冻住。
 //
@@ -3806,13 +3849,62 @@ std::wstring AppIdentityKeyForWindow(HWND hwnd) {
     return identity;
 }
 
-// 有窗口或托盘驻留才算“已打开”；基础设施/套件自身永不挂起。
-bool ShouldManageAppSuspension(const DockItem& item) {
-    if (!item.hasWindow && !item.trayMarked) return false;
+// 该条目是否属于“可被暂停的应用”（与是否正在运行无关：固定但未运行的
+// 应用也可以先设置偏好，启动后生效）。系统/套件进程本来就不会暂停，
+// 不显示应用级开关。
+bool IsSuspendableAppItem(const DockItem& item) {
     const std::wstring base = ToLower(PathBasename(item.key));
-    if (base.empty()) return false;
-    if (IsSelfSuiteBinary(base) || IsInfraBaseline(base)) return false;
+    // 只对真实 exe 应用显示开关：目录/未解析的 .lnk 固定项没有可挂起的
+    // 进程，给它们显示“暂停”开关只会让人误以为设置生效了。
+    if (base.size() <= 4 ||
+        base.compare(base.size() - 4, 4, L".exe") != 0) {
+        return false;
+    }
+    return !IsSelfSuiteBinary(base) && !IsInfraBaseline(base);
+}
+
+// 用户是否在图标右键菜单里勾选了「不暂停此应用」。同时检查运行 key 与
+// 固定项 key：名称合并后的条目（如钉钉 dingtalk.exe ↔ 启动器 lnk）两个
+// key 不同，任一命中都算用户已经豁免；旧版窗口最小化实现留下的
+// SuspendException* 里也混有这两种 key。
+bool IsSuspendExcluded(const AppState& s, const std::wstring& key,
+                       const std::wstring& pinKey) {
+    const std::wstring normalized = appsuspend::NormalizePath(key);
+    if (!normalized.empty() && s.suspendExceptions.count(normalized) != 0) {
+        return true;
+    }
+    if (!pinKey.empty()) {
+        const std::wstring normalizedPin =
+            appsuspend::NormalizePath(pinKey);
+        if (!normalizedPin.empty() &&
+            s.suspendExceptions.count(normalizedPin) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 「窗口全部最小化」：条目收集到的顶层窗口里，没有任何一个是“可见且
+// 未最小化”的。应用自己隐藏/收进托盘的窗口（不可见或被 DWM cloak）同样
+// 算已收起。纯托盘应用没有顶层窗口，同样返回 true。
+bool AppWindowsAllMinimized(const DockItem& item) {
+    for (HWND w : item.windows) {
+        if (!IsWindow(w) || IsCloaked(w)) continue;
+        // IsWindowVisible 对最小化窗口仍为 TRUE，必须配合 IsIconic 判断。
+        if (IsWindowVisible(w) && !IsIconic(w)) return false;
+    }
     return true;
+}
+
+// 暂停条件：应用仍然打开（有窗口或托盘驻留）、所有窗口都已最小化或根本
+// 没有窗口、且没有被用户单独豁免。只要还有一张可见且未最小化的窗口就
+// 不暂停 —— 用户正在看/随时会切回，冻住会让内容与后台渲染停在原地；
+// 最小化表示用户暂时不用，和纯托盘应用一样可以暂停。基础设施/套件除外。
+bool ShouldManageAppSuspension(const AppState& s, const DockItem& item) {
+    if (!IsSuspendableAppItem(item)) return false;
+    const bool excluded = IsSuspendExcluded(s, item.key, item.pinKey);
+    return appsuspend::ShouldPauseApp(item.hasWindow || item.trayMarked,
+                                     !AppWindowsAllMinimized(item), excluded);
 }
 
 // UAC/锁屏会切到安全桌面：此时不做新的挂起。否则 UAC 确认框背后的
@@ -3922,11 +4014,14 @@ void ReconcileAppSuspension(AppState& s, HWND focusHint = nullptr,
 
     for (const DockItem& item : s.items) {
         const std::wstring& key = item.key;
-        if (!ShouldManageAppSuspension(item)) {
+        if (!ShouldManageAppSuspension(s, item)) {
+            // 还有可见且未最小化的窗口 / 用户已豁免 / 非后台应用：
+            // 绝不暂停，且如果之前已被挂起（条件在运行中发生了变化）
+            // 立即恢复。
             if (g_appSuspender.IsSuspended(key)) {
                 std::wstring detail;
                 g_appSuspender.Resume(key, &detail);
-                Logf(L"[暂停] 不再管理 %ls → 恢复（%ls）", key.c_str(),
+                Logf(L"[暂停] 不符合暂停条件 → 恢复 %ls（%ls）", key.c_str(),
                      detail.c_str());
             }
             s.suspendSince.erase(key);
@@ -4036,12 +4131,58 @@ void ToggleSuspendInactive(AppState& s) {
         g_appSuspender.ResumeAll();
         s.suspendSince.clear();
         s.suspendLogAt.clear();
-        Logf(L"[暂停] 未聚焦应用挂起：关闭 → 已恢复全部");
+        Logf(L"[暂停] 后台应用挂起：关闭 → 已恢复全部");
         return;
     }
-    Logf(L"[暂停] 未聚焦应用挂起：开启（焦点离开 %llu ms 后挂起）",
+    Logf(L"[暂停] 后台应用挂起：开启（窗口最小化或无窗口时；焦点离开 %llu ms 后挂起）",
          static_cast<unsigned long long>(kSuspendGraceMs));
     // 开启后不立即冻：Reconcile 会从当前时刻起算宽限期。
+    ReconcileAppSuspension(s);
+}
+
+// 图标右键菜单「不暂停此应用」：把应用 key 写入/移出豁免集合并持久化。
+// 有固定项 key（名称合并条目）时优先记 pinKey —— 与旧版 SuspendException*
+// 的存法一致，也保证不同运行 key（启动器/主程序）都能命中。勾选时如果
+// 该应用正被挂起，立即恢复（用户的本意就是别冻它）；取消勾选后交给
+// Reconcile 重新计宽限期，不会瞬间冻住。
+void ToggleSuspendExclude(AppState& s, const std::wstring& appKey,
+                          const std::wstring& pinKey,
+                          const std::wstring& displayName) {
+    const std::wstring key = appsuspend::NormalizePath(appKey);
+    const std::wstring normalizedPin = appsuspend::NormalizePath(pinKey);
+    if (key.empty() && normalizedPin.empty()) return;
+    const std::wstring storedKey =
+        normalizedPin.empty() ? key : normalizedPin;
+    const bool excluded = IsSuspendExcluded(s, key, normalizedPin);
+
+    if (excluded) {
+        // 关闭豁免：两个 key 都清掉，避免任何一边残留导致开关“关不掉”。
+        if (!key.empty()) s.suspendExceptions.erase(key);
+        if (!normalizedPin.empty()) s.suspendExceptions.erase(normalizedPin);
+        s.suspendSince.erase(key);
+        if (!normalizedPin.empty()) s.suspendSince.erase(normalizedPin);
+        SaveConfig(s);
+        Logf(L"[暂停] 应用级开关：%ls → 恢复自动暂停（%ls）",
+             displayName.c_str(), storedKey.c_str());
+        ReconcileAppSuspension(s);
+        return;
+    }
+
+    s.suspendExceptions.insert(storedKey);
+    s.suspendSince.erase(key);
+    if (!normalizedPin.empty()) s.suspendSince.erase(normalizedPin);
+    s.suspendLogAt.erase(key);
+    SaveConfig(s);
+    if (g_appSuspender.IsSuspended(key)) {
+        std::wstring detail;
+        const bool ok = g_appSuspender.Resume(key, &detail);
+        Logf(ok ? L"[暂停] 应用级开关：%ls → 永不挂起，已恢复（%ls）"
+                : L"[暂停] 应用级开关：%ls → 永不挂起，恢复失败（%ls）",
+             displayName.c_str(), detail.c_str());
+    } else {
+        Logf(L"[暂停] 应用级开关：%ls → 永不挂起（%ls）",
+             displayName.c_str(), storedKey.c_str());
+    }
     ReconcileAppSuspension(s);
 }
 
@@ -5918,6 +6059,14 @@ std::wstring WindowTitleForMenu(HWND hwnd) {
 void ShowItemContextMenu(AppState& s, size_t idx) {
     if (s.menuOpen) return;  // 防止菜单未关闭时重复右键造成嵌套模态循环/卡死
     DockItem& item = s.items[idx];
+    // 菜单是模态的（内部还会派发定时器/刷新消息），菜单返回后 s.items 可能
+    // 已经重建。应用级开关按 key 快照执行，避免菜单返回后误操作别的条目。
+    const std::wstring suspendKey = item.key;
+    const std::wstring suspendPinKey = item.pinKey;
+    const std::wstring suspendName = item.displayName;
+    const bool suspendSupported = IsSuspendableAppItem(item);
+    const bool suspendExcluded =
+        IsSuspendExcluded(s, suspendKey, suspendPinKey);
     ResetMenuEntries(s);
     HMENU menu = CreatePopupMenu();
 
@@ -5971,6 +6120,16 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
         AppendMenuW(menu, MF_STRING, hidId, L"从 Dock 隐藏此后台程序");
     }
 
+    // 应用级暂停开关：勾选 = 该应用永不自动暂停（如果当前正被挂起，
+    // 立即恢复）；取消勾选 = 重新允许“窗口全部最小化/无窗口时自动暂停”。
+    // 系统/套件进程本来就不会暂停，不显示这个容易误解的开关。
+    if (suspendSupported) {
+        AppendMenuW(menu,
+                    MF_STRING | (suspendExcluded ? MF_CHECKED : MF_UNCHECKED),
+                    kMenuToggleSuspendExclude,
+                    L"不暂停此应用（后台保持运行）");
+    }
+
     // 打开文件位置（固定项有意义：定位到 lnk/exe）
     if (GetFileAttributesW(item.launchPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
         const int showId =
@@ -5988,7 +6147,7 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
     AppendMenuW(menu,
                 MF_STRING | (s.suspendInactive ? MF_CHECKED : MF_UNCHECKED),
                 kMenuToggleSuspendInactive,
-                L"暂停未聚焦应用（挂起后台进程，切回时恢复）");
+                L"暂停未聚焦应用（窗口最小化或无窗口时挂起，切回时恢复）");
     AppendMenuW(menu,
                 MF_STRING | (g_logEnabled.load(std::memory_order_relaxed)
                                  ? MF_CHECKED
@@ -6033,6 +6192,10 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
     }
     if (cmd == kMenuToggleSuspendInactive) {
         ToggleSuspendInactive(s);
+        return;
+    }
+    if (cmd == kMenuToggleSuspendExclude) {
+        ToggleSuspendExclude(s, suspendKey, suspendPinKey, suspendName);
         return;
     }
     if (cmd == kMenuToggleLog) {
@@ -6106,7 +6269,7 @@ void ShowBlankContextMenu(AppState& s) {
     AppendMenuW(menu,
                 MF_STRING | (s.suspendInactive ? MF_CHECKED : MF_UNCHECKED),
                 kMenuToggleSuspendInactive,
-                L"暂停未聚焦应用（挂起后台进程，切回时恢复）");
+                L"暂停未聚焦应用（窗口最小化或无窗口时挂起，切回时恢复）");
     AppendMenuW(menu,
                 MF_STRING | (g_logEnabled.load(std::memory_order_relaxed)
                                  ? MF_CHECKED
@@ -6872,7 +7035,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         UpdateKeepTopWorkArea(*s, /*refitMaximized=*/true);
                     }
                 }
-                // 未聚焦应用挂起：放在配置重读之后，外部把开关改掉时
+                // 后台应用挂起：放在配置重读之后，外部把开关改掉时
                 // 同一拍就能生效；顶栏目标消息丢失、应用新开辅助进程等
                 // 情况也在这里保底复核（幂等；宽限计时在 Reconcile 内）。
                 ReconcileAppSuspension(*s);
@@ -7060,8 +7223,10 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
     }
     LogInit();
     if (DedupePins(s)) SaveConfig(s);  // 去重后立即持久化（收敛历史重复固定项）
-    Logf(L"配置载入：固定 %zu 项，隐藏 %zu 项，挂起未聚焦应用=%d",
-         s.pins.size(), s.hiddenKeys.size(), s.suspendInactive ? 1 : 0);
+    Logf(L"配置载入：固定 %zu 项，隐藏 %zu 项，暂停豁免 %zu 项，"
+         L"后台应用挂起=%d",
+         s.pins.size(), s.hiddenKeys.size(), s.suspendExceptions.size(),
+         s.suspendInactive ? 1 : 0);
 
     // 挂起控制器初始化 + 上次异常退出的残留恢复。恢复必须在任何新挂起
     // 之前做：注册表里记录的 PID/创建时间会逐个核对，PID 已复用则跳过。

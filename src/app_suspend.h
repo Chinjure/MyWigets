@@ -1,8 +1,9 @@
-// app_suspend.h - 「未聚焦应用挂起」的进程归属与挂起/恢复
+// app_suspend.h - 「后台应用挂起」的进程归属与挂起/恢复
 //
-// 需求：Dock 里已经打开的应用，一旦不再处于顶栏当前焦点，就暂停它的
-// 进程；重新成为焦点时恢复。真正容易出错的地方不是 NtSuspendProcess，
-// 而是「哪些进程算这个应用」——
+// 需求：Dock 里已经没有可见窗口的应用（窗口全部最小化，或纯托盘驻留），
+// 一旦不再处于顶栏当前焦点，就暂停它的进程；重新成为焦点或被交互时恢复。
+// 单个应用可以由用户在图标右键菜单里豁免（不暂停）。真正容易出错的地方
+// 不是 NtSuspendProcess，而是「哪些进程算这个应用」——
 //
 //   1. 不能用窗口数量/进程数量判断：Chrome、Edge、Electron、微信、钉钉
 //      都是多进程应用，主窗只是其中一个进程。
@@ -35,6 +36,8 @@
 // 创建时间，绝不把「同 PID 的新进程」当成原来那个进程。
 //
 // 安全边界（由 Dock 在调用前再叠加一层）：
+//   - 只把「没有可见窗口」（窗口全部最小化或纯托盘）且未被用户豁免的
+//     应用交给本模块；
 //   - 不碰 MyWigets 自身、explorer、conhost 等系统基础设施；
 //   - 不碰当前系统前台应用（即使顶栏目标暂时粘在别的应用上）；
 //   - 不碰安全桌面（UAC/锁屏）期间的新挂起请求；
@@ -93,6 +96,12 @@ bool IsBroadInstallRoot(const std::wstring& dir);
 
 // 永不属于任何可挂起应用集合的系统/套件进程（按 exe 基名）。
 bool IsNeverSuspendImage(const std::wstring& imagePath);
+
+// Dock 侧的暂停策略（纯函数，便于单元测试）：只有「仍然打开、当前没有
+// 任何“可见且未最小化”的窗口、且没有被用户单独豁免」的应用才允许暂停。
+// hasVisibleWindow 为 true 表示至少有一张可见且未最小化的顶层窗口；
+// 窗口全部最小化、或纯托盘驻留（根本没有窗口）时都为 false，可以暂停。
+bool ShouldPauseApp(bool opened, bool hasVisibleWindow, bool userExcluded);
 
 // 全量进程快照（忽略其他登录会话、系统基础设施与自身）。
 std::vector<ProcessEntry> SnapshotProcesses();

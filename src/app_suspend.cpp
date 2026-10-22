@@ -333,6 +333,13 @@ bool IsNeverSuspendImage(const std::wstring& imagePath) {
     return IsNeverSuspendBase(BaseNameOf(NormalizePath(imagePath)));
 }
 
+bool ShouldPauseApp(bool opened, bool hasVisibleWindow, bool userExcluded) {
+    // 没打开（进程已退出）没有可暂停对象；只要还有一张可见且未最小化的
+    // 窗口就保持运行；窗口全部最小化或纯托盘驻留时可以暂停。用户显式
+    // 勾选「不暂停此应用」时永久豁免，即使之后收起窗口变成托盘应用。
+    return opened && !hasVisibleWindow && !userExcluded;
+}
+
 std::vector<ProcessEntry> SnapshotProcesses() {
     std::vector<ProcessEntry> out;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
