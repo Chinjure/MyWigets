@@ -51,7 +51,7 @@ $sources = @(
     'launcher_main.cpp', # launcher
     'topbar_main.cpp',   # topbar
     'dock_main.cpp',     # dock
-    'app_cpu_limit.cpp'  # inactive app CPU rate limiting
+    'app_suspend.cpp'    # inactive app suspend/resume
 ) | ForEach-Object { (Join-Path $srcDir $_) }
 
 $defs = '/DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX'

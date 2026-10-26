@@ -22,7 +22,8 @@
 //          顶栏（重设层级）即时生效。
 //        - 关闭全部组件（逐个 WM_CLOSE 优雅退出，超时则结束线程；
 //          等同把每个组件的开关都关掉并持久化）
-//        - 开机启动（勾选后写入 HKCU\...\Run）
+//        - 开机启动（勾选后写入 HKCU\...\Run；同时把低级钩子超时
+//          LowLevelHooksTimeout 检查/改为 1ms，取消时恢复 300ms）
 //        - 退出 MyWigets（关闭全部组件后退出托盘）
 //   3. 支持命令行：
 //        MyWigets.exe -autostart on    开启开机启动
@@ -742,6 +743,54 @@ bool IsAutoStartEnabled() {
     return result == ERROR_SUCCESS;
 }
 
+// ---- 低级钩子超时（与「开机启动」绑定）----
+// Windows 对 WH_KEYBOARD_LL / WH_MOUSE_LL 的回调有 LowLevelHooksTimeout
+// （默认 300ms，位于 HKCU\Control Panel\Desktop）。被 Dock 挂起的应用如果
+// 仍持有低级钩子，系统每次输入都要等它超时；把该值压到 1ms，系统会尽快
+// 跳过，并在连续超时后静默摘掉卡住的钩子。
+//
+// 这个值只在登录时被 Windows 读取，所以正好和「开机启动」绑定：
+//   - 勾选开机启动：自启动实例启动时检查/写成 1ms；
+//   - 取消开机启动：恢复 Windows 默认的 300ms。
+constexpr wchar_t kDesktopKeyPath[] = L"Control Panel\\Desktop";
+constexpr wchar_t kLowLevelHooksTimeoutValue[] = L"LowLevelHooksTimeout";
+constexpr DWORD kLowLevelHooksTimeoutOnMs = 1;
+constexpr DWORD kLowLevelHooksTimeoutDefaultMs = 300;
+
+bool SetLowLevelHooksTimeout(DWORD timeoutMs) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kDesktopKeyPath, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) !=
+        ERROR_SUCCESS) {
+        return false;
+    }
+    const LONG result = RegSetValueExW(
+        key, kLowLevelHooksTimeoutValue, 0, REG_DWORD,
+        reinterpret_cast<const BYTE*>(&timeoutMs), sizeof(timeoutMs));
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS;
+}
+
+// 已经是目标值就不写，避免每次启动都产生一次无意义的注册表写入。
+bool EnsureLowLevelHooksTimeout(DWORD timeoutMs) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kDesktopKeyPath, 0, KEY_QUERY_VALUE,
+                      &key) == ERROR_SUCCESS) {
+        DWORD type = 0;
+        DWORD value = 0;
+        DWORD bytes = sizeof(value);
+        const LONG q = RegQueryValueExW(
+            key, kLowLevelHooksTimeoutValue, nullptr, &type,
+            reinterpret_cast<BYTE*>(&value), &bytes);
+        RegCloseKey(key);
+        if (q == ERROR_SUCCESS && type == REG_DWORD &&
+            bytes == sizeof(value) && value == timeoutMs) {
+            return true;
+        }
+    }
+    return SetLowLevelHooksTimeout(timeoutMs);
+}
+
 bool SetAutoStart(bool enable) {
     wchar_t self[MAX_PATH] = {};
     const DWORD len = GetModuleFileNameW(nullptr, self, MAX_PATH);
@@ -770,7 +819,13 @@ bool SetAutoStart(bool enable) {
     }
 
     RegCloseKey(key);
-    return result == ERROR_SUCCESS;
+
+    // 与低级钩子超时联动。该值下次登录才生效，正好和自启动同拍：
+    // 开启时检查/写成 1ms，关闭时恢复 300ms。
+    const bool hooksOk =
+        enable ? EnsureLowLevelHooksTimeout(kLowLevelHooksTimeoutOnMs)
+               : SetLowLevelHooksTimeout(kLowLevelHooksTimeoutDefaultMs);
+    return result == ERROR_SUCCESS && hooksOk;
 }
 
 void ShowTrayBalloon(HWND hwnd, const wchar_t* text) {
@@ -808,7 +863,10 @@ bool RemoveTrayIcon(HWND hwnd) {
 void ToggleAutoStart(HWND hwnd) {
     const bool enable = !IsAutoStartEnabled();
     if (SetAutoStart(enable)) {
-        ShowTrayBalloon(hwnd, enable ? L"已开启开机启动" : L"已关闭开机启动");
+        ShowTrayBalloon(
+            hwnd, enable
+                      ? L"已开启开机启动（低级钩子超时 1ms，下次登录生效）"
+                      : L"已关闭开机启动（低级钩子超时恢复 300ms）");
     } else {
         ShowTrayBalloon(hwnd, L"设置开机启动失败");
     }
@@ -1074,6 +1132,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     }
     if (lpCmdLine && std::strstr(lpCmdLine, "-autostart off")) {
         return SetAutoStart(false) ? 0 : 1;
+    }
+
+    // 「开机启动」与低级钩子超时绑定：自启动实例启动时再检查一次，防止
+    // 注册表值被系统/其它工具改回默认。该值下次登录才生效，本次会话不变，
+    // 这里只是把持久化状态对齐。
+    if (IsAutoStartEnabled()) {
+        EnsureLowLevelHooksTimeout(kLowLevelHooksTimeoutOnMs);
     }
 
     EnableDpiAwareness();  // 先于本进程一切窗口创建

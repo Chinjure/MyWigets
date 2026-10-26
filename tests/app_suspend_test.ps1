@@ -1,11 +1,13 @@
-# app_cpu_limit_test.ps1 - 编译并运行 app_cpu_limit 的单元 + 真实效率模式测试
+# app_suspend_test.ps1 - 编译并运行 app_suspend 的单元 + 真实挂起/恢复测试
 #
 # 用法（脚本执行策略可能禁止直接运行）：
-#   powershell -NoProfile -ExecutionPolicy Bypass -File tests\app_cpu_limit_test.ps1
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tests\app_suspend_test.ps1
 #
-# 测试只操作临时目录里由测试自己派生/复制的 app.exe、helper.exe，不会碰
-# 系统里正在运行的其它应用。集成测试会真实对两个忙循环进程调用
-# SetProcessInformation(ProcessPowerThrottling)，验证 EcoQoS 启用/恢复。
+# 测试只操作 bin 下由测试自己创建/复制的 app.exe、helper.exe，不会碰
+# 系统里正在运行的其它应用。集成测试会真实调用 NtSuspendProcess，并用
+# 两个心跳文件验证主进程与不同 exe 的辅助进程一起停/一起恢复；持久化
+# 恢复用例需要可写的 HKCU\Software\DesktopSuite\Dock，受限运行环境下
+# 会打印 [SKIP] 而不是误报失败。
 
 param(
     [ValidateSet('Debug', 'Release')]
@@ -16,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
 $outDir = Join-Path $root 'bin'
-$exe = Join-Path $outDir 'app_cpu_limit_test.exe'
+$exe = Join-Path $outDir 'app_suspend_test.exe'
 $null = New-Item -ItemType Directory -Force -Path $outDir
 
 function Find-VsDevCmd {
@@ -41,7 +43,7 @@ if (-not $vsDevCmd -and -not (Get-Command cl.exe -ErrorAction SilentlyContinue))
 }
 
 $optim = if ($Configuration -eq 'Release') { '/O2 /MT' } else { '/Od /MTd /Zi' }
-$bat = Join-Path $env:TEMP 'mywigets_app_cpu_limit_test_build.bat'
+$bat = Join-Path $env:TEMP 'mywigets_app_suspend_test_build.bat'
 $lines = @('@echo off', 'setlocal')
 if ($vsDevCmd) {
     $lines += "call `"$vsDevCmd`" -no_logo -arch=x64"
@@ -51,8 +53,8 @@ $lines += "cd /d `"$root`""
 $lines += "cl /nologo /std:c++17 /EHsc $optim /W4 /permissive- /utf-8 " +
           "/DUNICODE /D_UNICODE /DNOMINMAX " +
           "/I`"$root\src`" /Fe:`"$exe`" " +
-          "`"$root\tests\app_cpu_limit_test.cpp`" `"$root\src\app_cpu_limit.cpp`" " +
-          "/link advapi32.lib user32.lib"
+          "`"$root\tests\app_suspend_test.cpp`" `"$root\src\app_suspend.cpp`" " +
+          "/link advapi32.lib"
 $lines += 'if errorlevel 1 exit /b 1'
 $lines += 'endlocal'
 Set-Content -Path $bat -Value $lines -Encoding Ascii
