@@ -7,7 +7,8 @@
 //   2. 挂起集合 = Job 成员 ∪ 快照选择（兜底允许跨目录后代），过滤系统
 //      进程、其它 Dock 应用、可见窗口、已由别的应用挂起的进程；
 //   3. 两阶段整组挂起/恢复（ntdll!NtSuspendProcess / NtResumeProcess），
-//      冻结后循环补冻 Job 新成员；已挂起应用每 2s 补挂新成员；
+//      冻结后循环补冻 Job 新成员，并对 Job 追加失败的兜底成员做一次
+//      快照收尾补冻；已挂起应用不再周期补挂/轮询；
 //   4. 用 PID + 创建时间双保险，并把挂起表持久化，供异常退出后恢复。
 //
 // 不按进程树整棵挂起、不按 exe 名字合并、不碰系统基础设施，原因见头文件。
@@ -321,7 +322,7 @@ bool ProcessOwnsVisibleWindow(DWORD pid) {
 }
 
 // 一次枚举所有“可见且未最小化”的顶层窗口，返回 PID 集合。避免为每个
-// 候选进程各 EnumWindows 一遍（2s 复核 × 多应用 × 多 helper 会很贵）。
+// 候选进程各 EnumWindows 一遍（多应用 × 多 helper 时会很贵）。
 std::unordered_set<DWORD> VisibleWindowPids() {
     std::unordered_set<DWORD> pids;
     EnumWindows(
@@ -711,7 +712,7 @@ struct Suspender::Impl {
             }
 
             // 先用最小权限查一次是否已在 Job：已经在 Job 里的成员占多数，
-            // 这样 2s 复核不会对每个 helper 都请求 PROCESS_SET_QUOTA。
+            // 避免对每个 helper 都请求 PROCESS_SET_QUOTA。
             HANDLE probe = OpenVerified(
                 ref.pid, ref.creationTime,
                 PROCESS_QUERY_LIMITED_INFORMATION, nullptr);
@@ -962,53 +963,6 @@ struct Suspender::Impl {
         return out;
     }
 
-    // 已挂起应用的补挂：Job/快照里出现新成员（旧代码只看首次挂起）就
-    // 单独 suspend，绝不重复 suspend 已在 owner 表里的进程。
-    size_t TopUpSuspended(const std::wstring& key,
-                          const std::vector<ProcessEntry>& snapshot,
-                          const std::unordered_set<std::wstring>& foreignKeys,
-                          const std::unordered_set<DWORD>& visiblePids,
-                          size_t* skipped, bool* visible) {
-        // 已挂起应用可能又启动了同一 exe 的新实例；先把新根追加进 Job，
-        // 否则它后续再异步拉起的跨目录 helper 不会继承 Job。
-        HANDLE job = GetJob(key);
-        if (job) {
-            AdoptIntoJob(key, job, snapshot, foreignKeys, visiblePids,
-                         nullptr);
-        }
-        CandidateSet candidates =
-            BuildCandidates(key, snapshot, foreignKeys, visiblePids);
-        if (visible) *visible = candidates.visibleWindow;
-        if (skipped) *skipped = candidates.skipped + candidates.unreadable;
-        if (candidates.visibleWindow || candidates.unreadable > 0) return 0;
-        size_t added = 0;
-        for (const ProcessRef& ref : candidates.refs) {
-            // 快照之后才出现的窗口这里再确认一次，绝不冻结用户眼前的
-            // 新窗口（尤其是补挂路径）。
-            if (ProcessOwnsVisibleWindow(ref.pid)) continue;
-            DWORD err = ERROR_SUCCESS;
-            HANDLE proc = OpenVerified(
-                ref.pid, ref.creationTime,
-                PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION,
-                &err);
-            if (!proc) continue;
-            if (!NtSuccess(suspendFn(proc))) {
-                CloseHandle(proc);
-                continue;
-            }
-            CloseHandle(proc);
-            owner[ProcKey{ref.pid, ref.creationTime}] = key;
-            apps[key].push_back(TrackedProcess{ref.pid, ref.creationTime});
-            ++added;
-        }
-        return added;
-    }
-
-    HANDLE GetJob(const std::wstring& key) {
-        auto it = jobs.find(key);
-        return it == jobs.end() ? nullptr : it->second;
-    }
-
     bool Initialize() {
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (!ntdll) return false;
@@ -1034,9 +988,7 @@ struct Suspender::Impl {
 
         bool stateChanged = false;
         std::vector<size_t> todo;
-        std::vector<size_t> already;
         todo.reserve(requests.size());
-        already.reserve(requests.size());
         for (size_t i = 0; i < requests.size(); ++i) {
             const std::wstring key = NormalizePath(requests[i].appKey);
             if (key.empty()) {
@@ -1062,8 +1014,10 @@ struct Suspender::Impl {
                         existing->second = std::move(alive);
                         stateChanged = true;
                     }
+                    // 已经在挂起态：不再做任何快照/补挂。同一 Job 内
+                    // 后续创建的子进程不可能发生 —— 能创建进程的成员都
+                    // 已经冻结；竞态窗口由 SuspendMany 收尾阶段的补冻覆盖。
                     results[i].code = SuspendCode::AlreadySuspended;
-                    already.push_back(i);
                     continue;
                 }
                 apps.erase(existing);
@@ -1071,7 +1025,7 @@ struct Suspender::Impl {
             }
             todo.push_back(i);
         }
-        if (todo.empty() && already.empty()) {
+        if (todo.empty()) {
             if (stateChanged) Persist();
             return results;
         }
@@ -1093,41 +1047,6 @@ struct Suspender::Impl {
         }
 
         std::unordered_set<DWORD> visiblePids = VisibleWindowPids();
-
-        // 已挂起应用的 2s 复核：Job/快照里出现新成员就补挂。旧实现直接
-        // return AlreadySuspended，导致“挂起后才异步拉起的进程”一直活到
-        // 下一次恢复。补挂不重复 suspend 已在跟踪表里的进程。
-        for (size_t index : already) {
-            SuspendResult& result = results[index];
-            const std::wstring key = NormalizePath(requests[index].appKey);
-            const HANDLE job = GetJob(key);
-            result.jobSandbox = job != nullptr;
-            result.jobMembers = job ? QueryJobProcessIds(job).size() : 0;
-            size_t skipped = 0;
-            bool visible = false;
-            const size_t added = TopUpSuspended(
-                key, snapshot, foreignAppKeys, visiblePids, &skipped,
-                &visible);
-            if (job) result.jobMembers = QueryJobProcessIds(job).size();
-            result.skipped = skipped;
-            if (added > 0) {
-                stateChanged = true;
-                result.code = SuspendCode::Suspended;
-                result.suspended = added;
-                result.detail = L"补挂新成员 " + std::to_wstring(added);
-                if (visible) {
-                    result.detail += L"；另有成员出现可见窗口，已跳过";
-                }
-                continue;
-            }
-            result.code = SuspendCode::AlreadySuspended;
-            result.detail = L"已在挂起态";
-            if (visible) {
-                result.detail += L"；Job 成员出现可见窗口，跳过补挂";
-            } else if (skipped > 0) {
-                result.detail += L"；本轮无可补挂成员";
-            }
-        }
 
         FILETIME nowFt{};
         GetSystemTimeAsFileTime(&nowFt);
@@ -1360,6 +1279,70 @@ struct Suspender::Impl {
                             PROCESS_QUERY_LIMITED_INFORMATION,
                         &err);
                     if (!proc) {
+                        quiesceFailed = true;
+                        break;
+                    }
+                    if (!NtSuccess(suspendFn(proc))) {
+                        CloseHandle(proc);
+                        quiesceFailed = true;
+                        break;
+                    }
+                    handles.push_back(proc);
+                    tracked.push_back(
+                        TrackedProcess{ref.pid, ref.creationTime});
+                    ++suspended;
+                    added = true;
+                }
+                if (!added) break;
+            }
+
+            // Job 追加失败的兜底成员不在 Job 里，Job 成员枚举看不到它们
+            // 在冻结边界刚创建的子进程。这里在冻结后再做一次（只做一次，
+            // 不是轮询）完整快照选择：所有已冻结的父进程都不可能再创建
+            // 新进程，因此补完即收敛。Job 正常时这一轮通常没有新增。
+            for (int pass = 0; pass < 4 && !suspendFailed &&
+                                !quiesceFailed;
+                 ++pass) {
+                bool added = false;
+                const std::vector<ProcessEntry> verifySnapshot =
+                    SnapshotProcesses();
+                if (verifySnapshot.empty()) break;
+                std::unordered_map<DWORD, const ProcessEntry*> byPid;
+                byPid.reserve(verifySnapshot.size());
+                for (const ProcessEntry& e : verifySnapshot) {
+                    byPid[e.pid] = &e;
+                }
+                const Selection verify = SelectAppProcesses(
+                    key, verifySnapshot, &foreignAppKeys,
+                    /*includeExternalDescendants=*/true);
+                for (const ProcessRef& ref : verify.processes) {
+                    const ProcKey pk{ref.pid, ref.creationTime};
+                    if (!seen.insert(pk).second) continue;
+                    if (owner.count(pk) != 0) continue;
+                    auto byPidIt = byPid.find(ref.pid);
+                    if (byPidIt == byPid.end()) continue;
+                    const ProcessEntry& entry = *byPidIt->second;
+                    if (IsNeverSuspendImage(entry.imagePath)) continue;
+                    if (entry.imagePath != key &&
+                        foreignAppKeys.count(entry.imagePath) != 0) {
+                        continue;
+                    }
+                    if (ProcessOwnsVisibleWindow(ref.pid)) {
+                        quiesceVisible = true;
+                        quiesceFailed = true;
+                        break;
+                    }
+                    DWORD err = ERROR_SUCCESS;
+                    HANDLE proc = OpenVerified(
+                        ref.pid, ref.creationTime,
+                        PROCESS_SUSPEND_RESUME |
+                            PROCESS_QUERY_LIMITED_INFORMATION,
+                        &err);
+                    if (!proc) {
+                        if (err == ERROR_NOT_FOUND ||
+                            err == ERROR_INVALID_PARAMETER) {
+                            continue;  // 快照后刚退出
+                        }
                         quiesceFailed = true;
                         break;
                     }
