@@ -54,7 +54,7 @@ $lines += "cl /nologo /std:c++17 /EHsc $optim /W4 /permissive- /utf-8 " +
           "/DUNICODE /D_UNICODE /DNOMINMAX " +
           "/I`"$root\src`" /Fe:`"$exe`" " +
           "`"$root\tests\app_suspend_test.cpp`" `"$root\src\app_suspend.cpp`" " +
-          "/link advapi32.lib"
+          "/link advapi32.lib dwmapi.lib user32.lib"
 $lines += 'if errorlevel 1 exit /b 1'
 $lines += 'endlocal'
 Set-Content -Path $bat -Value $lines -Encoding Ascii

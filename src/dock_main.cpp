@@ -50,9 +50,13 @@
 //   9. 后台应用挂起（默认关闭，右键菜单开启）：窗口全部最小化或纯托盘
 //      驻留（没有可见窗口）的应用，一旦不再处于顶栏焦点，就暂停它的全部
 //      进程（NtSuspendProcess）；还有可见且未最小化窗口的应用保持正常运行。
-//      按「同一 exe 的全部进程 + 安装目录树内的后代辅助进程」整组挂起
-//      （见 app_suspend.h），重新聚焦/交互时恢复。单个应用可在图标右键
-//      菜单勾选「不暂停此应用」永久豁免。离开焦点有 1.2s 宽限，交互/关闭
+//      进程归属优先用“每应用一个 Job Object”的沙箱：启动时把主进程放进
+//      Job（LaunchItem 的 ShellExecuteEx 句柄 / AdoptProcess），之后它
+//      创建的所有后代 —— 无论 exe 落在安装目录、%TEMP% 还是更新目录，
+//      也无论父进程是否已经退出 —— 都自动留在 Job 里，挂起时整组冻结；
+//      Job 不可用时退回“同一 exe + 跨目录后代”的快照选择（见
+//      app_suspend.h）。重新聚焦/交互时恢复。单个应用可在图标右键菜单
+//      勾选「不暂停此应用」永久豁免。离开焦点有 1.2s 宽限，交互/关闭
 //      前先恢复，正常退出/组件重启时恢复全部；挂起表持久化，Dock 被强杀后
 //      下次启动恢复。
 //      最小化窗口仍会出现在 Alt+Tab 里，冻结后切过去会卡死：因此顶栏键盘
@@ -4425,6 +4429,7 @@ void ReconcileAppSuspend(AppState& s, HWND focusHint = nullptr,
                     break;
                 case appsuspend::SuspendCode::NoProcesses:
                 case appsuspend::SuspendCode::AccessDenied:
+                case appsuspend::SuspendCode::VisibleWindow:
                 case appsuspend::SuspendCode::Failed:
                     LogSuspendResultThrottled(
                         s, key, L"[挂起] 跳过 %ls：%ls", name, r.detail);
@@ -4608,13 +4613,35 @@ void BringAppWindowGroupToFront(const std::vector<HWND>& windows, HWND target) {
 void LaunchItem(AppState& s, size_t idx) {
     if (idx >= s.items.size()) return;
     DockItem& item = s.items[idx];
-    HINSTANCE h = ShellExecuteW(s.hwnd, L"open", item.launchPath.c_str(),
-                                nullptr, nullptr, SW_SHOWNORMAL);
-    if (reinterpret_cast<INT_PTR>(h) <= 32) {
-        Logf(L"启动失败(%d)：%ls",
-             static_cast<int>(reinterpret_cast<INT_PTR>(h)),
+    // 用 ShellExecuteEx 而不是 ShellExecute：拿到目标进程句柄后立刻加入
+    // 该应用的 Job 沙箱，保证目标从第一个子进程起（包括落在 %TEMP%、
+    // 更新目录里的 helper）都在 Job 里。拿不到句柄（URL/DDE/UWP 等）
+    // 时退回原来的行为，后续仍可在挂起时按快照追加。
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+    sei.hwnd = s.hwnd;
+    sei.lpVerb = L"open";
+    sei.lpFile = item.launchPath.c_str();
+    sei.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei)) {
+        Logf(L"启动失败(%lu)：%ls", GetLastError(),
              item.launchPath.c_str());
         return;
+    }
+    // 只有真正可挂起的 exe 应用才入 Job：目录/未解析的 .lnk/UWP 的
+    // ShellExecuteEx 句柄可能指向 explorer 或别的宿主，绝不能把宿主
+    // 追加进应用 Job（Job 关联不可撤销）。
+    if (sei.hProcess) {
+        if (IsSuspendAppItem(item)) {
+            std::wstring jobDetail;
+            if (g_suspender.AdoptProcess(item.key, sei.hProcess,
+                                         &jobDetail)) {
+                Logf(L"[挂起] 启动后加入 Job：%ls（%ls）",
+                     item.displayName.c_str(), jobDetail.c_str());
+            }
+        }
+        CloseHandle(sei.hProcess);
     }
     Logf(L"启动请求：%ls → %ls", item.displayName.c_str(),
          item.launchPath.c_str());

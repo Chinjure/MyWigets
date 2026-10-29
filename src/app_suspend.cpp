@@ -1,14 +1,20 @@
 // app_suspend.cpp - 见 app_suspend.h 的口径说明
 //
-// 这里只做三件事：
-//   1. 从全量进程快照中按「同一 exe + 安装目录树内的后代」选出应用进程；
-//   2. 两阶段整组挂起/恢复（ntdll!NtSuspendProcess / NtResumeProcess）；
-//   3. 用 PID + 创建时间双保险，并把挂起表持久化，供异常退出后恢复。
+// 这里做四件事：
+//   1. 每应用一个 Job Object 做进程围栏：启动时/首次挂起时把主进程及其
+//      后代追加进去，Windows 自动把未来子进程（无论落在哪个目录）也
+//      放进 Job；父进程退出后 Job 成员仍可枚举；
+//   2. 挂起集合 = Job 成员 ∪ 快照选择（兜底允许跨目录后代），过滤系统
+//      进程、其它 Dock 应用、可见窗口、已由别的应用挂起的进程；
+//   3. 两阶段整组挂起/恢复（ntdll!NtSuspendProcess / NtResumeProcess），
+//      冻结后循环补冻 Job 新成员；已挂起应用每 2s 补挂新成员；
+//   4. 用 PID + 创建时间双保险，并把挂起表持久化，供异常退出后恢复。
 //
 // 不按进程树整棵挂起、不按 exe 名字合并、不碰系统基础设施，原因见头文件。
 
 #include "app_suspend.h"
 
+#include <dwmapi.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
@@ -272,6 +278,105 @@ bool IsProcessCritical(HANDLE proc) {
     return critical != FALSE;
 }
 
+// 该进程是否拥有一张“用户此刻看得到”的顶层窗口。用于两件事：
+//   1) 追加 Job 时，不把应用顺手拉起的浏览器/播放器/终端等外部程序
+//      及其 helper 圈进来；
+//   2) 冻结前复查 Job 成员，发现成员里冒出了可见窗口（例如更新器弹窗、
+//      被拉起的另一个应用），整组放弃，绝不让用户面前正在显示的窗口卡住。
+// 只看 IsWindowVisible + !IsIconic；被 DWM cloak 的 UWP 窗口也按“可见”
+// 处理，宁可少挂一个应用，也不误冻桌面。
+bool IsCloakedWindow(HWND hwnd) {
+    DWORD cloaked = 0;
+    return SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked,
+                                           sizeof(cloaked))) &&
+           cloaked != 0;
+}
+
+struct VisibleWindowSearch {
+    DWORD pid = 0;
+    bool found = false;
+};
+
+BOOL CALLBACK FindVisibleWindowProc(HWND hwnd, LPARAM param) {
+    auto* search = reinterpret_cast<VisibleWindowSearch*>(param);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != search->pid) return TRUE;
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || IsCloakedWindow(hwnd)) {
+        return TRUE;
+    }
+    RECT rect{};
+    if (!GetWindowRect(hwnd, &rect)) return TRUE;
+    if (rect.right <= rect.left || rect.bottom <= rect.top) return TRUE;
+    search->found = true;
+    return FALSE;
+}
+
+bool ProcessOwnsVisibleWindow(DWORD pid) {
+    if (pid == 0) return false;
+    VisibleWindowSearch search;
+    search.pid = pid;
+    EnumWindows(FindVisibleWindowProc, reinterpret_cast<LPARAM>(&search));
+    return search.found;
+}
+
+// 一次枚举所有“可见且未最小化”的顶层窗口，返回 PID 集合。避免为每个
+// 候选进程各 EnumWindows 一遍（2s 复核 × 多应用 × 多 helper 会很贵）。
+std::unordered_set<DWORD> VisibleWindowPids() {
+    std::unordered_set<DWORD> pids;
+    EnumWindows(
+        [](HWND hwnd, LPARAM param) -> BOOL {
+            auto* out = reinterpret_cast<std::unordered_set<DWORD>*>(param);
+            if (!IsWindowVisible(hwnd) || IsIconic(hwnd) ||
+                IsCloakedWindow(hwnd)) {
+                return TRUE;
+            }
+            RECT rect{};
+            if (!GetWindowRect(hwnd, &rect)) return TRUE;
+            if (rect.right <= rect.left || rect.bottom <= rect.top) {
+                return TRUE;
+            }
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid != 0) out->insert(pid);
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&pids));
+    return pids;
+}
+
+std::vector<DWORD> QueryJobProcessIds(HANDLE job) {
+    std::vector<DWORD> pids;
+    if (!job) return pids;
+    DWORD capacity = 256;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        std::vector<BYTE> buffer(
+            sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) +
+            static_cast<size_t>(capacity) * sizeof(ULONG_PTR));
+        auto* list =
+            reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST*>(buffer.data());
+        list->NumberOfAssignedProcesses = capacity;
+        list->NumberOfProcessIdsInList = 0;
+        DWORD needed = 0;
+        if (!QueryInformationJobObject(job, JobObjectBasicProcessIdList, list,
+                                       static_cast<DWORD>(buffer.size()),
+                                       &needed)) {
+            return pids;
+        }
+        const DWORD count = list->NumberOfProcessIdsInList;
+        if (count < capacity) {
+            pids.reserve(count);
+            for (DWORD i = 0; i < count; ++i) {
+                pids.push_back(
+                    static_cast<DWORD>(list->ProcessIdList[i]));
+            }
+            return pids;
+        }
+        capacity *= 4;
+    }
+    return pids;
+}
+
 }  // namespace
 
 std::wstring NormalizePath(const std::wstring& path) {
@@ -412,7 +517,8 @@ std::vector<ProcessEntry> SnapshotProcesses() {
 
 Selection SelectAppProcesses(
     const std::wstring& appKey, const std::vector<ProcessEntry>& snapshot,
-    const std::unordered_set<std::wstring>* foreignAppKeys) {
+    const std::unordered_set<std::wstring>* foreignAppKeys,
+    bool includeExternalDescendants) {
     Selection sel;
     const std::wstring key = NormalizePath(appKey);
     if (key.empty()) {
@@ -471,7 +577,10 @@ Selection SelectAppProcesses(
             const bool inside =
                 !sel.broadRoot && !sel.installRoot.empty() &&
                 IsInsideDir(child.imagePath, sel.installRoot);
-            if (!sameDir && !inside) continue;  // 外部程序：不碰
+            // 默认只收安装目录树内的 helper；Job 沙箱路径或兜底补挂时
+            // 允许跨目录后代（应用把 helper.exe 落到 %TEMP% / AppData 再
+            // 拉起的场景）。外部程序仍由调用方用可见窗口过滤。
+            if (!sameDir && !inside && !includeExternalDescendants) continue;
             selected[childIndex] = true;
             pending.push(childIndex);
             ++sel.helperMatches;
@@ -492,12 +601,14 @@ Selection SelectAppProcesses(
 
     sel.note = L"精确 " + std::to_wstring(sel.exactMatches) + L" + 辅助 " +
                std::to_wstring(sel.helperMatches) + L"（根 " +
-               sel.installRoot + (sel.broadRoot ? L"，宽泛目录" : L"") + L"）";
+               sel.installRoot + (sel.broadRoot ? L"，宽泛目录" : L"") +
+               (includeExternalDescendants ? L"，含跨目录后代" : L"") + L"）";
     return sel;
 }
 
 struct Suspender::Impl {
     bool persist = true;
+    bool useJobSandbox = true;
     ULONGLONG minProcessAgeMs = kMinProcessAgeDefaultMs;
     std::wstring stateValueName = L"SuspendedState";
     bool initialized = false;
@@ -506,11 +617,397 @@ struct Suspender::Impl {
 
     std::unordered_map<std::wstring, std::vector<TrackedProcess>> apps;
     std::unordered_map<ProcKey, std::wstring, ProcKeyHash> owner;
+    // 每个应用一个 Job。Job 只做进程归属围栏：不设 UI 限制、不设
+    // breakaway、不设 kill-on-close，因此不会改变应用的行为，也不会在
+    // Dock 退出时杀进程；Job 句柄关闭后进程继续运行。
+    std::unordered_map<std::wstring, HANDLE> jobs;
 
-    Impl(bool persistState, ULONGLONG minAge, std::wstring valueName)
+    Impl(bool persistState, ULONGLONG minAge, std::wstring valueName,
+         bool jobSandbox)
         : persist(persistState),
+          useJobSandbox(jobSandbox),
           minProcessAgeMs(minAge),
           stateValueName(std::move(valueName)) {}
+
+    ~Impl() {
+        for (auto& kv : jobs) {
+            if (kv.second) CloseHandle(kv.second);
+        }
+        jobs.clear();
+    }
+
+    HANDLE EnsureJob(const std::wstring& key) {
+        if (!useJobSandbox) return nullptr;
+        auto it = jobs.find(key);
+        if (it != jobs.end()) return it->second;
+        HANDLE job = CreateJobObjectW(nullptr, nullptr);
+        if (!job) return nullptr;
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
+        // LimitFlags = 0：不允许主动 breakaway、不 kill-on-close、无 UI
+        // 限制。UI 限制会阻止 Chromium/Electron 自己再嵌套 sandbox Job。
+        info.BasicLimitInformation.LimitFlags = 0;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info,
+                                sizeof(info));
+        jobs.emplace(key, job);
+        return job;
+    }
+
+    // 把快照里属于该应用的进程（含跨目录后代）追加进 Job。已在该 Job
+    // 里的进程跳过；受保护/无权限的进程只记录失败，不阻断其它成员 ——
+    // Job 是增强路径，失败时 SuspendMany 仍有快照兜底。
+    size_t AdoptIntoJob(const std::wstring& key, HANDLE job,
+                        const std::vector<ProcessEntry>& snapshot,
+                        const std::unordered_set<std::wstring>& foreignKeys,
+                        const std::unordered_set<DWORD>& visiblePids,
+                        size_t* failed) {
+        if (!job) return 0;
+        const Selection adopt = SelectAppProcesses(
+            key, snapshot, &foreignKeys, /*includeExternalDescendants=*/true);
+        if (adopt.processes.empty()) return 0;
+
+        std::unordered_map<DWORD, const ProcessEntry*> byPid;
+        byPid.reserve(snapshot.size());
+        for (const ProcessEntry& e : snapshot) byPid[e.pid] = &e;
+
+        // 父进程创建时间一定早于子进程（SelectAppProcesses 已校验），
+        // 按创建时间排序就是“先父后子”，保证追加过程中新创建的子进程
+        // 也能继承 Job。
+        std::vector<ProcessRef> ordered = adopt.processes;
+        std::sort(ordered.begin(), ordered.end(),
+                  [&byPid](const ProcessRef& a, const ProcessRef& b) {
+                      const auto ia = byPid.find(a.pid);
+                      const auto ib = byPid.find(b.pid);
+                      const ULONGLONG ta =
+                          ia == byPid.end() ? 0 : ia->second->creationTime;
+                      const ULONGLONG tb =
+                          ib == byPid.end() ? 0 : ib->second->creationTime;
+                      if (ta != tb) return ta < tb;
+                      return a.pid < b.pid;
+                  });
+
+        // 可见窗口的外部程序及其后代不追加：那是用户正在看的另一个
+        // 应用，不属于本应用的后台 helper。
+        std::unordered_set<DWORD> excluded;
+        size_t adopted = 0;
+        for (const ProcessRef& ref : ordered) {
+            auto entryIt = byPid.find(ref.pid);
+            if (entryIt == byPid.end()) continue;
+            const ProcessEntry& entry = *entryIt->second;
+            const bool isRoot = entry.imagePath == key;
+            if (!isRoot) {
+                if (excluded.count(entry.parentPid) != 0) {
+                    excluded.insert(ref.pid);
+                    continue;
+                }
+                if (visiblePids.count(ref.pid) != 0) {
+                    excluded.insert(ref.pid);
+                    continue;
+                }
+            }
+            auto owned = owner.find(ProcKey{ref.pid, ref.creationTime});
+            if (owned != owner.end() && owned->second != key) {
+                excluded.insert(ref.pid);
+                continue;
+            }
+
+            // 先用最小权限查一次是否已在 Job：已经在 Job 里的成员占多数，
+            // 这样 2s 复核不会对每个 helper 都请求 PROCESS_SET_QUOTA。
+            HANDLE probe = OpenVerified(
+                ref.pid, ref.creationTime,
+                PROCESS_QUERY_LIMITED_INFORMATION, nullptr);
+            if (!probe) {
+                if (failed) ++*failed;
+                continue;
+            }
+            BOOL already = FALSE;
+            const BOOL inJob = IsProcessInJob(probe, job, &already);
+            CloseHandle(probe);
+            if (inJob && already) continue;
+
+            DWORD err = ERROR_SUCCESS;
+            HANDLE proc = OpenVerified(
+                ref.pid, ref.creationTime,
+                PROCESS_SET_QUOTA | PROCESS_TERMINATE |
+                    PROCESS_QUERY_LIMITED_INFORMATION,
+                &err);
+            if (!proc) {
+                if (failed) ++*failed;
+                continue;
+            }
+            if (!AssignProcessToJobObject(job, proc)) {
+                if (failed) ++*failed;
+            } else {
+                ++adopted;
+            }
+            CloseHandle(proc);
+        }
+        return adopted;
+    }
+
+    // Job 当前成员（含子 Job），转换成 PID + 创建时间。快照里没有的
+    // 新进程现场补查创建时间；查不到就丢弃，避免 PID 复用。
+    std::vector<ProcessRef> JobMembers(const std::wstring& key,
+                                       size_t* unreadable = nullptr) {
+        std::vector<ProcessRef> members;
+        if (!useJobSandbox) return members;
+        auto it = jobs.find(key);
+        if (it == jobs.end() || !it->second) return members;
+        const std::vector<DWORD> pids = QueryJobProcessIds(it->second);
+        members.reserve(pids.size());
+        for (DWORD pid : pids) {
+            if (pid == 0 || pid == GetCurrentProcessId()) continue;
+            HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                      pid);
+            if (!proc) {
+                // Job 列表里可能还残留刚退出的 PID；这不是“无权限”，
+                // 不能因此让整组挂起失败。只有真正的拒绝访问才计入
+                // unreadable。
+                const DWORD err = GetLastError();
+                if (err != ERROR_INVALID_PARAMETER &&
+                    err != ERROR_NOT_FOUND) {
+                    if (unreadable) ++*unreadable;
+                }
+                continue;
+            }
+            // Job 列表理论上不会把已退出/复用的 PID 留给我们，但这里
+            // 再做一次 IsProcessInJob 核对，挡住极端 PID 复用。
+            BOOL belongs = FALSE;
+            if (!IsProcessInJob(proc, it->second, &belongs) || !belongs) {
+                CloseHandle(proc);
+                continue;
+            }
+            ULONGLONG created = 0;
+            const bool ok = QueryCreationTime(proc, &created);
+            const DWORD timeError = GetLastError();
+            CloseHandle(proc);
+            // 句柄已拿到但查询失败：多半是进程正在退出（残留句柄），
+            // 跳过；只有明确的拒绝访问才让整组放弃。
+            if (!ok || created == 0) {
+                if (!ok && timeError == ERROR_ACCESS_DENIED) {
+                    if (unreadable) ++*unreadable;
+                }
+                continue;
+            }
+            members.push_back(ProcessRef{pid, created});
+        }
+        return members;
+    }
+
+    bool AdoptProcess(const std::wstring& appKey, HANDLE process,
+                      std::wstring* detail) {
+        if (!process) {
+            if (detail) *detail = L"空进程句柄";
+            return false;
+        }
+        const std::wstring key = NormalizePath(appKey);
+        if (key.empty()) {
+            if (detail) *detail = L"空应用 key";
+            return false;
+        }
+        // 绝不能把系统基础设施/本套件自己塞进 Job；调用方传错 key 时
+        // 这里再兜一层。
+        if (IsNeverSuspendImage(key)) {
+            if (detail) *detail = L"该镜像永不挂起，拒绝加入 Job";
+            return false;
+        }
+        HANDLE job = EnsureJob(key);
+        if (!job) {
+            if (detail) *detail = L"Job 不可用";
+            return false;
+        }
+        BOOL already = FALSE;
+        if (IsProcessInJob(process, job, &already) && already) {
+            if (detail) *detail = L"已在 Job 中";
+            return true;
+        }
+        if (!AssignProcessToJobObject(job, process)) {
+            if (detail) {
+                *detail = L"AssignProcessToJobObject 失败：" +
+                           std::to_wstring(GetLastError());
+            }
+            return false;
+        }
+        if (detail) *detail = L"已加入 Job";
+        return true;
+    }
+
+    struct CandidateSet {
+        std::vector<ProcessRef> refs;
+        std::unordered_set<DWORD> blockedPids;
+        size_t skipped = 0;
+        size_t ownedByOther = 0;
+        size_t unreadable = 0;
+        bool visibleWindow = false;
+        std::wstring note;
+    };
+
+    // 汇总“本次要冻结的进程”：Job 成员（若有）∪ 快照选择（含跨目录
+    // 后代），再过滤永不挂起、其它 Dock 应用的整棵子树、已由别的应用
+    // 挂起的进程，以及拥有可见窗口的外部程序。
+    CandidateSet BuildCandidates(
+        const std::wstring& key,
+        const std::vector<ProcessEntry>& snapshot,
+        const std::unordered_set<std::wstring>& foreignKeys,
+        const std::unordered_set<DWORD>& visiblePids) {
+        CandidateSet out;
+        std::unordered_map<DWORD, const ProcessEntry*> byPid;
+        byPid.reserve(snapshot.size());
+        for (const ProcessEntry& e : snapshot) byPid[e.pid] = &e;
+
+        // 其它 Dock 应用及其后代整棵排除：即使 Job 因继承把它们带进来，
+        // 也不应该由当前应用冻结（Office 的 WINWORD 拉起 EXCEL 等）。
+        std::unordered_set<DWORD> blocked;
+        std::unordered_map<DWORD, std::vector<DWORD>> children;
+        for (const ProcessEntry& e : snapshot) {
+            children[e.parentPid].push_back(e.pid);
+            if (e.imagePath != key && foreignKeys.count(e.imagePath) != 0) {
+                blocked.insert(e.pid);
+            }
+        }
+        if (!blocked.empty()) {
+            std::queue<DWORD> pending;
+            for (DWORD pid : blocked) pending.push(pid);
+            while (!pending.empty()) {
+                const DWORD pid = pending.front();
+                pending.pop();
+                auto it = children.find(pid);
+                if (it == children.end()) continue;
+                for (DWORD child : it->second) {
+                    if (blocked.insert(child).second) pending.push(child);
+                }
+            }
+        }
+
+        const Selection sel = SelectAppProcesses(
+            key, snapshot, &foreignKeys, /*includeExternalDescendants=*/true);
+
+        const std::vector<ProcessRef> jobMembers =
+            JobMembers(key, &out.unreadable);
+        std::vector<ProcessRef> merged;
+        merged.reserve(sel.processes.size() + jobMembers.size());
+        std::unordered_set<ProcKey, ProcKeyHash> seen;
+        auto addRef = [&merged, &seen](const ProcessRef& ref) {
+            if (ref.pid == 0 || ref.creationTime == 0) return;
+            if (seen.insert(ProcKey{ref.pid, ref.creationTime}).second) {
+                merged.push_back(ref);
+            }
+        };
+        for (const ProcessRef& ref : jobMembers) addRef(ref);
+        for (const ProcessRef& ref : sel.processes) addRef(ref);
+
+        for (const ProcessRef& ref : merged) {
+            const ProcessEntry* entry = nullptr;
+            auto byPidIt = byPid.find(ref.pid);
+            if (byPidIt != byPid.end()) entry = byPidIt->second;
+
+            // Job 里可能有快照之后才创建的新进程：现场查镜像路径。
+            ProcessEntry fetched;
+            if (!entry) {
+                HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                          FALSE, ref.pid);
+                if (!proc) {
+                    ++out.skipped;
+                    continue;
+                }
+                wchar_t image[32768] = {};
+                DWORD len = 32760;
+                if (QueryFullProcessImageNameW(proc, 0, image, &len) &&
+                    len > 0) {
+                    fetched.pid = ref.pid;
+                    fetched.creationTime = ref.creationTime;
+                    fetched.imagePath = NormalizePath(image);
+                }
+                CloseHandle(proc);
+                if (fetched.imagePath.empty()) {
+                    ++out.skipped;
+                    continue;
+                }
+                entry = &fetched;
+            }
+
+            if (IsNeverSuspendImage(entry->imagePath)) {
+                ++out.skipped;
+                continue;
+            }
+            // 快照之后才创建、因 Job 继承而带进来的另一个 Dock 应用：
+            // 同样不能由当前应用冻结。
+            if (entry->imagePath != key &&
+                (blocked.count(ref.pid) != 0 ||
+                 foreignKeys.count(entry->imagePath) != 0)) {
+                ++out.skipped;
+                continue;
+            }
+            auto owned = owner.find(ProcKey{ref.pid, ref.creationTime});
+            if (owned != owner.end()) {
+                if (owned->second != key) ++out.ownedByOther;
+                ++out.skipped;
+                continue;
+            }
+            if (visiblePids.count(ref.pid) != 0) {
+                out.visibleWindow = true;
+                out.note = L"成员 pid " + std::to_wstring(ref.pid) +
+                           L" 仍有可见且未最小化的窗口";
+                return out;
+            }
+            out.refs.push_back(ref);
+        }
+        out.blockedPids = std::move(blocked);
+        out.note = sel.note + L"；Job 成员 " +
+                   std::to_wstring(jobMembers.size()) + L" -> 待挂起 " +
+                   std::to_wstring(out.refs.size());
+        if (out.unreadable > 0) {
+            out.note += L"；Job 中 " + std::to_wstring(out.unreadable) +
+                        L" 个进程无法核对（保持整组一致，放弃挂起）";
+        }
+        return out;
+    }
+
+    // 已挂起应用的补挂：Job/快照里出现新成员（旧代码只看首次挂起）就
+    // 单独 suspend，绝不重复 suspend 已在 owner 表里的进程。
+    size_t TopUpSuspended(const std::wstring& key,
+                          const std::vector<ProcessEntry>& snapshot,
+                          const std::unordered_set<std::wstring>& foreignKeys,
+                          const std::unordered_set<DWORD>& visiblePids,
+                          size_t* skipped, bool* visible) {
+        // 已挂起应用可能又启动了同一 exe 的新实例；先把新根追加进 Job，
+        // 否则它后续再异步拉起的跨目录 helper 不会继承 Job。
+        HANDLE job = GetJob(key);
+        if (job) {
+            AdoptIntoJob(key, job, snapshot, foreignKeys, visiblePids,
+                         nullptr);
+        }
+        CandidateSet candidates =
+            BuildCandidates(key, snapshot, foreignKeys, visiblePids);
+        if (visible) *visible = candidates.visibleWindow;
+        if (skipped) *skipped = candidates.skipped + candidates.unreadable;
+        if (candidates.visibleWindow || candidates.unreadable > 0) return 0;
+        size_t added = 0;
+        for (const ProcessRef& ref : candidates.refs) {
+            // 快照之后才出现的窗口这里再确认一次，绝不冻结用户眼前的
+            // 新窗口（尤其是补挂路径）。
+            if (ProcessOwnsVisibleWindow(ref.pid)) continue;
+            DWORD err = ERROR_SUCCESS;
+            HANDLE proc = OpenVerified(
+                ref.pid, ref.creationTime,
+                PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION,
+                &err);
+            if (!proc) continue;
+            if (!NtSuccess(suspendFn(proc))) {
+                CloseHandle(proc);
+                continue;
+            }
+            CloseHandle(proc);
+            owner[ProcKey{ref.pid, ref.creationTime}] = key;
+            apps[key].push_back(TrackedProcess{ref.pid, ref.creationTime});
+            ++added;
+        }
+        return added;
+    }
+
+    HANDLE GetJob(const std::wstring& key) {
+        auto it = jobs.find(key);
+        return it == jobs.end() ? nullptr : it->second;
+    }
 
     bool Initialize() {
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
@@ -537,7 +1034,9 @@ struct Suspender::Impl {
 
         bool stateChanged = false;
         std::vector<size_t> todo;
+        std::vector<size_t> already;
         todo.reserve(requests.size());
+        already.reserve(requests.size());
         for (size_t i = 0; i < requests.size(); ++i) {
             const std::wstring key = NormalizePath(requests[i].appKey);
             if (key.empty()) {
@@ -564,6 +1063,7 @@ struct Suspender::Impl {
                         stateChanged = true;
                     }
                     results[i].code = SuspendCode::AlreadySuspended;
+                    already.push_back(i);
                     continue;
                 }
                 apps.erase(existing);
@@ -571,7 +1071,7 @@ struct Suspender::Impl {
             }
             todo.push_back(i);
         }
-        if (todo.empty()) {
+        if (todo.empty() && already.empty()) {
             if (stateChanged) Persist();
             return results;
         }
@@ -592,6 +1092,43 @@ struct Suspender::Impl {
             return results;
         }
 
+        std::unordered_set<DWORD> visiblePids = VisibleWindowPids();
+
+        // 已挂起应用的 2s 复核：Job/快照里出现新成员就补挂。旧实现直接
+        // return AlreadySuspended，导致“挂起后才异步拉起的进程”一直活到
+        // 下一次恢复。补挂不重复 suspend 已在跟踪表里的进程。
+        for (size_t index : already) {
+            SuspendResult& result = results[index];
+            const std::wstring key = NormalizePath(requests[index].appKey);
+            const HANDLE job = GetJob(key);
+            result.jobSandbox = job != nullptr;
+            result.jobMembers = job ? QueryJobProcessIds(job).size() : 0;
+            size_t skipped = 0;
+            bool visible = false;
+            const size_t added = TopUpSuspended(
+                key, snapshot, foreignAppKeys, visiblePids, &skipped,
+                &visible);
+            if (job) result.jobMembers = QueryJobProcessIds(job).size();
+            result.skipped = skipped;
+            if (added > 0) {
+                stateChanged = true;
+                result.code = SuspendCode::Suspended;
+                result.suspended = added;
+                result.detail = L"补挂新成员 " + std::to_wstring(added);
+                if (visible) {
+                    result.detail += L"；另有成员出现可见窗口，已跳过";
+                }
+                continue;
+            }
+            result.code = SuspendCode::AlreadySuspended;
+            result.detail = L"已在挂起态";
+            if (visible) {
+                result.detail += L"；Job 成员出现可见窗口，跳过补挂";
+            } else if (skipped > 0) {
+                result.detail += L"；本轮无可补挂成员";
+            }
+        }
+
         FILETIME nowFt{};
         GetSystemTimeAsFileTime(&nowFt);
         const ULONGLONG now = FileTimeToU64(nowFt);
@@ -601,12 +1138,39 @@ struct Suspender::Impl {
             SuspendResult& result = results[requestIndex];
             const std::wstring key =
                 NormalizePath(requests[requestIndex].appKey);
-            const Selection sel = SelectAppProcesses(key, snapshot,
-                                                    &foreignAppKeys);
-            result.matched = sel.processes.size();
-            result.detail = sel.note;
-
-            if (sel.processes.empty()) {
+            HANDLE job = EnsureJob(key);
+            size_t adoptFailed = 0;
+            const size_t adopted = AdoptIntoJob(
+                key, job, snapshot, foreignAppKeys, visiblePids,
+                &adoptFailed);
+            // 追加 Job 期间可能有 helper 刚显示窗口；冻结前重新取一次，
+            // 避免把用户眼前的新窗口一起冻住。
+            visiblePids = VisibleWindowPids();
+            CandidateSet candidates = BuildCandidates(
+                key, snapshot, foreignAppKeys, visiblePids);
+            result.jobSandbox = job != nullptr;
+            result.jobMembers =
+                job ? static_cast<size_t>(QueryJobProcessIds(job).size()) : 0;
+            result.matched = candidates.refs.size();
+            result.detail = candidates.note;
+            if (job) {
+                result.detail += L"；Job 追加 " + std::to_wstring(adopted);
+                if (adoptFailed > 0) {
+                    result.detail += L"（失败 " +
+                                     std::to_wstring(adoptFailed) + L"）";
+                }
+            }
+            if (candidates.visibleWindow) {
+                result.code = SuspendCode::VisibleWindow;
+                result.detail += L"；可见窗口成员，放弃本次挂起";
+                continue;
+            }
+            if (candidates.unreadable > 0) {
+                result.code = SuspendCode::AccessDenied;
+                result.detail += L"；Job 成员无法核对，放弃本次挂起";
+                continue;
+            }
+            if (candidates.refs.empty()) {
                 result.code = SuspendCode::NoProcesses;
                 continue;
             }
@@ -615,7 +1179,7 @@ struct Suspender::Impl {
             // 主进程被冻住、辅助进程还没初始化完的半启动状态。
             ULONGLONG maxRetry100ns = 0;
             bool tooYoung = false;
-            for (const ProcessRef& ref : sel.processes) {
+            for (const ProcessRef& ref : candidates.refs) {
                 if (ref.creationTime == 0 || ref.creationTime > now) {
                     continue;
                 }
@@ -639,7 +1203,7 @@ struct Suspender::Impl {
             // 两阶段：先把整组进程都打开并核对，再统一挂起。
             // 任意一个成员无权限/受保护就整组放弃 —— 只冻住一半（例如主
             // 进程还在、渲染 helper 被冻）比不冻更容易把应用挂死。
-            std::vector<TrackedProcess> candidates;
+            std::vector<TrackedProcess> tracked;
             std::vector<HANDLE> handles;
             size_t accessDenied = 0;
             size_t critical = 0;
@@ -647,7 +1211,7 @@ struct Suspender::Impl {
             size_t ownedByOther = 0;
             bool aborted = false;
 
-            for (const ProcessRef& ref : sel.processes) {
+            for (const ProcessRef& ref : candidates.refs) {
                 if (ref.creationTime == 0) {
                     ++accessDenied;
                     aborted = true;
@@ -681,7 +1245,7 @@ struct Suspender::Impl {
                     aborted = true;
                     break;
                 }
-                candidates.push_back(
+                tracked.push_back(
                     TrackedProcess{ref.pid, ref.creationTime});
                 handles.push_back(proc);
             }
@@ -689,7 +1253,7 @@ struct Suspender::Impl {
             if (aborted) {
                 for (HANDLE h : handles) CloseHandle(h);
                 result.code = SuspendCode::AccessDenied;
-                result.skipped = sel.processes.size();
+                result.skipped = candidates.refs.size();
                 result.detail += L"；为保证整组一致，放弃本次挂起";
                 if (accessDenied > 0) {
                     result.detail += L"（无权限/无法核对 " +
@@ -725,7 +1289,95 @@ struct Suspender::Impl {
                 }
                 ++suspended;
             }
-            if (suspendFailed) {
+
+            // 关掉“枚举之后、冻结生效之前”的窗口：这段时间父进程可能
+            // 刚创建了子进程，它已经继承 Job，但不在上面的 handles 里。
+            // 全部成员冻结后不会再有新进程；循环补冻直到没有新成员。
+            std::unordered_set<ProcKey, ProcKeyHash> seen;
+            for (const TrackedProcess& t : tracked) {
+                seen.insert(ProcKey{t.pid, t.creation});
+            }
+            bool quiesceFailed = false;
+            bool quiesceVisible = false;
+            for (int pass = 0; pass < 8 && !suspendFailed &&
+                                !quiesceFailed;
+                 ++pass) {
+                bool added = false;
+                size_t unreadableNow = 0;
+                const std::vector<ProcessRef> members =
+                    JobMembers(key, &unreadableNow);
+                if (unreadableNow > 0) {
+                    quiesceFailed = true;
+                    break;
+                }
+                for (const ProcessRef& ref : members) {
+                    const ProcKey pk{ref.pid, ref.creationTime};
+                    if (!seen.insert(pk).second) continue;
+                    if (owner.count(pk) != 0) continue;
+                    if (candidates.blockedPids.count(ref.pid) != 0) continue;
+
+                    std::wstring image;
+                    for (const ProcessEntry& e : snapshot) {
+                        if (e.pid == ref.pid) {
+                            image = e.imagePath;
+                            break;
+                        }
+                    }
+                    if (image.empty()) {
+                        HANDLE probe = OpenProcess(
+                            PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ref.pid);
+                        if (probe) {
+                            wchar_t path[32768] = {};
+                            DWORD len = 32760;
+                            if (QueryFullProcessImageNameW(probe, 0, path,
+                                                           &len) &&
+                                len > 0) {
+                                image = NormalizePath(path);
+                            }
+                            CloseHandle(probe);
+                        }
+                    }
+                    if (image.empty()) {
+                        // 查不到镜像就无法判断是不是 helper/系统进程；
+                        // 为保证整组一致，回滚本次挂起而不是跳过。
+                        quiesceFailed = true;
+                        break;
+                    }
+                    if (IsNeverSuspendImage(image)) continue;
+                    if (image != key &&
+                        foreignAppKeys.count(image) != 0) {
+                        continue;
+                    }
+                    if (ProcessOwnsVisibleWindow(ref.pid)) {
+                        quiesceVisible = true;
+                        quiesceFailed = true;
+                        break;
+                    }
+                    DWORD err = ERROR_SUCCESS;
+                    HANDLE proc = OpenVerified(
+                        ref.pid, ref.creationTime,
+                        PROCESS_SUSPEND_RESUME |
+                            PROCESS_QUERY_LIMITED_INFORMATION,
+                        &err);
+                    if (!proc) {
+                        quiesceFailed = true;
+                        break;
+                    }
+                    if (!NtSuccess(suspendFn(proc))) {
+                        CloseHandle(proc);
+                        quiesceFailed = true;
+                        break;
+                    }
+                    handles.push_back(proc);
+                    tracked.push_back(
+                        TrackedProcess{ref.pid, ref.creationTime});
+                    ++suspended;
+                    added = true;
+                }
+                if (!added) break;
+            }
+
+            if (suspendFailed || quiesceFailed) {
                 // 回滚已成功挂起的那部分，避免应用处于半冻结状态。
                 // 只恢复本次确实挂起过的前 suspended 个句柄，绝不误碰
                 // 调用前就被别的组件挂起的进程。
@@ -734,13 +1386,17 @@ struct Suspender::Impl {
                 std::vector<TrackedProcess> stuck;
                 for (size_t i = 0; i < suspended; ++i) {
                     if (!NtSuccess(resumeFn(handles[i]))) {
-                        stuck.push_back(candidates[i]);
+                        stuck.push_back(tracked[i]);
                     }
                 }
                 for (HANDLE h : handles) CloseHandle(h);
-                result.code = SuspendCode::Failed;
-                result.skipped = sel.processes.size();
-                result.detail += L"；挂起中途失败";
+                result.code = quiesceVisible ? SuspendCode::VisibleWindow
+                                             : SuspendCode::Failed;
+                result.skipped = candidates.refs.size();
+                result.detail += quiesceVisible
+                                     ? L"；补冻阶段发现新成员有可见窗口，"
+                                       L"已回滚"
+                                     : L"；挂起中途失败";
                 if (!stuck.empty()) {
                     for (const TrackedProcess& t : stuck) {
                         owner[ProcKey{t.pid, t.creation}] = key;
@@ -755,14 +1411,14 @@ struct Suspender::Impl {
             }
 
             for (HANDLE h : handles) CloseHandle(h);
-            for (const TrackedProcess& t : candidates) {
+            for (const TrackedProcess& t : tracked) {
                 owner[ProcKey{t.pid, t.creation}] = key;
             }
-            apps[key] = std::move(candidates);
+            apps[key] = std::move(tracked);
             stateChanged = true;
             result.code = SuspendCode::Suspended;
             result.suspended = suspended;
-            result.skipped = sel.processes.size() - suspended;
+            result.skipped = candidates.refs.size() - suspended;
             result.detail += L"；已挂起 " + std::to_wstring(suspended);
             if (reused > 0) {
                 result.detail += L"，已退出 " + std::to_wstring(reused);
@@ -1040,9 +1696,10 @@ struct Suspender::Impl {
 };
 
 Suspender::Suspender(bool persist, ULONGLONG minProcessAgeMs,
-                     std::wstring stateValueName)
+                     std::wstring stateValueName, bool useJobSandbox)
     : impl_(std::make_unique<Impl>(persist, minProcessAgeMs,
-                                   std::move(stateValueName))) {}
+                                   std::move(stateValueName),
+                                   useJobSandbox)) {}
 
 Suspender::~Suspender() {
     if (impl_) impl_->ResumeAll();
@@ -1054,6 +1711,18 @@ std::vector<SuspendResult> Suspender::SuspendMany(
     const std::vector<SuspendRequest>& requests,
     const std::vector<std::wstring>& allAppKeys) {
     return impl_->SuspendMany(requests, allAppKeys);
+}
+
+bool Suspender::AdoptProcess(const std::wstring& appKey, HANDLE process,
+                             std::wstring* detail) {
+    return impl_->AdoptProcess(appKey, process, detail);
+}
+
+size_t Suspender::JobMemberCount(const std::wstring& appKey) const {
+    if (!impl_) return 0;
+    auto it = impl_->jobs.find(NormalizePath(appKey));
+    if (it == impl_->jobs.end() || !it->second) return 0;
+    return QueryJobProcessIds(it->second).size();
 }
 
 bool Suspender::Resume(const std::wstring& appKey, std::wstring* detail) {

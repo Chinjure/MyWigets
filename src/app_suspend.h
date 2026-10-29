@@ -42,17 +42,24 @@
 //   进程集合 =
 //     A. 所有镜像路径恰好等于 key 的进程（多进程应用的主体，如 Chrome
 //        的全部 chrome.exe）；
-//     B. 从 A 出发、仍在同一安装目录树内的后代进程（不同 exe 的辅助进程，
-//        如微信的 WeChatAppEx.exe、Electron 的渲染/GPU helper、Steam 的
-//        steamwebhelper.exe）。
+//     B. 从 A 出发的后代进程（不同 exe 的辅助进程，如微信的
+//        WeChatAppEx.exe、Electron 的渲染/GPU helper、Steam 的
+//        steamwebhelper.exe；也包括应用把 exe 落到 %TEMP%、更新目录
+//        后再拉起的子进程）。
 //
-//   B 的「同一安装目录树」有严格边界：
-//     - 常态下要求子进程镜像位于应用 exe 所在安装根目录之下；
-//     - 安装根若是 Windows/Program Files/用户目录等宽泛目录，只允许与
-//       主 exe **同目录** 的后代，避免把系统进程或隔壁应用吞进来；
-//     - 只沿已选中的进程向下扩展。因此应用 A 启动的外部程序如果不在 A
-//       的安装目录内，它和它的后代都不会被选中；A 的启动器父进程也不会
-//       被选中（只收后代，不收祖先）。
+//   B 有两条路径：
+//     1) 首选「Job 沙箱」：应用主进程被放进每个应用独立的 Job Object，
+//        Windows 在创建子进程时自动把后代放进同一个 Job，后续无论
+//        子进程从哪个目录启动、父进程是否已经退出，都不会漏。
+//     2) Job 不可用时的兜底：按进程快照的父子关系向下遍历，并允许
+//        跨安装目录；但只用于已经存在的后代，无法覆盖「枚举之后才
+//        创建」的进程，所以仍需 2s 复核补挂。
+//
+// 兜底遍历仍排除：
+//   - 永不挂起的系统/套件进程；
+//   - Dock 中另一个应用的 key（应用 A 拉起的应用 B 不应算 A 的 helper）；
+//   - 拥有可见且未最小化顶层窗口的外部程序及其后代（那是用户正在看的
+//     另一个应用，不能因为 A 收起窗口就被一起冻住）。
 //
 // 另外用进程创建时间做 PID 复用防护：挂起/恢复前重新打开进程并核对
 // 创建时间，绝不把「同 PID 的新进程」当成原来那个进程。
@@ -63,10 +70,14 @@
 //     还在、渲染 helper 被冻）比不冻更容易把应用挂死；
 //   - 再统一调用 NtSuspendProcess；中途失败立即回滚已挂起的成员，仍回滚
 //     失败的保留在跟踪表里，退出时 ResumeAll 还能再试；
+//   - 挂起后重新枚举 Job 成员：父进程在「枚举之后、冻结生效之前」刚创建
+//     的子进程已经自动进入 Job，但不在第一批句柄里。循环补冻直到没有新
+//     成员，冻结后的进程不可能再创建新进程，因此能收敛；
 //   - 恢复用 NtResumeProcess，只递减一次挂起计数，不会把别的组件（调试器、
 //     系统）挂起的线程误恢复；
-//   - 子进程不需要额外监控：进程被挂起后无法再创建新进程；挂起瞬间的
-//     极窄竞态由 Dock 的 2s 保底复核兜底；
+//   - 已挂起应用每 2s 复核时做一次「补挂」：Job 里出现新的成员（例如被
+//     另一个未冻结的兄弟进程拉起）就单独挂起，不重复挂起已在跟踪表中的
+//     进程（重复 NtSuspendProcess 会让恢复只减一次计数，永久挂死）；
 //   - 挂起表持久化到 HKCU\Software\DesktopSuite\Dock\SuspendedState，
 //     Dock 被强杀/崩溃后下次启动按 PID+创建时间核对并恢复，避免应用
 //     永久停在挂起态。
@@ -148,9 +159,15 @@ std::vector<ProcessEntry> SnapshotProcesses();
 // 应用 B」误当 A 的辅助进程 —— 典型是 Office 同一安装目录下 WINWORD 拉起
 // EXCEL，两者在同一个 Office16 目录树里。子进程镜像恰好是另一个 Dock
 // 应用的 key 时，不并入当前应用，也不继续向下遍历它的后代。
+//
+// includeExternalDescendants=true 时，后代不再受安装目录树限制：应用把
+// helper.exe 写到 %TEMP%、AppData 或另一个产品目录后再拉起，仍会被收进来。
+// 这是 Job 沙箱不可用时的兜底；Dock 侧还会用「可见窗口」过滤掉用户正在
+// 看的外部程序。纯选择函数不接触窗口，所以调用方要自己叠加这层过滤。
 Selection SelectAppProcesses(
     const std::wstring& appKey, const std::vector<ProcessEntry>& snapshot,
-    const std::unordered_set<std::wstring>* foreignAppKeys = nullptr);
+    const std::unordered_set<std::wstring>* foreignAppKeys = nullptr,
+    bool includeExternalDescendants = false);
 
 enum class SuspendCode {
     Suspended,        // 至少挂起了一个进程（整组已挂起）
@@ -158,6 +175,7 @@ enum class SuspendCode {
     NoProcesses,      // 找不到属于该应用的进程
     TooYoung,         // 进程刚启动，等过了最小年龄再试
     AccessDenied,     // 有匹配进程，但一个也打不开/受保护，整组放弃
+    VisibleWindow,    // 成员里出现了可见且未最小化的窗口，整组放弃
     Failed,           // 其他失败（NtSuspendProcess 不可用等）
 };
 
@@ -171,6 +189,8 @@ struct SuspendResult {
     size_t matched = 0;
     size_t suspended = 0;   // 本次已挂起的进程数
     size_t skipped = 0;
+    size_t jobMembers = 0;  // Job 沙箱当前成员数（0 表示未用 Job）
+    bool jobSandbox = false;
     DWORD retryAfterMs = 0;
     std::wstring detail;
 };
@@ -182,9 +202,15 @@ struct SuspendResult {
 // 用于 Dock 被强杀后下次启动恢复进程，避免应用永久停在挂起态。
 class Suspender {
 public:
+    // useJobSandbox=true 时优先用 Job Object 做进程围栏：应用主进程进入
+    // 每个应用独立的、无 UI 限制/无 breakaway/不随句柄关闭杀进程的 Job，
+    // 之后它创建的所有后代（无论 exe 在哪个目录、父进程是否已退出）都
+    // 自动留在 Job 里，挂起时按 Job 成员整组冻结。Job 创建/追加失败时
+    // 自动退回旧的「快照 + 跨目录后代」选择。
     explicit Suspender(bool persist = true,
                        ULONGLONG minProcessAgeMs = 8000,
-                       std::wstring stateValueName = L"SuspendedState");
+                       std::wstring stateValueName = L"SuspendedState",
+                       bool useJobSandbox = true);
     ~Suspender();
 
     Suspender(const Suspender&) = delete;
@@ -199,6 +225,16 @@ public:
     std::vector<SuspendResult> SuspendMany(
         const std::vector<SuspendRequest>& requests,
         const std::vector<std::wstring>& allAppKeys = {});
+
+    // 启动应用时调用（CreateProcess 得到句柄之后、ResumeThread 之前）：
+    // 把主进程直接放进该应用的 Job，保证从第一个子进程起就不会漏。
+    // 没有这个调用也能工作，但只能靠「事后 OpenProcess + 追加」，
+    // 对拒绝 PROCESS_SET_QUOTA 的进程会退回快照选择。
+    bool AdoptProcess(const std::wstring& appKey, HANDLE process,
+                      std::wstring* detail = nullptr);
+
+    // 当前 Job 成员数（仅测试/日志用；未启用或创建失败返回 0）。
+    size_t JobMemberCount(const std::wstring& appKey) const;
 
     // 恢复该应用被本控制器挂起的全部进程。个别进程已退出视为成功；
     // 仍存活但恢复失败的条目会保留，等待下次重试。

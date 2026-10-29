@@ -181,6 +181,17 @@ void TestSelection() {
         Check(has21, L"同安装目录内不同 exe 的辅助进程被选中");
         Check(has24, L"辅助进程的后代也在安装目录树内时被选中");
         Check(!bad, L"系统进程/外部程序/创建时间早于父进程的 PID 被排除");
+
+        // Job 不可用时的兜底：跨目录后代也要收进来（应用把 helper.exe
+        // 落到 %TEMP%/更新目录再拉起）。默认选择仍保持保守口径。
+        const auto extended = appsuspend::SelectAppProcesses(
+            L"C:\\Apps\\WeChat\\WeChat.exe", procs, nullptr,
+            /*includeExternalDescendants=*/true);
+        bool extendedHas23 = false;
+        for (const auto& p : extended.processes) {
+            if (p.pid == 23) extendedHas23 = true;
+        }
+        Check(extendedHas23, L"兜底模式选中跨目录后代");
     }
 
     {
@@ -268,6 +279,269 @@ void TestPausePolicy() {
           L"窗口全部最小化或纯托盘（无可见窗口）可暂停");
     Check(!appsuspend::ShouldPauseApp(true, false, true),
           L"用户勾选「不暂停此应用」后永久豁免");
+}
+
+// Job 沙箱集成测试：
+//   1. 主进程在 ResumeThread 之前被 AdoptProcess 放进应用 Job；
+//   2. 主进程从“另一个目录”拉起 helper.exe（模拟应用把 exe 落到
+//      %TEMP%/更新目录后再开子进程）；
+//   3. 不靠安装目录树，Job 自动把 helper 收进来，SuspendMany 必须
+//      把两个进程一起冻结。
+bool TestJobSandbox() {
+    wchar_t self[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, self, MAX_PATH) == 0) {
+        ++g_failures;
+        wprintf(L"[FAIL] Job 测试取自身路径失败：%lu\n", GetLastError());
+        return false;
+    }
+    const std::wstring dir =
+        Join(appsuspend::ParentDirOf(self),
+             L"mywigets_job_test_" + std::to_wstring(GetCurrentProcessId()) +
+                 L"_" + std::to_wstring(GetTickCount64()));
+    const std::wstring outside = Join(dir, L"outside");
+    if (!CreateDirectoryW(dir.c_str(), nullptr) ||
+        !CreateDirectoryW(outside.c_str(), nullptr)) {
+        ++g_failures;
+        wprintf(L"[FAIL] Job 测试目录创建失败：%lu（%ls）\n", GetLastError(),
+                dir.c_str());
+        return false;
+    }
+
+    const std::wstring appExe = Join(dir, L"app.exe");
+    const std::wstring helperExe = Join(outside, L"helper.exe");
+    const std::wstring appBeat = Join(dir, L"app.heartbeat");
+    const std::wstring helperBeat = Join(outside, L"helper.heartbeat");
+    bool copied = CopyFileW(self, appExe.c_str(), FALSE) != FALSE;
+    copied = copied && CopyFileW(self, helperExe.c_str(), FALSE) != FALSE;
+    if (!copied) {
+        ++g_failures;
+        wprintf(L"[FAIL] Job 测试复制 exe 失败：%lu\n", GetLastError());
+        RemoveDirectoryW(outside.c_str());
+        RemoveDirectoryW(dir.c_str());
+        return false;
+    }
+
+    const std::wstring appCmd =
+        L"\"" + appExe + L"\" --spawn-tree \"" + dir + L"\"";
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION appPi{};
+    std::wstring mutableCmd = appCmd;
+    const BOOL started = CreateProcessW(
+        appExe.c_str(), mutableCmd.data(), nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, dir.c_str(), &si,
+        &appPi);
+    if (!started) {
+        ++g_failures;
+        wprintf(L"[FAIL] Job 测试启动失败：%lu\n", GetLastError());
+        DeleteFileW(appExe.c_str());
+        DeleteFileW(helperExe.c_str());
+        RemoveDirectoryW(outside.c_str());
+        RemoveDirectoryW(dir.c_str());
+        return false;
+    }
+
+    appsuspend::Suspender suspender(false, 0, L"SuspendedStateTest", true);
+    const bool init = suspender.Initialize();
+    Check(init, L"Job 测试控制器初始化");
+    std::wstring detail;
+    const bool adopted =
+        init && suspender.AdoptProcess(appsuspend::NormalizePath(appExe),
+                                       appPi.hProcess, &detail);
+    Check(adopted, L"启动时把主进程加入应用 Job");
+    if (adopted) {
+        Check(suspender.JobMemberCount(appsuspend::NormalizePath(appExe)) >= 1,
+              L"Job 成员查询包含主进程");
+    }
+    ResumeThread(appPi.hThread);
+    CloseHandle(appPi.hThread);
+
+    bool ok = adopted && WaitForFile(appBeat, 1, 6000) &&
+              WaitForFile(helperBeat, 1, 6000);
+    Check(ok, L"跨目录 helper 心跳已启动");
+    const std::wstring key = appsuspend::NormalizePath(appExe);
+    if (ok) {
+        // 等 helper 真正进入 Job；Job 继承是创建时完成的，这里只是查表。
+        const size_t members = suspender.JobMemberCount(key);
+        if (members < 2) {
+            wprintf(L"  job members=%zu（期望 >=2）\n", members);
+        }
+        Check(members >= 2, L"跨目录 helper 自动继承 Job");
+
+        Sleep(250);
+        std::vector<appsuspend::SuspendRequest> requests;
+        requests.push_back({key, L"job-test"});
+        auto results = suspender.SuspendMany(requests);
+        const bool suspended =
+            results.size() == 1 &&
+            results[0].code == appsuspend::SuspendCode::Suspended &&
+            results[0].jobSandbox && results[0].jobMembers >= 2 &&
+            results[0].suspended >= 2;
+        Check(suspended, L"Job 成员（含跨目录 helper）整组挂起");
+        if (!results.empty()) {
+            wprintf(L"  job result: code=%d matched=%zu suspended=%zu "
+                    L"job=%d members=%zu detail=%ls\n",
+                    static_cast<int>(results[0].code), results[0].matched,
+                    results[0].suspended, results[0].jobSandbox ? 1 : 0,
+                    results[0].jobMembers, results[0].detail.c_str());
+        }
+        if (suspended) {
+            // 重复调用必须是幂等的：不能对同一进程再次 NtSuspendProcess，
+            // 否则 Resume 只减一次计数，应用会永久停在挂起态。
+            auto again = suspender.SuspendMany(requests);
+            Check(again.size() == 1 &&
+                      again[0].code ==
+                          appsuspend::SuspendCode::AlreadySuspended,
+                  L"重复 SuspendMany 幂等，不重复冻结");
+            Sleep(300);
+            const ULONGLONG appFrozen = FileSize(appBeat);
+            const ULONGLONG helperFrozen = FileSize(helperBeat);
+            Sleep(700);
+            Check(FileSize(appBeat) == appFrozen,
+                  L"Job 挂起后主进程心跳停止");
+            Check(FileSize(helperBeat) == helperFrozen,
+                  L"Job 挂起后跨目录 helper 心跳停止");
+            std::wstring resumeDetail;
+            const bool resumed = suspender.Resume(key, &resumeDetail);
+            Check(resumed, L"Job 组恢复成功");
+            Check(WaitForGrowth(appBeat, appFrozen, 2500),
+                  L"Job 恢复后主进程心跳继续");
+            Check(WaitForGrowth(helperBeat, helperFrozen, 2500),
+                  L"Job 恢复后跨目录 helper 心跳继续");
+        }
+    }
+
+    if (appPi.hProcess) {
+        TerminateProcess(appPi.hProcess, 0);
+        WaitForSingleObject(appPi.hProcess, 1000);
+        CloseHandle(appPi.hProcess);
+    }
+    TerminateImage(helperExe);
+    Sleep(150);
+    DeleteFileW(appBeat.c_str());
+    DeleteFileW(helperBeat.c_str());
+    DeleteFileW(appExe.c_str());
+    DeleteFileW(helperExe.c_str());
+    RemoveDirectoryW(outside.c_str());
+    RemoveDirectoryW(dir.c_str());
+    return ok && g_failures == 0;
+}
+
+// 父进程退出后，Job 仍持有 helper：此时按 exe 路径已经找不到“主进程”，
+// 旧选择会返回 NoProcesses；Job 成员必须仍能整组挂起/恢复。
+bool TestJobSurvivesRootExit() {
+    wchar_t self[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, self, MAX_PATH) == 0) {
+        ++g_failures;
+        wprintf(L"[FAIL] 父退出测试取自身路径失败：%lu\n", GetLastError());
+        return false;
+    }
+    const std::wstring dir =
+        Join(appsuspend::ParentDirOf(self),
+             L"mywigets_job_exit_test_" +
+                 std::to_wstring(GetCurrentProcessId()) + L"_" +
+                 std::to_wstring(GetTickCount64()));
+    const std::wstring outside = Join(dir, L"outside");
+    if (!CreateDirectoryW(dir.c_str(), nullptr) ||
+        !CreateDirectoryW(outside.c_str(), nullptr)) {
+        ++g_failures;
+        wprintf(L"[FAIL] 父退出测试目录创建失败：%lu\n", GetLastError());
+        return false;
+    }
+    const std::wstring appExe = Join(dir, L"app.exe");
+    const std::wstring helperExe = Join(outside, L"helper.exe");
+    const std::wstring helperBeat = Join(outside, L"helper.heartbeat");
+    bool copied = CopyFileW(self, appExe.c_str(), FALSE) != FALSE;
+    copied = copied && CopyFileW(self, helperExe.c_str(), FALSE) != FALSE;
+    if (!copied) {
+        ++g_failures;
+        wprintf(L"[FAIL] 父退出测试复制 exe 失败：%lu\n", GetLastError());
+        RemoveDirectoryW(outside.c_str());
+        RemoveDirectoryW(dir.c_str());
+        return false;
+    }
+
+    const std::wstring appCmd =
+        L"\"" + appExe + L"\" --spawn-tree-exit \"" + dir + L"\"";
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION appPi{};
+    std::wstring mutableCmd = appCmd;
+    const BOOL started = CreateProcessW(
+        appExe.c_str(), mutableCmd.data(), nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, dir.c_str(), &si,
+        &appPi);
+    if (!started) {
+        ++g_failures;
+        wprintf(L"[FAIL] 父退出测试启动失败：%lu\n", GetLastError());
+        DeleteFileW(appExe.c_str());
+        DeleteFileW(helperExe.c_str());
+        RemoveDirectoryW(outside.c_str());
+        RemoveDirectoryW(dir.c_str());
+        return false;
+    }
+
+    appsuspend::Suspender suspender(false, 0, L"SuspendedStateTest", true);
+    const bool init = suspender.Initialize();
+    std::wstring detail;
+    const bool adopted =
+        init && suspender.AdoptProcess(appsuspend::NormalizePath(appExe),
+                                       appPi.hProcess, &detail);
+    Check(adopted, L"父退出测试：主进程加入 Job");
+    ResumeThread(appPi.hThread);
+    CloseHandle(appPi.hThread);
+
+    bool ok = adopted && WaitForFile(helperBeat, 1, 6000);
+    if (ok) {
+        // 等主进程真正退出；Job 里的 helper 不应随之退出。
+        const DWORD wait = WaitForSingleObject(appPi.hProcess, 5000);
+        Check(wait == WAIT_OBJECT_0, L"父退出测试：主进程已退出");
+        Check(WaitForFile(helperBeat, 1, 1000) != FALSE,
+              L"父退出后 helper 仍存活");
+        const std::wstring key = appsuspend::NormalizePath(appExe);
+        Check(suspender.JobMemberCount(key) >= 1,
+              L"父退出后 Job 仍持有 helper");
+        std::vector<appsuspend::SuspendRequest> requests;
+        requests.push_back({key, L"job-exit-test"});
+        auto results = suspender.SuspendMany(requests);
+        const bool suspended =
+            results.size() == 1 &&
+            results[0].code == appsuspend::SuspendCode::Suspended &&
+            results[0].jobSandbox && results[0].suspended >= 1;
+        Check(suspended, L"无主进程时按 Job 成员挂起 helper");
+        if (!results.empty()) {
+            wprintf(L"  exit result: code=%d suspended=%zu job=%d "
+                    L"members=%zu detail=%ls\n",
+                    static_cast<int>(results[0].code),
+                    results[0].suspended, results[0].jobSandbox ? 1 : 0,
+                    results[0].jobMembers, results[0].detail.c_str());
+        }
+        if (suspended) {
+            Sleep(300);
+            const ULONGLONG frozen = FileSize(helperBeat);
+            Sleep(700);
+            Check(FileSize(helperBeat) == frozen,
+                  L"父退出场景 helper 心跳停止");
+            std::wstring resumeDetail;
+            Check(suspender.Resume(key, &resumeDetail),
+                  L"父退出场景 Job 组恢复成功");
+            Check(WaitForGrowth(helperBeat, frozen, 2500),
+                  L"父退出场景 helper 心跳继续");
+        }
+    }
+
+    if (appPi.hProcess) {
+        WaitForSingleObject(appPi.hProcess, 1000);
+        CloseHandle(appPi.hProcess);
+    }
+    TerminateImage(helperExe);
+    Sleep(150);
+    DeleteFileW(helperBeat.c_str());
+    DeleteFileW(appExe.c_str());
+    DeleteFileW(helperExe.c_str());
+    RemoveDirectoryW(outside.c_str());
+    RemoveDirectoryW(dir.c_str());
+    return ok && g_failures == 0;
 }
 
 bool TestSuspendResume() {
@@ -471,6 +745,31 @@ int wmain(int argc, wchar_t** argv) {
         HeartbeatLoop(Join(dir, L"app.heartbeat"));
         return 0;
     }
+    // Job 沙箱测试：从 dir\outside\helper.exe 拉起不同目录的辅助进程。
+    if (argc >= 3 && _wcsicmp(argv[1], L"--spawn-tree") == 0) {
+        const std::wstring dir = argv[2];
+        const std::wstring outside = Join(dir, L"outside");
+        const std::wstring helper = Join(outside, L"helper.exe");
+        const std::wstring helperCmd =
+            L"\"" + helper + L"\" --heartbeat \"" +
+            Join(outside, L"helper.heartbeat") + L"\"";
+        SpawnProcess(helper, helperCmd, outside, nullptr);
+        HeartbeatLoop(Join(dir, L"app.heartbeat"));
+        return 0;
+    }
+    // 父进程退出后 helper 仍留在 Job 里：验证“没有主进程快照条目”
+    // 时仍能按 Job 成员挂起。
+    if (argc >= 3 && _wcsicmp(argv[1], L"--spawn-tree-exit") == 0) {
+        const std::wstring dir = argv[2];
+        const std::wstring outside = Join(dir, L"outside");
+        const std::wstring helper = Join(outside, L"helper.exe");
+        const std::wstring helperCmd =
+            L"\"" + helper + L"\" --heartbeat \"" +
+            Join(outside, L"helper.heartbeat") + L"\"";
+        SpawnProcess(helper, helperCmd, outside, nullptr);
+        Sleep(1200);
+        return 0;
+    }
     if (argc >= 2 && _wcsicmp(argv[1], L"--dump") == 0) {
         SetConsoleOutputCP(CP_UTF8);
         _setmode(_fileno(stdout), _O_U8TEXT);
@@ -522,6 +821,10 @@ int wmain(int argc, wchar_t** argv) {
     TestSelection();
     wprintf(L"== app_suspend pause policy tests ==\n");
     TestPausePolicy();
+    wprintf(L"== app_suspend job sandbox integration ==\n");
+    TestJobSandbox();
+    wprintf(L"== app_suspend job root-exit integration ==\n");
+    TestJobSurvivesRootExit();
     wprintf(L"== app_suspend suspend/resume integration ==\n");
     TestSuspendResume();
 
