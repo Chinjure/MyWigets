@@ -256,6 +256,12 @@ constexpr UINT kDockTargetQueryMsg = WM_APP + 19;
 // → Dock：顶栏目标变化通知（lParam = 新目标 HWND，0 = 已清空）。
 // 收到后 Dock 立即恢复新目标、旧目标进入挂起宽限期。与 dock_main.cpp 同值。
 constexpr UINT kDockTargetChangedMsg = WM_APP + 20;
+// → Dock：Alt+Tab 键盘钩子事件（不携带目标窗口）。
+//   wParam = 0：Tab 按下，提前恢复可能被选中的挂起应用；
+//   wParam = 3：Alt 松开，会话结束，通知 Dock 进入落定期。
+// 本钩子在 shell 处理 Tab 之前运行，是能拿到的最早时机；松手通知则用于
+// Win11 XAML 切换器不发 SWITCHEND 的情况。与 dock_main.cpp 同值。
+constexpr UINT kDockAltTabMsg = WM_APP + 21;
 // 「保持顶栏」模式下的全屏让位复核周期（ms）。全屏应用占用本屏时顶栏整体
 // 隐藏（用户要求：全屏游戏等场景顶栏不参与显示）；SHQueryUserNotificationState
 // 约 75µs，只在模式开启期间按 2s 复核，不进任何高频路径。
@@ -822,6 +828,11 @@ void ToggleCalendarFlyout() { SendWinChord('N'); }
 // 供目标跟踪区分系统自动转移焦点与用户主动切换窗口
 HWND g_lastClickWindow = nullptr;
 bool g_altTabPressed = false;
+// Alt+Tab 会话是否仍在进行（Alt 键还没松开）。Win11 的 XAML 切换器
+// 不一定会发 EVENT_SYSTEM_SWITCHSTART/SWITCHEND，所以由低级键盘钩子
+// 自己记录会话，并在 Alt 松开时通知 Dock “落定”—— 否则 Dock 只能等
+// 10s 会话上限才恢复挂起，非目标应用会被无谓地多唤醒几秒。
+bool g_altTabSessionActive = false;
 // 用户点击了套件窗口（Dock/启动台/时钟等）——落点本身不能当目标（不是
 // 任务栏级应用窗），但它同样表明"用户在主动切换应用"：目标粘住态必须
 // 立即解除，否则顶栏会永久停在被最小化的旧目标上
@@ -2632,12 +2643,29 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             info->vkCode == VK_TAB &&
             (GetAsyncKeyState(VK_MENU) & 0x8000) != 0) {
             g_altTabPressed = true;
+            g_altTabSessionActive = true;
+            // 先于 shell 通知 Dock：Alt+Tab 要切换了，立刻恢复挂起应用。
+            // 每次 Tab 都投递（幂等）：Dock 已恢复过的应用不会重复恢复，
+            // 同时顺延 Alt+Tab 会话的保护期，覆盖用户按住 Alt 连续循环选择。
+            if (HWND dock = g_dockHwnd.load(std::memory_order_relaxed)) {
+                PostMessageW(dock, kDockAltTabMsg, 0, 0);
+            }
             HWND bar = g_volumeHookHwnd;
             AppState* s = bar ? reinterpret_cast<AppState*>(
                 GetWindowLongPtrW(bar, GWLP_USERDATA)) : nullptr;
             // 目标粘住时，Alt+Tab 也立即通知刷新（不依赖 WinEvent）
             if (s && s->targetSticky) {
                 PostMessageW(bar, kUserSwitchMsg, 0, 0);
+            }
+        } else if ((wParam == WM_KEYUP || wParam == WM_SYSKEYUP) &&
+                   (info->vkCode == VK_MENU || info->vkCode == VK_LMENU ||
+                    info->vkCode == VK_RMENU) &&
+                   g_altTabSessionActive) {
+            // Alt+Tab 会话结束（用户松开 Alt）：通知 Dock 进入落定期。
+            // 不依赖 EVENT_SYSTEM_SWITCHEND —— Win11 XAML 切换器可能不发它。
+            g_altTabSessionActive = false;
+            if (HWND dock = g_dockHwnd.load(std::memory_order_relaxed)) {
+                PostMessageW(dock, kDockAltTabMsg, 3, 0);
             }
         }
     }
@@ -2836,6 +2864,7 @@ void UninstallVolumeHook() {
     g_volumeHookHwnd = nullptr;
     g_lastClickWindow = nullptr;
     g_altTabPressed = false;
+    g_altTabSessionActive = false;
 }
 
 // ---- 独立音量面板窗口 ----

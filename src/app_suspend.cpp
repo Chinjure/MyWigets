@@ -196,13 +196,21 @@ using NtProcessControlFn = LONG(NTAPI*)(HANDLE);
 
 bool NtSuccess(LONG status) { return status >= 0; }
 
-bool QueryCreationTime(HANDLE proc, ULONGLONG* out) {
-    FILETIME created{}, exited{}, kernel{}, user{};
-    if (!GetProcessTimes(proc, &created, &exited, &kernel, &user)) {
+bool QueryProcessTimes(HANDLE proc, ULONGLONG* created, ULONGLONG* exited) {
+    FILETIME c{}, e{}, kernel{}, user{};
+    if (!GetProcessTimes(proc, &c, &e, &kernel, &user)) {
         return false;
     }
-    *out = FileTimeToU64(created);
+    if (created) *created = FileTimeToU64(c);
+    if (exited) *exited = FileTimeToU64(e);
     return true;
+}
+
+bool QueryCreationTime(HANDLE proc, ULONGLONG* out) {
+    // 已终止的进程句柄仍可能打得开（例如被挂起后又被更新器替换掉的
+    // 残留进程），但它不再是可挂起/可恢复的对象。
+    ULONGLONG exited = 0;
+    return QueryProcessTimes(proc, out, &exited) && exited == 0;
 }
 
 bool TrackedAlive(const TrackedProcess& ref) {
@@ -230,13 +238,18 @@ HANDLE OpenVerified(DWORD pid, ULONGLONG creation, DWORD access,
         return nullptr;
     }
     ULONGLONG actual = 0;
-    if (!QueryCreationTime(proc, &actual)) {
+    ULONGLONG exited = 0;
+    if (!QueryProcessTimes(proc, &actual, &exited)) {
         if (lastError) *lastError = GetLastError();
         CloseHandle(proc);
         return nullptr;
     }
-    if (actual != creation) {
-        // 原进程已退出，PID 被另一个进程复用：绝不能碰新进程。
+    if (actual != creation || exited != 0) {
+        // 两种情况都必须让调用方丢弃记录，否则会永久卡死交互：
+        //   1) 原进程已退出、PID 被另一个进程复用 —— 绝不能碰新进程；
+        //   2) 原进程已终止但句柄还开着（典型：挂起期间被更新器替换，
+        //      或中断在退出中途）—— NtResumeProcess 必然失败，若保留
+        //      记录，每次交互都会"恢复失败"并取消切换。
         if (lastError) *lastError = ERROR_NOT_FOUND;
         CloseHandle(proc);
         return nullptr;
@@ -369,12 +382,17 @@ std::vector<ProcessEntry> SnapshotProcesses() {
             wchar_t image[32768] = {};
             DWORD imageLen = 32760;
             ULONGLONG created = 0;
+            ULONGLONG exited = 0;
             const bool imageOk =
                 QueryFullProcessImageNameW(proc, 0, image, &imageLen) != FALSE &&
                 imageLen > 0;
-            QueryCreationTime(proc, &created);
+            const bool timesOk = QueryProcessTimes(proc, &created, &exited);
             CloseHandle(proc);
             if (!imageOk) continue;
+            // 已终止但句柄仍存在的残留进程（挂起期间被更新器替换等）没有
+            // 可挂起对象，直接跳过 —— 留在快照里会因为创建时间为 0 让整组
+            // 挂起被判定为"无法核对"而放弃。
+            if (!timesOk || exited != 0) continue;
 
             const std::wstring normalized = NormalizePath(image);
             if (normalized.empty()) continue;

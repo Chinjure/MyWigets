@@ -16,9 +16,14 @@
 //      列表求交集：已登记托盘 ∩ 进程存活 − Windows 自带组件 − 本套件自身，
 //      即「现在正以托盘形式驻留的第三方程序」。这类程序即使没有任何可见窗口，
 //      也出现在 Dock 运行区并带运行圆点；纯后台静默项可右键隐藏。
-//   5. 点击行为：应用未在前台时 打开该应用的全部主窗口（最小化的一次性恢复），
-//      前台时 最小化全部；托盘驻留应用优先恢复任务栏已有窗口，确实没有
-//      窗口时才走托盘图标触发（TrayList 方式）或启动；
+//      存活判定要排除 Chromium/Electron 应用主进程退出后残留的
+//      --type=renderer/utility 辅助进程（它们与主程序共用 exe 路径），
+//      否则“已经关掉的应用”会一直被显示成仍在运行（网易云音乐实测）。
+//   5. 点击行为：托盘图标驻留应用 存在未最小化的打开窗口时 最小化全部打开的
+//      窗口；没有未最小化窗口（全部最小化/隐藏、纯托盘驻留）时 点击其系统
+//      托盘图标（TrayList 方式），窗口显示/隐藏交给应用自己的托盘处理器；
+//      普通应用未在前台时 打开该应用的全部主窗口（最小化的一次性恢复），
+//      前台时 最小化全部；未运行的应用正常启动；
 //      启动时有 macOS 风格弹跳动画直到应用出现；中键关闭该应用全部窗口
 //   6. 自动收起开关（空白区/图标右键菜单，注册表持久化）：光标离开 Dock
 //      即收起到屏幕底边，触碰下缘触发条展开；开启期间与顶栏联动 ——
@@ -50,6 +55,12 @@
 //      菜单勾选「不暂停此应用」永久豁免。离开焦点有 1.2s 宽限，交互/关闭
 //      前先恢复，正常退出/组件重启时恢复全部；挂起表持久化，Dock 被强杀后
 //      下次启动恢复。
+//      最小化窗口仍会出现在 Alt+Tab 里，冻结后切过去会卡死：因此顶栏键盘
+//      钩子的提前触发/Alt 松开、系统 SWITCHSTART/SWITCHEND、以及 Win11
+//      “任务切换” XAML 窗口的显示/隐藏（触摸板左右轻扫切换应用也走它，
+//      不产生键盘事件）都会在激活前恢复目标及其余仍拥有可见窗口的挂起
+//      应用，并在切换期间/落定期禁止重新挂起；纯托盘应用没有窗口、不会
+//      成为 Alt+Tab 目标，保持挂起。
 //
 // 日志写入 ..\logs\dock.log
 
@@ -99,6 +110,16 @@
 #include "fullscreen_guard.h"  // 全屏应用让位判定（与宿主托盘共用）
 #include "keep_top.h"         // 「保持顶栏」模式（注册表开关 + 预留区计算）
 #include "widgets.h"
+
+// 本工程按 Win7 目标编译（_WIN32_WINNT=0x0601），当前 SDK 未导出 Win8+
+// 的 XAML cloak 事件常量；切换器窗口隐藏时通常走 cloak 而不是 show/hide，
+// 因此按 ABI 值补上（EVENT_OBJECT_CLOAKED/UNCLOAKED = 0x8017/0x8018）。
+#ifndef EVENT_OBJECT_CLOAKED
+#define EVENT_OBJECT_CLOAKED 0x8017
+#endif
+#ifndef EVENT_OBJECT_UNCLOAKED
+#define EVENT_OBJECT_UNCLOAKED 0x8018
+#endif
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "user32.lib")
@@ -168,6 +189,14 @@ constexpr UINT kCollapseWatchMs = 2000;        // 监视周期（2s，只记录�
 // 顶栏目标短暂清空都可能产生一闪而过的“未聚焦”，立即冻结会打断后台任务。
 constexpr ULONGLONG kSuspendGraceMs = 1200;
 constexpr ULONGLONG kSuspendLogRepeatMs = 30000;  // 同一应用失败日志限频
+// Alt+Tab 保护期：
+//   - 会话上限：从顶栏键盘钩子/ SWITCHSTART 起最多抑制 10s。正常松手会由
+//     SWITCHEND 改写成落定期；事件丢失（切换器异常/explorer 重启）时这个
+//     上限保证挂起功能不会被永久停用。
+//   - 落定期：松手后再等 1.5s 才允许重新挂起，覆盖窗口还原动画与紧随其后的
+//     前台/顶栏目标事件；之后仍按 kSuspendGraceMs 计宽限。
+constexpr ULONGLONG kAltTabHoldMaxMs = 10000;
+constexpr ULONGLONG kAltTabSettleMs = 1500;
 
 // 事件驱动消息（WinEvent 回调/注册表监听线程 → 主窗口）
 constexpr UINT kMsgRefresh = WM_APP + 1;   // 窗口集合/托盘状态可能变化，合并刷新
@@ -201,9 +230,12 @@ constexpr UINT kMsgTopBarDockQuery = WM_APP + 15;
 // 旧应用上(用户现象:开完 Windows Terminal 再点浏览器,顶栏聚焦仍在终端)。
 // 以顶栏目标(用户看到的聚焦指示)为准,套件内语义才自洽。
 constexpr UINT kMsgTopBarFocusQuery = WM_APP + 16;
-// ← WinEvent(EVENT_SYSTEM_FOREGROUND)：前台切换 → 复核全屏应用让位状态
-// （游戏全屏/退出全屏多数伴随前台切换，事件级延迟 <10ms；另有 2s 保底与
-// 下缘触发前的当场复核，见 UpdateFullscreenState）
+// ← WinEvent(EVENT_SYSTEM_FOREGROUND)：前台切换（lParam = 新前台 HWND）。
+// 用于两件事：
+//   1. 立刻恢复“前台已经是挂起应用”的目标（触摸板手势直接切换/任务栏
+//      唤起等没有切换前事件的路径，这是最快的兜底）；
+//   2. 复核全屏应用让位状态（游戏全屏/退出全屏多数伴随前台切换；另有
+//      2s 保底与下缘触发前的当场复核，见 UpdateFullscreenState）。
 constexpr UINT kMsgFullscreen = WM_APP + 17;
 // ← 宿主托盘「保持顶栏」菜单项：请求立即按注册表重读开关并生效。
 // 开关的持久化由发起方（宿主托盘 / 顶栏）写注册表，Dock 只负责重读并
@@ -219,6 +251,21 @@ constexpr UINT kMsgTopBarTargetQuery = WM_APP + 19;
 // Dock 收到后立即复核挂起状态：新目标立刻恢复，旧目标进入宽限期。
 // 与 topbar_main.cpp 的 kDockTargetChangedMsg 同值。
 constexpr UINT kMsgTopBarTargetChanged = WM_APP + 20;
+// ← Alt+Tab：用户开始/结束切换窗口的事件。wParam 区分阶段：
+//   0 = 顶栏低级键盘钩子的提前触发（lParam = 0，此时还不知道目标）；
+//   1 = EVENT_SYSTEM_SWITCHSTART（lParam = 正在切换到的目标 HWND）；
+//   2 = EVENT_SYSTEM_SWITCHEND（lParam = 已经切换到的目标 HWND）；
+//   3 = 顶栏键盘钩子检测到 Alt 松开（lParam = 0）；
+//   4 = Win11 “任务切换”窗口显示/取消隐藏（lParam = 切换器 HWND，无目标）；
+//   5 = “任务切换”窗口隐藏/ cloak（lParam = 切换器 HWND）。
+// 4/5 覆盖不产生键盘事件的触摸板左右轻扫切应用；键盘路径仍由 0-3 兜底。
+// 系统文档保证 1/2 的 hwnd 就是切换目标窗口；但 Win11 的 XAML 切换器
+// 不一定会发这两个事件，Alt 按住期间的“选择项变化”也没有公开事件，
+// 因此 0/3/4/5 由键盘钩子和切换器窗口事件兜住会话起止，0/1/4 阶段恢复
+// 所有仍拥有可见顶层窗口的挂起应用（= 所有可能被 Alt+Tab 选中的应用），
+// 保证多按几次 Tab 后的最终目标也不是冻结窗口。纯托盘应用没有窗口，
+// 不在候选集合里。与 topbar_main.cpp 的 kDockAltTabMsg 同值。
+constexpr UINT kMsgAltTab = WM_APP + 21;
 
 // 固定区拖拽重排消息子类型（wParam）
 constexpr WPARAM kDockDragMove = 1;  // 按下后仍在按住 → 移动（UI 自行读取物理光标）
@@ -384,6 +431,10 @@ struct AppState {
     std::unordered_set<std::wstring> suspendExceptions;
     std::unordered_map<std::wstring, ULONGLONG> suspendSince;  // 未聚焦起点
     std::unordered_map<std::wstring, ULONGLONG> suspendLogAt;  // 失败日志限频
+    // Alt+Tab 保护截止时刻（GetTickCount64）。> now 时 Reconcile 不发起新的
+    // 挂起：用户正在切换器里选择，或目标窗口刚被恢复、还原动画还没落定。
+    // 0 = 无保护；会话上限见 kAltTabHoldMaxMs，事件丢失也会自动过期。
+    ULONGLONG altTabSuppressUntil = 0;
     bool hideRequested = false;   // 收起目标态（光标离开 Dock / 触碰下缘触发条）
     float collapseOffset = 0;     // 当前收起偏移（0=展开，winH=完全滑出屏幕底）
     std::atomic<bool> menuOpen{false};  // 右键菜单打开期间不收起（低层钩子线程也会读取）
@@ -1253,7 +1304,51 @@ void ClearIconCache(AppState& s) {
 
 // ============================== 运行状态采集 ==============================
 
-std::unordered_set<std::wstring> CollectRunningExePaths() {
+// 读取进程命令行（Win8.1+ 的 ProcessCommandLineInformation=60）。
+// 失败返回空串：调用方必须把空串当作“不是辅助进程”，否则一次查询失败
+// 就会让一个正常的托盘应用从 Dock 上消失。
+std::wstring QueryProcessCommandLine(HANDLE proc) {
+    using NtQueryInformationProcessFn =
+        LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static NtQueryInformationProcessFn query = [] {
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (!ntdll) return static_cast<NtQueryInformationProcessFn>(nullptr);
+        return reinterpret_cast<NtQueryInformationProcessFn>(
+            GetProcAddress(ntdll, "NtQueryInformationProcess"));
+    }();
+    if (!query) return L"";
+
+    constexpr ULONG kProcessCommandLineInformation = 60;
+    // 命令行上限 32767 字符；结构头 + 结尾 NUL 再留余量。
+    std::vector<wchar_t> buffer(32768 + 64);
+    ULONG returnLength = 0;
+    const LONG status = query(
+        proc, kProcessCommandLineInformation, buffer.data(),
+        static_cast<ULONG>(buffer.size() * sizeof(wchar_t)), &returnLength);
+    if (status < 0) return L"";
+
+    struct UnicodeString {
+        USHORT length;
+        USHORT maximumLength;
+        PWSTR buffer;
+    };
+    const auto* us = reinterpret_cast<const UnicodeString*>(buffer.data());
+    if (us->buffer == nullptr || us->length == 0) return L"";
+    return std::wstring(us->buffer, us->length / sizeof(wchar_t));
+}
+
+// Chromium/Electron 系应用（网易云音乐、钉钉、微信、DeepSeek Harness 等）
+// 的 renderer / gpu-process / utility 子进程与主程序共用同一个 exe 路径，
+// 命令行带 --type=xxx；主进程不带。主进程退出后子进程可能残留，
+// 此时只按“同路径进程仍存活”判断会把已关闭的应用继续显示为运行中。
+bool IsHelperProcessCommandLine(const std::wstring& cmdLine) {
+    return cmdLine.find(L"--type=") != std::wstring::npos;
+}
+
+// trayCandidates = 托盘注册表里的 exe 路径（归一化）。只有这些路径才需要
+// 读命令行做辅助进程过滤，避免每 3 秒对所有进程都做一次额外查询。
+std::unordered_set<std::wstring> CollectRunningExePaths(
+    const std::unordered_set<std::wstring>& trayCandidates) {
     std::unordered_set<std::wstring> set;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return set;
@@ -1268,7 +1363,16 @@ std::unordered_set<std::wstring> CollectRunningExePaths() {
             wchar_t img[MAX_PATH] = {};
             DWORD size = MAX_PATH;
             if (QueryFullProcessImageNameW(proc, 0, img, &size) && size > 0) {
-                set.insert(NormalizePath(img));
+                const std::wstring key = NormalizePath(img);
+                // 仅当该路径确实是托盘候选时才查命令行；主进程或查询失败
+                // （空串）都按“存活”处理，保证正常托盘项不被误删。
+                bool helper = false;
+                if (!trayCandidates.empty() &&
+                    trayCandidates.find(key) != trayCandidates.end()) {
+                    helper = IsHelperProcessCommandLine(
+                        QueryProcessCommandLine(proc));
+                }
+                if (!helper) set.insert(key);
             }
             CloseHandle(proc);
         } while (Process32NextW(snap, &pe));
@@ -2203,7 +2307,11 @@ void ToggleShowDesktop() {
 // 交互动作定义在下方；低层鼠标钩子只采集点击并投递给 WndProc 统一执行
 // （透明底部空隙/贴底边缘可能收不到窗口消息，钩子负责命中采集）
 int HitIndexAt(AppState& s, float x, float y);
-void ToggleFocusOrLaunch(AppState& s, size_t idx);
+// iconClick = 直接点击 Dock 图标（含固定区松手判定）；false = 右键菜单的
+// 「打开全部窗口 / 最小化所有窗口」显式窗口操作。托盘图标应用在 iconClick
+// 时按「有未最小化窗口→最小化全部；否则→点击托盘图标」处理，菜单则保留
+// 显式窗口语义。
+void ToggleFocusOrLaunch(AppState& s, size_t idx, bool iconClick);
 void SetFrameCadence(AppState& s, bool fast);
 void SyncTopBarDockState(AppState& s, bool force);  // 顶栏联动：展开/收起态同步（定义在下方）
 void UpdateKeepTopWorkArea(AppState& s, bool refitMaximized);  // 保持顶栏：工作区（定义在下方）
@@ -2550,10 +2658,69 @@ void UninstallShowDesktopHook() {
 
 std::vector<HWINEVENTHOOK> g_winEventHooks;
 
+// Windows 11 的“任务切换”窗口是一个持久化的 XAML 岛：
+//   类名 XamlExplorerHostIslandWindow，标题“任务切换”（英文 Task Switching）。
+// 键盘 Alt+Tab 和触摸板“左右轻扫切换应用”最终都显示这个窗口；触摸板手势
+// 不会产生键盘事件，也不保证发 EVENT_SYSTEM_SWITCHSTART/END，所以直接
+// 监听它的 show/uncloak/hide/cloak 作为切换会话的起止信号。
+// 只按类名+标题识别：同类的开始菜单/快速设置/任务视图标题不同。
+HWND g_taskSwitcherHwnd = nullptr;
+bool g_taskSwitcherActive = false;
+
+bool IsTaskSwitcherWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    wchar_t cls[64] = {};
+    if (GetClassNameW(hwnd, cls, 63) <= 0) return false;
+    if (_wcsicmp(cls, L"XamlExplorerHostIslandWindow") != 0) return false;
+    wchar_t title[128] = {};
+    if (GetWindowTextW(hwnd, title, 127) <= 0) return false;
+    // 标题随系统 UI 语言本地化；当前用户中文系统为“任务切换”，
+    // 英文系统为 Task Switching / Task Switch。
+    return _wcsicmp(title, L"任务切换") == 0 ||
+           _wcsicmp(title, L"Task Switching") == 0 ||
+           _wcsicmp(title, L"Task Switch") == 0;
+}
+
 void CALLBACK DockWinEventProc(HWINEVENTHOOK /*hook*/, DWORD event, HWND hwnd,
                                LONG idObject, LONG /*idChild*/,
                                DWORD /*idThread*/, DWORD /*time*/) {
     if (!g_state.hwnd) return;
+    // 任务切换器（Alt+Tab / 触摸板手势）：show/uncloak 表示用户开始切换，
+    // hide/cloak 表示切换结束。先于 shell 的激活恢复候选应用；这对不产生
+    // 键盘事件的触摸板手势是唯一可用的“切换前”信号。
+    if (hwnd && (event == EVENT_OBJECT_SHOW ||
+                 event == EVENT_OBJECT_UNCLOAKED)) {
+        if (IsTaskSwitcherWindow(hwnd)) {
+            if (!g_taskSwitcherActive) {
+                g_taskSwitcherActive = true;
+                g_taskSwitcherHwnd = hwnd;
+                PostMessageW(g_state.hwnd, kMsgAltTab, 4,
+                             reinterpret_cast<LPARAM>(hwnd));
+            }
+            return;
+        }
+    } else if (hwnd && g_taskSwitcherActive &&
+               hwnd == g_taskSwitcherHwnd &&
+               (event == EVENT_OBJECT_HIDE ||
+                event == EVENT_OBJECT_CLOAKED ||
+                event == EVENT_OBJECT_DESTROY)) {
+        g_taskSwitcherActive = false;
+        g_taskSwitcherHwnd = nullptr;
+        PostMessageW(g_state.hwnd, kMsgAltTab, 5,
+                     reinterpret_cast<LPARAM>(hwnd));
+        return;
+    }
+    // Alt+Tab 切换窗口：系统在 SWITCHSTART/SWITCHEND 回调的 hwnd 参数里
+    // 直接给出“正在/已经切换到的窗口”（见 MSAA event constants）。
+    // 这里只把目标句柄投递给 UI 线程；恢复进程必须在 UI 线程执行
+    // （Suspender 的线程约束见 app_suspend.h）。
+    if (event == EVENT_SYSTEM_SWITCHSTART ||
+        event == EVENT_SYSTEM_SWITCHEND) {
+        PostMessageW(g_state.hwnd, kMsgAltTab,
+                     event == EVENT_SYSTEM_SWITCHSTART ? 1u : 2u,
+                     reinterpret_cast<LPARAM>(hwnd));
+        return;
+    }
     if (event == EVENT_SYSTEM_MINIMIZESTART && idObject == OBJID_WINDOW) {
         // Win+D 把套件组件最小化：立即恢复（事件级延迟 <10ms，无闪烁）
         if (IsSuiteWindowClass(hwnd)) {
@@ -2562,8 +2729,10 @@ void CALLBACK DockWinEventProc(HWINEVENTHOOK /*hook*/, DWORD event, HWND hwnd,
         return;
     }
     if (event == EVENT_SYSTEM_FOREGROUND) {
-        // 前台切换：全屏应用（游戏全屏）进出大多由此暴露，立即复核让位状态
-        PostMessageW(g_state.hwnd, kMsgFullscreen, 0, 0);
+        // 前台切换：全屏应用（游戏全屏）进出大多由此暴露，立即复核让位状态；
+        // lParam 带上新前台，Dock 可先恢复“已经是挂起应用”的目标。
+        PostMessageW(g_state.hwnd, kMsgFullscreen, 0,
+                     reinterpret_cast<LPARAM>(hwnd));
         return;
     }
     if (idObject != OBJID_WINDOW) return;  // 只关心窗口级事件
@@ -2585,9 +2754,28 @@ void InstallDockWinEventHook() {
         EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
         GetModuleHandleW(nullptr), DockWinEventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT);
+    // Alt+Tab 开始/结束（0x0014-0x0015 连续区间）：切换前恢复挂起应用。
+    // hwnd = 用户正在/已经切换到的窗口；细节见 kMsgAltTab 注释。
+    HWINEVENTHOOK h4 = SetWinEventHook(
+        EVENT_SYSTEM_SWITCHSTART, EVENT_SYSTEM_SWITCHEND,
+        GetModuleHandleW(nullptr), DockWinEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT);
+    // 任务切换器 XAML 岛的 cloak/uncloak（XAML 界面隐藏时通常是 cloak
+    // 而不是 show/hide）：触摸板手势也走这个窗口。
+    HWINEVENTHOOK h5 = SetWinEventHook(
+        EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED,
+        GetModuleHandleW(nullptr), DockWinEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT);
     if (h1) g_winEventHooks.push_back(h1);
     if (h2) g_winEventHooks.push_back(h2);
     if (h3) g_winEventHooks.push_back(h3);
+    if (h4) g_winEventHooks.push_back(h4);
+    if (h5) g_winEventHooks.push_back(h5);
+    if (!h4) {
+        // 不是致命错误：顶栏键盘钩子的提前触发仍能在 shell 处理 Tab 前恢复，
+        // 最坏情况下退回前台事件（恢复时机晚一拍，但不会切断已挂起进程）。
+        Logf(L"[挂起] Alt+Tab 切换事件钩子安装失败：改用键盘提前触发/前台事件");
+    }
     if (g_winEventHooks.empty()) {
         Logf(L"WinEvent 钩子安装失败（回退 60s 保底轮询）");
     }
@@ -2596,6 +2784,8 @@ void InstallDockWinEventHook() {
 void UninstallDockWinEventHook() {
     for (HWINEVENTHOOK h : g_winEventHooks) UnhookWinEvent(h);
     g_winEventHooks.clear();
+    g_taskSwitcherActive = false;
+    g_taskSwitcherHwnd = nullptr;
 }
 
 // 托盘注册表阻塞式监听：RegNotifyChangeKeyValue 阻塞等待变化，
@@ -2723,13 +2913,28 @@ bool RefreshItems(AppState& s) {
     // ---- 来源 3：托盘驻留第三方 —— 特别需求核心 ----
     // 进程级全量枚举（每个进程 OpenProcess + 查询镜像路径）较耗电，
     // “是否存活”容忍 3s 缓存延迟（应用启动/退出后托盘条目 ≤3s 校正）
+    //
+    // 先读托盘注册项并归一化出候选路径：来源 3 需要它，存活判定也只需要
+    // 对这些候选路径做“辅助进程过滤”（见 CollectRunningExePaths）。
+    // 只按 exe 路径判断会遇到：Chromium/Electron 应用主进程退出后仍有
+    // --type=renderer 子进程残留（网易云音乐实测），于是应用明明已经关闭，
+    // Dock 却继续把它当成托盘驻留并显示运行圆点（点击也只会去点不存在的
+    // 托盘图标，必然失败）。
+    const std::vector<std::wstring> trayRawPaths = ReadRegisteredTrayRawPaths();
+    std::unordered_set<std::wstring> trayCandidates;
+    trayCandidates.reserve(trayRawPaths.size());
+    for (const auto& raw : trayRawPaths) {
+        const std::wstring key = NormalizePath(ExpandKnownFolderPrefix(raw));
+        if (!key.empty()) trayCandidates.insert(key);
+    }
+
     const ULONGLONG nowForCache = GetTickCount64();
     if (nowForCache - s.runningExeCacheAt > kRunningPathsCacheMs) {
-        s.runningExeCache = CollectRunningExePaths();
+        s.runningExeCache = CollectRunningExePaths(trayCandidates);
         s.runningExeCacheAt = nowForCache;
     }
     const auto& runningNow = s.runningExeCache;
-    for (const auto& raw : ReadRegisteredTrayRawPaths()) {
+    for (const auto& raw : trayRawPaths) {
         const std::wstring expanded = ExpandKnownFolderPrefix(raw);
         const std::wstring key = NormalizePath(expanded);
         if (key.empty()) continue;
@@ -3941,6 +4146,106 @@ bool EnsureAppResumedForInteraction(AppState& s, const std::wstring& key) {
     return ok;
 }
 
+// 条目是否仍有 Alt+Tab 可见的顶层窗口。item.windows 来自
+// EnumAppWindowProc（已过滤隐藏窗/属主窗/工具窗/cloaked 窗），这里只做
+// 存活复核。挂起应用按定义没有“可见且未最小化”的窗口，因此命中的必然
+// 是仍最小化的窗口 —— 它仍是 Alt+Tab 的合法目标，需要提前恢复。
+bool AppHasAltTabWindow(AppState& s, const std::wstring& key) {
+    const size_t idx = FindItemByKey(s, key);
+    if (idx == static_cast<size_t>(-1)) return false;
+    for (HWND w : s.items[idx].windows) {
+        if (!IsWindow(w) || IsCloaked(w)) continue;
+        if (!IsWindowVisible(w)) continue;
+        return true;
+    }
+    return false;
+}
+
+// 把 Alt+Tab 目标窗口映射回仍处于挂起态的应用 key。
+// 正常路径与 Dock 分组口径一致（AppIdentityKeyForWindow）；映射失败时
+// 按窗口句柄/进程 id 在条目窗口集合里兜底（UWP 宿主、辅助进程、刷新
+// 延迟等情况）。返回空 = 目标不属于任何挂起应用。
+std::wstring SuspendedKeyForWindow(AppState& s, HWND target) {
+    if (!target || !IsWindow(target)) return L"";
+    std::wstring key = AppIdentityKeyForWindow(target);
+    if (!key.empty() && g_suspender.IsSuspended(key)) return key;
+
+    const DWORD pid = PidOf(target);
+    if (pid == 0) return L"";
+    for (const DockItem& item : s.items) {
+        if (!g_suspender.IsSuspended(item.key)) continue;
+        for (HWND w : item.windows) {
+            if (!IsWindow(w)) continue;
+            if (w == target || PidOf(w) == pid) return item.key;
+        }
+    }
+    return L"";
+}
+
+// Alt+Tab 切换前恢复挂起应用。
+//
+// 为什么不是“只恢复目标”：
+//   - EVENT_SYSTEM_SWITCHSTART 只给出初始目标；Alt 按住期间再按 Tab 的
+//     选择变化没有公开事件，最终目标在松手前不可知；
+//   - 可能被选中的集合 = 仍有可见顶层窗口的挂起应用。纯托盘应用没有
+//     窗口，不会出现在 Alt+Tab，继续挂起不唤醒。
+// 先恢复目标（若有），再恢复其余候选；重复调用幂等（已恢复的 key 会被
+// Suspender 跳过），所以提前触发 + SWITCHSTART 可以放心叠加。
+size_t ResumeAltTabCandidates(AppState& s, HWND target,
+                              const wchar_t* phase) {
+    if (!s.suspendInactive) return 0;
+
+    std::unordered_set<std::wstring> keys;
+    const std::wstring targetKey = SuspendedKeyForWindow(s, target);
+    if (!targetKey.empty()) keys.insert(targetKey);
+    for (const std::wstring& key : g_suspender.SuspendedKeys()) {
+        if (AppHasAltTabWindow(s, key)) keys.insert(key);
+    }
+
+    size_t resumed = 0;
+    std::wstring names;
+    for (const std::wstring& key : keys) {
+        if (!g_suspender.IsSuspended(key)) continue;
+        std::wstring detail;
+        const bool ok = g_suspender.Resume(key, &detail);
+        s.suspendSince.erase(key);
+        if (!ok) {
+            Logf(L"[挂起] Alt+Tab 恢复失败：%ls（%ls）", key.c_str(),
+                 detail.c_str());
+            continue;
+        }
+        ++resumed;
+        if (names.size() < 120) {
+            if (!names.empty()) names += L", ";
+            names += PathBasename(key);
+        }
+    }
+    if (resumed > 0) {
+        Logf(L"[挂起] Alt+Tab（%ls）→ 恢复 %zu 个挂起应用：%ls", phase,
+             resumed, names.c_str());
+    }
+    return resumed;
+}
+
+// 前台已经切到一个挂起应用：立即只恢复它。
+// 触摸板手势、任务栏/托盘唤起等路径可能在激活后才产生前台事件；这是
+// 没有“切换前”信号时的最快兜底，不扩大候选集合（只恢复目标应用）。
+void ResumeForegroundSuspendedApp(AppState& s, HWND foreground) {
+    if (!s.suspendInactive || g_suspender.TrackedProcessCount() == 0) return;
+    if (!foreground || !IsWindow(foreground)) return;
+    const std::wstring key = SuspendedKeyForWindow(s, foreground);
+    if (key.empty()) return;
+    std::wstring detail;
+    if (!g_suspender.Resume(key, &detail)) {
+        Logf(L"[挂起] 前台切到挂起应用但恢复失败：%ls（%ls）", key.c_str(),
+             detail.c_str());
+        return;
+    }
+    s.suspendSince.erase(key);
+    Logf(L"[挂起] 前台已切到挂起应用 → 恢复 %ls（%ls）", key.c_str(),
+         detail.c_str());
+}
+
 void LogSuspendResultThrottled(AppState& s, const std::wstring& key,
                                const wchar_t* fmt, const std::wstring& a,
                                const std::wstring& b) {
@@ -4050,6 +4355,15 @@ void ReconcileAppSuspend(AppState& s, HWND focusHint = nullptr,
             continue;
         }
 
+        // Alt+Tab 保护期：用户正在切换器里选择，或目标窗口刚被恢复、
+        // 还原动画与紧随其后的前台/顶栏目标事件还没落定。这段时间只允许
+        // 恢复，绝不再发起挂起 —— 否则刚恢复的应用会在激活前又被冻住。
+        // 保护期结束后的下一次 Reconcile 仍按 kSuspendGraceMs 重新计宽限。
+        if (now < s.altTabSuppressUntil) {
+            nextRetry = std::min(nextRetry, s.altTabSuppressUntil);
+            continue;
+        }
+
         auto sinceIt = s.suspendSince.find(key);
         if (sinceIt == s.suspendSince.end()) {
             sinceIt = s.suspendSince.emplace(key, now).first;
@@ -4129,6 +4443,8 @@ void ReconcileAppSuspend(AppState& s, HWND focusHint = nullptr,
 void ToggleSuspend(AppState& s) {
     s.suspendInactive = !s.suspendInactive;
     SaveConfig(s);
+    // 开关切换后从头计时：避免关闭前残留的 Alt+Tab 保护期影响下一次开启。
+    s.altTabSuppressUntil = 0;
     if (!s.suspendInactive) {
         g_suspender.ResumeAll();
         s.suspendSince.clear();
@@ -5481,11 +5797,10 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
     // 找该应用的全部存活 pid（按 exe 镜像路径匹配 key）
     std::vector<DWORD> pids = FindPidsByKey(item.key);
 
-    // 托盘驻留应用：到达这里说明任务栏已无该应用窗口（点击路径先恢复
-    // 已有窗口，见 ToggleFocusOrLaunch），统一走 TrayList 方式 ——
-    // 点击 Dock 图标 = 点击系统托盘图标，由应用自己的托盘处理器恢复/
-    // 显示可交互主窗口。绝对不能先走外部 ShowWindow —— 微信等 Qt 自绘
-    // 应用会得到“看得见点不动”的影子窗口。
+    // 托盘驻留应用：没有未最小化窗口时（点击主路径见 ToggleFocusOrLaunch
+    // 的 iconClick 分支）统一走 TrayList 方式 —— 点击 Dock 图标 = 点击系统
+    // 托盘图标，由应用自己的托盘处理器决定显示/隐藏可交互主窗口。绝不能
+    // 走外部 ShowWindow —— 微信等 Qt 自绘应用会得到“看得见点不动”的影子窗口。
     if (item.trayMarked && !pids.empty() && !g_skipTrayTriggerOnce) {
         TrayIconTriggerAsync(s, item.displayName, pids, idx);
         // 托盘触发是异步的（窗口由应用自己的托盘处理器恢复）：
@@ -5612,11 +5927,14 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
                 return;
             }
         }
-        if (!pids.empty()) {
+        if (!pids.empty() && item.trayMarked) {
             Logf(L"托盘应用无可唤起窗口（纯后台驻留）：%ls",
                  item.displayName.c_str());
             return;
         }
+        // 非托盘条目：pids 里可能只是应用退出后残留的辅助进程
+        // （网易云音乐主进程退出后只剩 --type=renderer），不能据此认为
+        // 应用仍在运行，点击必须重新启动。
         LaunchItem(s, idx);
         return;
     }
@@ -5670,20 +5988,49 @@ void WakeTrayOnlyApp(AppState& s, size_t idx) {
     }
 }
 
-void ToggleFocusOrLaunch(AppState& s, size_t idx) {
+void ToggleFocusOrLaunch(AppState& s, size_t idx, bool iconClick) {
     SetFrameCadence(s, true);  // 空闲已停帧：点击反馈（圆点/悬停态）需要帧
     if (idx >= s.items.size()) return;
     DockItem& item = s.items[idx];
 
     // 点击被挂起的应用 = 用户要切过去：先恢复，否则随后的
-    // SendMessageTimeout(SC_RESTORE)/SetForegroundWindow 都会打空。
+    // SendMessageTimeout(SC_RESTORE)/SetForegroundWindow 都会打空，
+    // 托盘触发也会因为应用处理不了消息而落空。
     if (!EnsureAppResumedForInteraction(s, item.key)) {
         Logf(L"切换已取消：%ls 仍处于挂起状态且恢复失败",
              item.displayName.c_str());
         return;
     }
 
+    // 点击 Dock 图标：托盘图标驻留应用按“有没有打开的窗口”分两种语义 ——
+    //   1) 存在未最小化的打开窗口：最小化全部打开的窗口（任务栏切换语义）；
+    //   2) 一个未最小化窗口都没有（全部最小化/隐藏、纯托盘驻留）：
+    //      等价于点击它的系统托盘图标，由应用自己的托盘处理器决定如何
+    //      恢复/显示窗口（微信/钉钉等左键托盘 = 切换主窗）。
+    // 托盘应用在第二种情况下绝不由 Dock 代做 SC_RESTORE / SW_SHOW：
+    // 外部窗口操作会与应用内部状态不同步（应用仍认为窗口是隐藏的），
+    // 也会绕过托盘单击的应用自定义行为（切换/呼出面板等）。
+    if (iconClick && item.trayMarked) {
+        bool minimizedAny = false;
+        for (HWND w : item.windows) {
+            if (!IsWindow(w) || !IsWindowVisible(w) || IsIconic(w)) continue;
+            if (IsCloaked(w)) continue;
+            ShowWindow(w, SW_MINIMIZE);
+            minimizedAny = true;
+        }
+        if (minimizedAny) {
+            Logf(L"最小化：%ls", item.displayName.c_str());
+            s.needsRedraw = true;
+            return;
+        }
+        WakeTrayOnlyApp(s, idx);  // 无未最小化窗口 → 托盘图标触发/兜底启动
+        s.needsRedraw = true;
+        return;
+    }
+
     // 应用已在前台：点击 = 最小化该应用全部可见窗口（保留原有切换语义）。
+    // 托盘应用的图标点击已在上方处理（最小化或转发托盘图标）；这里只剩
+    // 普通应用与右键菜单的显式「最小化所有窗口」。
     if (AppOwnsForeground(item)) {
         bool minimizedAny = false;
         for (HWND w : item.windows) {
@@ -5702,13 +6049,11 @@ void ToggleFocusOrLaunch(AppState& s, size_t idx) {
         // Dock 图标能把隐藏/最小化的窗口重新打开。
     }
 
-    // 托盘驻留应用：优先打开任务栏已有窗口 —— item.windows 里收集到的
-    // 可见顶层主窗口与普通应用同路径恢复全部（最小化 SC_RESTORE）；
-    // 只有完全没有窗口时才走托盘图标触发（UIA 树，由应用自己的托盘
-    // 处理器恢复窗口），避免每次打开都强行走 UIA 树点托盘图标。
-    // item.windows 只含可见顶层窗口（EnumAppWindowProc 过滤），隐藏的
-    // Qt 自绘主窗（“看得见点不动”的影子窗口风险）不在集合内，恢复路径
-    // 天然安全；纯托盘驻留（无窗口）自然落入下方 WakeTrayOnlyApp 触发。
+    // 显式窗口操作（右键菜单「打开全部窗口 / 最小化所有窗口」）：托盘应用
+    // 的图标点击已在上方处理（最小化或转发托盘图标），这里只剩普通应用与
+    // 菜单入口。item.windows 只含可见顶层窗口（EnumAppWindowProc 过滤），
+    // 隐藏的 Qt 自绘主窗（“看得见点不动”的影子窗口风险）不在集合内；
+    // 完全没有可操作窗口时仍交给 WakeTrayOnlyApp 做托盘触发/启动兜底。
 
     // 优先使用 Dock 已收集的顶层窗口（item.windows 已包含 UWP 的
     // ApplicationFrameWindow 等真实应用窗口，不能只靠按 exe 枚举线程窗口）。
@@ -5936,7 +6281,7 @@ void ProcessDockDragUp(AppState& s, POINT client) {
         // 语义不变；期间 poll 可能重建 items，按 key 反查最新下标）
         const size_t idx = FindItemByKey(s, s.dragKey);
         if (idx != static_cast<size_t>(-1)) {
-            ToggleFocusOrLaunch(s, idx);
+            ToggleFocusOrLaunch(s, idx, true);
         }
     }
     ResetDockDrag(s);
@@ -6218,7 +6563,9 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
     const MenuEntry& e = s.menu[cmd - kMenuBaseId];
     switch (e.action) {
         case ItemAction::ToggleFocus:
-            ToggleFocusOrLaunch(s, e.itemIndex);
+            // 菜单是显式窗口操作（“打开全部窗口/最小化所有窗口”），
+            // 不套用图标点击的“永远等价于托盘图标”规则。
+            ToggleFocusOrLaunch(s, e.itemIndex, false);
             break;
         case ItemAction::SwitchToWindow:
             if (e.window && IsWindow(e.window)) {
@@ -6744,7 +7091,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     // 固定区：与钩子路径一致 —— 按压预备，松手再区分点击/拖拽
                     BeginDockPress(*s, static_cast<size_t>(idx), pt);
                 } else {
-                    ToggleFocusOrLaunch(*s, static_cast<size_t>(idx));
+                    ToggleFocusOrLaunch(*s, static_cast<size_t>(idx), true);
                 }
             }
             return 0;
@@ -6894,7 +7241,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                             // 固定区：进入按压预备态，松手再区分点击/拖拽重排
                             BeginDockPress(*s, static_cast<size_t>(idx), pt);
                         } else {
-                            ToggleFocusOrLaunch(*s, static_cast<size_t>(idx));
+                            ToggleFocusOrLaunch(*s, static_cast<size_t>(idx), true);
                         }
                     } else {
                         RequestCloseByIndex(*s, static_cast<size_t>(idx));
@@ -7077,10 +7424,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HealMinimizedSuiteWindows();
             return 0;
 
-        // WinEvent(EVENT_SYSTEM_FOREGROUND)：前台切换 → 复核全屏让位
-        // （游戏全屏/退出全屏绝大多数伴随前台切换；原地 Alt+Enter 切全屏
-        //  由 2s 保底与下缘触发前复核兜住）
+        // WinEvent(EVENT_SYSTEM_FOREGROUND)：前台切换 → 先恢复挂起目标，
+        // 再复核全屏让位（游戏全屏/退出全屏绝大多数伴随前台切换；原地
+        // Alt+Enter 切全屏由 2s 保底与下缘触发前复核兜住）。
         case kMsgFullscreen:
+            ResumeForegroundSuspendedApp(*s, reinterpret_cast<HWND>(lParam));
             UpdateFullscreenState(*s);
             // 前台切换也顺带复核：顶栏目标变化消息通常紧随其后，但若
             // 顶栏未运行/消息丢失，这里至少能立刻恢复新的前台应用。
@@ -7092,6 +7440,46 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case kMsgTopBarTargetChanged:
             ReconcileAppSuspend(*s, reinterpret_cast<HWND>(lParam), true);
             return 0;
+
+        // Alt+Tab / 触摸板切换开始或结束：切换前恢复可能被选中的挂起应用。
+        //   0/1/4 = 键盘提前触发 / SWITCHSTART / 任务切换器显示
+        //           → 保护期设到会话上限；
+        //   2/3/5 = SWITCHEND / Alt 松开 / 切换器隐藏
+        //           → 保护期改为落定期，恢复最终目标并复核一次。
+        // 所有恢复都在本 UI 线程执行（Suspender 线程约束），事件回调只投递。
+        case kMsgAltTab: {
+            if (!s->suspendInactive) return 0;
+            const ULONGLONG now = GetTickCount64();
+            const HWND target = reinterpret_cast<HWND>(lParam);
+            if (wParam == 0 || wParam == 1 || wParam == 4) {
+                // 提前触发（0/4）总是开新会话；SWITCHSTART（1）只补目标，
+                // 不把已进入落定期（或已开新会话）的保护期重新拉长——
+                // 它由 shell 的 WinEvent 线程投递，可能晚于键盘的“松开
+                // Alt”/切换器 hide 消息，无条件延长会让非目标应用多挂起 10s。
+                if (wParam == 0 || now >= s->altTabSuppressUntil) {
+                    s->altTabSuppressUntil = std::max(
+                        s->altTabSuppressUntil, now + kAltTabHoldMaxMs);
+                }
+                if (wParam == 4) {
+                    Logf(L"[挂起] 任务切换器显示（触摸板/Alt+Tab）");
+                }
+                ResumeAltTabCandidates(
+                    *s, wParam == 1 ? target : nullptr,
+                    wParam == 4 ? L"切换器"
+                                : (wParam == 1 ? L"开始" : L"提前"));
+            } else if (wParam == 2 || wParam == 3 || wParam == 5) {
+                s->altTabSuppressUntil = now + kAltTabSettleMs;
+                if (wParam == 5) {
+                    Logf(L"[挂起] 任务切换器关闭");
+                }
+                ResumeAltTabCandidates(
+                    *s, wParam == 2 ? target : nullptr,
+                    wParam == 5 ? L"切换器关闭"
+                                : (wParam == 2 ? L"结束" : L"松开 Alt"));
+                ReconcileAppSuspend(*s);
+            }
+            return 0;
+        }
 
         // 托盘图标触发完成（worker 线程）：确保任务栏保持隐藏并收尾
         // （溢出触发会临时显示过任务栏，这里清截止时刻并做兜底自愈）
@@ -7189,6 +7577,8 @@ void ResetDockGlobalsForRestart() {
     g_hookLeftDownOnDock = false;
     g_hookMiddleDownOnDock = false;
     g_skipTrayTriggerOnce = false;
+    g_taskSwitcherActive = false;
+    g_taskSwitcherHwnd = nullptr;
     g_fullscreenActive.store(false, std::memory_order_relaxed);  // 新一轮运行重新判定
 }
 
