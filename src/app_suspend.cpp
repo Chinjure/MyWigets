@@ -458,6 +458,11 @@ bool ShouldPauseApp(bool opened, bool hasVisibleWindow, bool userExcluded) {
 }
 
 std::vector<ProcessEntry> SnapshotProcesses() {
+    return SnapshotProcessesEx(ProcessSnapshotOptions{});
+}
+
+std::vector<ProcessEntry> SnapshotProcessesEx(
+    const ProcessSnapshotOptions& options) {
     std::vector<ProcessEntry> out;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return out;
@@ -473,12 +478,11 @@ std::vector<ProcessEntry> SnapshotProcesses() {
         do {
             const DWORD pid = pe.th32ProcessID;
             if (pid == 0 || pid == selfPid) continue;
-            if (sessionKnown) {
-                DWORD session = 0;
-                if (ProcessIdToSessionId(pid, &session) &&
-                    session != selfSession) {
-                    continue;
-                }
+            DWORD session = 0;
+            const bool sessionOk = ProcessIdToSessionId(pid, &session) != FALSE;
+            if (sessionKnown && sessionOk && session != selfSession &&
+                !options.includeOtherSessions) {
+                continue;
             }
 
             HANDLE proc =
@@ -502,12 +506,16 @@ std::vector<ProcessEntry> SnapshotProcesses() {
 
             const std::wstring normalized = NormalizePath(image);
             if (normalized.empty()) continue;
-            if (IsNeverSuspendImage(normalized)) continue;
+            if (!options.includeNeverSuspend &&
+                IsNeverSuspendImage(normalized)) {
+                continue;
+            }
 
             ProcessEntry entry;
             entry.pid = pid;
             entry.parentPid = pe.th32ParentProcessID;
             entry.creationTime = created;
+            entry.sessionId = sessionOk ? session : 0;
             entry.imagePath = normalized;
             out.push_back(std::move(entry));
         } while (Process32NextW(snap, &pe));
@@ -748,7 +756,7 @@ struct Suspender::Impl {
     // Job 当前成员（含子 Job），转换成 PID + 创建时间。快照里没有的
     // 新进程现场补查创建时间；查不到就丢弃，避免 PID 复用。
     std::vector<ProcessRef> JobMembers(const std::wstring& key,
-                                       size_t* unreadable = nullptr) {
+                                       size_t* unreadable = nullptr) const {
         std::vector<ProcessRef> members;
         if (!useJobSandbox) return members;
         auto it = jobs.find(key);
@@ -1706,6 +1714,12 @@ size_t Suspender::JobMemberCount(const std::wstring& appKey) const {
     auto it = impl_->jobs.find(NormalizePath(appKey));
     if (it == impl_->jobs.end() || !it->second) return 0;
     return QueryJobProcessIds(it->second).size();
+}
+
+std::vector<ProcessRef> Suspender::JobMemberRefs(
+    const std::wstring& appKey) const {
+    if (!impl_) return {};
+    return impl_->JobMembers(NormalizePath(appKey), nullptr);
 }
 
 bool Suspender::Resume(const std::wstring& appKey, std::wstring* detail) {

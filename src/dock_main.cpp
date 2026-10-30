@@ -65,6 +65,16 @@
 //      不产生键盘事件）都会在激活前恢复目标及其余仍拥有可见窗口的挂起
 //      应用，并在切换期间/落定期禁止重新挂起；纯托盘应用没有窗口、不会
 //      成为 Alt+Tab 目标，保持挂起。
+//  10. 关闭后清理（默认关闭，右键菜单开启）：固定第三方应用一旦
+//      没有可见/最小化窗口、也没有存活托盘图标，就在 5s 宽限后一次性
+//      结束全部可归因进程（精确/Job/后代/窄安装根/服务后代），并停止
+//      应用私有服务源头。只在窗口/托盘状态迁移、用户关闭、启动 30s
+//      sweep 或手动动作时触发；没有周期轮询、没有 kill-retry 循环。
+//      「不暂停此应用」只影响挂起，不影响清理。详见 app_cleanup.h。
+//  11. 应用服务守护（默认关闭，右键菜单安装/开启）：通过一次性安装的
+//      最高权限计划任务 broker，在应用关闭后停止并临时禁用其私有服务，
+//      应用重新打开时恢复原启动类型并视情况 StartService。broker 不常驻、
+//      不轮询；请求由 Dock 写文件 + schtasks /run 触发。
 //
 // 日志写入 ..\logs\dock.log
 
@@ -95,12 +105,15 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
+#include <deque>
 #include <functional>  // 托盘 UIA 树遍历递归（std::function）
+#include <memory>      // 清理结果在 worker/UI 线程间传递
 #include <mutex>    // std::once_flag：托盘注册表监听线程每进程仅建一次
 #include <new>      // 组件重启时 placement-new 重建 g_state
 #include <share.h>   // _SH_DENYNO：日志允许外部同时读取
@@ -111,6 +124,7 @@
 #include <vector>
 
 #include "app_suspend.h"      // 后台应用挂起（进程归属 + 挂起/恢复）
+#include "app_cleanup.h"      // 可见关闭后的残留进程清理（事件驱动、一次性）
 #include "fullscreen_guard.h"  // 全屏应用让位判定（与宿主托盘共用）
 #include "keep_top.h"         // 「保持顶栏」模式（注册表开关 + 预留区计算）
 #include "widgets.h"
@@ -184,10 +198,20 @@ constexpr int kMenuToggleLog = 1003;           // 右键菜单：运行日志开
 constexpr int kMenuToggleKeepTop = 1004;       // 右键菜单：「保持顶栏」模式开关
 constexpr int kMenuToggleSuspend = 1005;  // 右键菜单：后台应用挂起
 constexpr int kMenuToggleSuspendExclude = 1006;  // 图标菜单：不暂停此应用
+constexpr int kMenuToggleResidualCleanup = 1007;  // 关闭后清理残留进程
+constexpr int kMenuToggleServiceGuard = 1008;     // 应用服务守护开关
+constexpr int kMenuManageServiceGuard = 1009;     // 安装/卸载服务守护
+constexpr int kMenuRepairServiceGuard = 1010;     // 重装/修复服务守护任务
+constexpr int kMenuRepairServiceStart = 1011;     // 修复此应用服务的原始启动类型
 constexpr int kDockStripHeightLogical = 2;     // 展开触发条高度（逻辑像素，与 Dock 同宽）
 constexpr UINT_PTR kTooltipTimerId = 4;        // 悬停提示一次性定时器（停帧模式下到期踢帧）
 constexpr UINT_PTR kCollapseWatchTimerId = 5;  // 收起状态监视（诊断专用：本应收起未收起）
 constexpr UINT_PTR kSuspendTimerId = 6;       // 后台应用：宽限期/延后重试一次性定时器
+constexpr UINT_PTR kResidualTimerId = 7;      // 关闭后清理：一次性宽限到期
+constexpr UINT_PTR kResidualStartupTimerId = 8;  // 启动 30s 后一次性 sweep
+constexpr ULONGLONG kResidualGraceMs = 5000;    // 可见关闭后等托盘/窗口落定
+constexpr ULONGLONG kResidualStartupSettleMs = 30000;  // 启动 sweep 前的稳定期
+constexpr ULONGLONG kResidualMinProcessAgeMs = 15000;  // 刚启动的 helper 不杀
 constexpr UINT kCollapseWatchMs = 2000;        // 监视周期（2s，只记录不干预）
 // 焦点离开应用后先等一小段再挂起：应用切换、启动器拉起主窗、
 // 顶栏目标短暂清空都可能产生一闪而过的“未聚焦”，立即冻结会打断后台任务。
@@ -224,6 +248,7 @@ constexpr UINT kMsgTopBarDockState = WM_APP + 14;
 // ← 顶栏:启动/重置时查询当前联动状态(通过 SendMessageTimeout 的返回值应答,
 // 返回值 = 1 覆盖所有窗口/0 默认策略;同时按需补投递一次 kMsgTopBarDockState)。
 constexpr UINT kMsgTopBarDockQuery = WM_APP + 15;
+constexpr UINT kMsgResidualDone = WM_APP + 16;  // 清理 worker → UI 线程
 // → 顶栏:查询"顶栏当前把哪个应用当作聚焦目标"(wParam = 待判定窗口 HWND,
 // 返回值 1 = 该窗口属于顶栏当前目标应用 / 0 = 否)。与 topbar_main.cpp 同值。
 //
@@ -365,6 +390,18 @@ struct PendingLaunch {
     ULONGLONG startTick = 0;
 };
 
+// 关闭后清理：每个应用同一关闭 episode 只允许一次清理。
+struct ResidualTracker {
+    ULONGLONG closedSince = 0;
+    bool waiting = false;   // 已安排一次性宽限
+    bool running = false;   // worker 正在处理
+    bool done = false;      // 本次 episode 已处理（含放弃）
+    bool blocked = false;   // 权限/关键进程/源头不可停，等重新打开或手动
+    bool afterOpen = false; // 从「有窗口/托盘」迁移到关闭（可放宽进程年龄）
+    std::wstring detail;
+    std::shared_ptr<std::atomic<bool>> cancel;
+};
+
 // 固定区图标：点击还是拖拽重排？按压 → 超过阈值进入拖拽 → 松手执行其一。
 // 拖拽期间：行内剔除被拖槽、插入位留空位槽、绘制落位幽灵，松手后重排持久化。
 enum class DockDragPhase {
@@ -423,6 +460,7 @@ struct AppState {
     ULONGLONG lastPollTick = 0;                        // 上次全量轮询时刻
     bool refreshArmed = false;                         // 事件合并定时器已挂起
     UINT taskbarCreatedMsg = 0;                        // TaskbarCreated 广播（explorer 重启）
+    UINT serviceGuardDoneMsg = 0;                      // 服务守护 broker 完成
     std::unordered_set<std::wstring> runningExeCache;  // 进程路径集合缓存（省全进程枚举）
     ULONGLONG runningExeCacheAt = 0;
     bool needsRedraw = true;
@@ -435,6 +473,14 @@ struct AppState {
     std::unordered_set<std::wstring> suspendExceptions;
     std::unordered_map<std::wstring, ULONGLONG> suspendSince;  // 未聚焦起点
     std::unordered_map<std::wstring, ULONGLONG> suspendLogAt;  // 失败日志限频
+    // ---- 关闭后清理（可见关闭即零进程；事件驱动、无轮询）----
+    bool residualCleanup = false;  // 总开关（注册表 ResidualCleanup）
+    bool serviceGuardEnabled = false;  // 应用服务守护（注册表 ServiceGuardEnabled）
+    std::unordered_set<std::wstring> serviceGuardDisabledApps;
+    std::unordered_map<std::wstring, ResidualTracker> residualTrackers;
+    ULONGLONG residualStartupAt = 0;   // >0 表示启动 sweep 尚未执行
+    uint64_t residualGeneration = 0;   // 配置/启动取消在途任务
+    bool residualWorkerStarted = false;
     // Alt+Tab 保护截止时刻（GetTickCount64）。> now 时 Reconcile 不发起新的
     // 挂起：用户正在切换器里选择，或目标窗口刚被恢复、还原动画还没落定。
     // 0 = 无保护；会话上限见 kAltTabHoldMaxMs，事件丢失也会自动过期。
@@ -770,6 +816,10 @@ void LoadConfig(AppState& s, bool* existed) {
     // 默认关闭，由 Dock 右键菜单显式开启；老配置没有该值时保持关闭。
     // 注册表值名沿用 SuspendInactive，避免升级后开关状态被重置。
     s.suspendInactive = ReadRegDword(key, L"SuspendInactive", 0) != 0;
+    // 关闭后清理：默认关闭，属于破坏性行为；与挂起互不影响。
+    s.residualCleanup = ReadRegDword(key, L"ResidualCleanup", 0) != 0;
+    s.serviceGuardEnabled =
+        ReadRegDword(key, L"ServiceGuardEnabled", 0) != 0;
     // 应用级挂起豁免（图标右键菜单写入）：沿用 SuspendException* 值名，
     // 兼容早期窗口最小化版留下的勾选，不让用户的“永不暂停”设置丢失。
     const DWORD exceptionCount = std::clamp<DWORD>(
@@ -826,6 +876,14 @@ void SaveConfig(AppState& s) {
     RegSetValueExW(key, L"SuspendInactive", 0, REG_DWORD,
                    reinterpret_cast<const BYTE*>(&suspendInactive),
                    sizeof(suspendInactive));
+    const DWORD residualCleanup = s.residualCleanup ? 1 : 0;
+    RegSetValueExW(key, L"ResidualCleanup", 0, REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&residualCleanup),
+                   sizeof(residualCleanup));
+    const DWORD serviceGuardEnabled = s.serviceGuardEnabled ? 1 : 0;
+    RegSetValueExW(key, L"ServiceGuardEnabled", 0, REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&serviceGuardEnabled),
+                   sizeof(serviceGuardEnabled));
     const DWORD exceptionCount =
         static_cast<DWORD>(s.suspendExceptions.size());
     RegSetValueExW(key, L"SuspendExceptionCount", 0, REG_DWORD,
@@ -2320,6 +2378,28 @@ void SetFrameCadence(AppState& s, bool fast);
 void SyncTopBarDockState(AppState& s, bool force);  // 顶栏联动：展开/收起态同步（定义在下方）
 void UpdateKeepTopWorkArea(AppState& s, bool refitMaximized);  // 保持顶栏：工作区（定义在下方）
 bool ReloadDockConfigFromRegistry(AppState& s);  // 配置轮询：外部改动拉回（定义在下方）
+
+// 关闭后清理：事件路径只安排一次性宽限，不做周期轮询。
+bool IsResidualThirdParty(const DockItem& item);
+void MaybeScheduleResidualForItem(AppState& s, const DockItem& item,
+                                  bool afterOpen = false);
+void CancelResidualForApp(AppState& s, const std::wstring& key);
+void ReconcileResidualDue(AppState& s);
+void SeedResidualStartupSweep(AppState& s);
+void ArmResidualTimer(AppState& s);
+void StartResidualWorker(HWND hwnd);
+void StopResidualWorker();
+void DrainResidualResults(AppState& s);
+bool ResidualTrayProbe(const appcleanup::CleanupRequest& request,
+                       const std::vector<DWORD>& pids);
+bool ServiceGuardInstalled();
+void RequestServiceGuard(AppState& s, const std::wstring& action,
+                         const std::wstring& appKey,
+                         const std::wstring& pinKey);
+void EnsureServiceGuardRestoredForApp(AppState& s, const std::wstring& key,
+                                      const std::wstring& pinKey);
+void ToggleServiceGuard(AppState& s);
+void ManageServiceGuard(AppState& s);
 void ApplyKeepTopEnabled(AppState& s, bool enabled, bool refitMaximized);  // 定义在下方
 void ToggleKeepTopFromMenu(AppState& s);  // 右键菜单切换「保持顶栏」（定义在下方）
 void RequestCloseByIndex(AppState& s, size_t idx);  // 中键关闭：固定项隐藏圆点，临时项直接移除
@@ -2860,7 +2940,11 @@ size_t OrdinalFor(AppState& s,
 bool RefreshItems(AppState& s) {
     std::vector<std::wstring> prevKeys;
     prevKeys.reserve(s.items.size());
-    for (const auto& it : s.items) prevKeys.push_back(it.key);
+    std::unordered_map<std::wstring, bool> prevOpen;
+    for (const auto& it : s.items) {
+        prevKeys.push_back(it.key);
+        prevOpen[it.key] = it.hasWindow || it.trayMarked;
+    }
 
     std::unordered_map<std::wstring, size_t> prevOrder(s.orderMap);
     std::unordered_map<std::wstring, float> prevAnim;
@@ -3069,6 +3153,84 @@ bool RefreshItems(AppState& s) {
         if (animIt != prevAnim.end()) item.scaleAnim = animIt->second;
         if (item.pinned) ++s.pinCount;
         s.items.push_back(std::move(item));
+    }
+
+    // ---- 关闭后清理：只在「打开 → 可见关闭」迁移时安排一次 ----
+    // 这里不杀进程，也不做周期扫描：只是把一个一次性宽限任务登记到
+    // tracker，由 kResidualTimerId 到期后交给 worker。见 4xxx 的实现。
+    if (s.residualCleanup) {
+        // 某个有窗口/托盘的运行项刚刚从 Dock 消失（典型：Quark 的版本化
+        // 主进程退出、固定项是根启动器，key 不同）也算一次 close 迁移。
+        std::vector<std::wstring> prevOpenMissing;
+        for (const auto& kv : prevOpen) {
+            if (!kv.second) continue;
+            bool stillPresent = false;
+            for (const DockItem& it : s.items) {
+                if (it.key == kv.first) {
+                    stillPresent = true;
+                    break;
+                }
+            }
+            if (!stillPresent) prevOpenMissing.push_back(kv.first);
+        }
+        for (const DockItem& item : s.items) {
+            if (!IsResidualThirdParty(item)) continue;
+            const bool nowOpen = item.hasWindow || item.trayMarked;
+            auto old = prevOpen.find(item.key);
+            const bool wasOpen = old != prevOpen.end() ? old->second : false;
+            if (nowOpen) {
+                if (s.serviceGuardEnabled && ServiceGuardInstalled() &&
+                    IsResidualThirdParty(item)) {
+                    // 上一次运行可能把服务临时禁用了；应用重新打开时恢复。
+                    // 每个「关闭 → 打开」迁移只请求一次；broker 无状态时快速返回。
+                    auto disabled =
+                        s.serviceGuardDisabledApps.find(item.key);
+                    if (disabled != s.serviceGuardDisabledApps.end() ||
+                        !wasOpen) {
+                        RequestServiceGuard(s, L"restore", item.key,
+                                            item.pinKey);
+                        if (disabled != s.serviceGuardDisabledApps.end()) {
+                            s.serviceGuardDisabledApps.erase(disabled);
+                        }
+                    }
+                }
+                CancelResidualForApp(s, item.key);
+                continue;
+            }
+            // 只把「同一个应用」的消失映射到本条目：同 key、同 basename
+            // 或同显示名。避免一个无关应用关闭就把所有后台应用按
+            // minAge=0 清理。
+            bool relatedMissing = false;
+            const std::wstring itemBase =
+                ToLower(PathBasename(item.key));
+            const std::wstring itemName = ToLower(item.displayName);
+            for (const std::wstring& gone : prevOpenMissing) {
+                const std::wstring goneBase =
+                    ToLower(PathBasename(gone));
+                const std::wstring goneName =
+                    ToLower(ExeDisplayName(gone));
+                if (gone == item.key || gone == item.pinKey ||
+                    (!goneBase.empty() && goneBase == itemBase) ||
+                    (!goneName.empty() && goneName == itemName)) {
+                    relatedMissing = true;
+                    break;
+                }
+            }
+            const bool closingMigration = wasOpen || relatedMissing;
+            // 只处理关闭迁移；首次启动的关闭状态由 30s 一次性 sweep 覆盖。
+            // 60s 保底刷新不会因此变成清理轮询。
+            if (closingMigration) {
+                // 服务禁用不能只依赖残留清理结果：即使应用关闭时已经没有
+                // 残留进程（cleanup 返回 NoProcesses），也要在关闭迁移时
+                // 直接让 broker 停服务。这样“关闭后禁用”不依赖进程扫描。
+                if (s.serviceGuardEnabled && ServiceGuardInstalled()) {
+                    RequestServiceGuard(s, L"disable", item.key,
+                                        item.pinKey);
+                    s.serviceGuardDisabledApps.insert(item.key);
+                }
+                MaybeScheduleResidualForItem(s, item, /*afterOpen=*/true);
+            }
+        }
     }
 
     // ---- 变更检测与日志（仅状态切换的那一次 poll 会触发）----
@@ -4140,6 +4302,12 @@ bool IsLaunchPending(const AppState& s, const std::wstring& key) {
 // Dock 图标点击/菜单动作前先把应用恢复运行：被挂起的进程不会处理
 // 任何窗口消息，SendMessageTimeout 聚焦/关窗/托盘唤起都会超时。
 bool EnsureAppResumedForInteraction(AppState& s, const std::wstring& key) {
+    if (s.serviceGuardEnabled) {
+        const size_t idx = FindItemByKey(s, key);
+        if (idx != static_cast<size_t>(-1)) {
+            EnsureServiceGuardRestoredForApp(s, key, s.items[idx].pinKey);
+        }
+    }
     if (!g_suspender.IsSuspended(key)) return true;
     std::wstring detail;
     const bool ok = g_suspender.Resume(key, &detail);
@@ -4464,6 +4632,27 @@ void ToggleSuspend(AppState& s) {
     ReconcileAppSuspend(s);
 }
 
+// 关闭后清理总开关。与「不暂停此应用」完全独立：后者只影响挂起。
+void ToggleResidualCleanup(AppState& s) {
+    s.residualCleanup = !s.residualCleanup;
+    SaveConfig(s);
+    if (!s.residualCleanup) {
+        for (auto& kv : s.residualTrackers) {
+            if (kv.second.cancel) kv.second.cancel->store(true);
+        }
+        s.residualTrackers.clear();
+        if (s.hwnd) {
+            KillTimer(s.hwnd, kResidualTimerId);
+            KillTimer(s.hwnd, kResidualStartupTimerId);
+        }
+        Logf(L"[清理] 关闭后清理：关闭（不会主动结束任何进程）");
+        return;
+    }
+    Logf(L"[清理] 关闭后清理：开启（固定第三方应用；无窗口/无托盘；"
+         L"一次性事件驱动，不做轮询重试）");
+    SeedResidualStartupSweep(s);
+}
+
 // 图标右键菜单「不暂停此应用」：把应用 key 写入/移出豁免集合
 // 并持久化。有固定项 key（名称合并条目）时优先记 pinKey —— 与旧版
 // SuspendException* 的存法一致，也保证不同运行 key（启动器/主程序）都能
@@ -4613,6 +4802,10 @@ void BringAppWindowGroupToFront(const std::vector<HWND>& windows, HWND target) {
 void LaunchItem(AppState& s, size_t idx) {
     if (idx >= s.items.size()) return;
     DockItem& item = s.items[idx];
+    if (s.serviceGuardEnabled && ServiceGuardInstalled()) {
+        RequestServiceGuard(s, L"restore", item.key, item.pinKey);
+        s.serviceGuardDisabledApps.erase(item.key);
+    }
     // 用 ShellExecuteEx 而不是 ShellExecute：拿到目标进程句柄后立刻加入
     // 该应用的 Job 沙箱，保证目标从第一个子进程起（包括落在 %TEMP%、
     // 更新目录里的 helper）都在 Job 里。拿不到句柄（URL/DDE/UWP 等）
@@ -4721,7 +4914,11 @@ std::vector<DWORD> FindPidsByKey(const std::wstring& key) {
 // 特殊：explorer.exe 是系统 shell（桌面/任务栏/托盘宿主）——“关闭应用”
 // 只能关闭其用户意义上的窗口（文件管理器 CabinetWClass），绝不终止进程，
 // 否则会把整个资源管理器杀掉（桌面/任务栏全部重建）。
-void CloseAppByKey(const std::wstring& key, const std::wstring& displayName) {
+void CloseAppByKey(const std::wstring& key, const std::wstring& pinKey,
+                   const std::wstring& displayName,
+                   const std::vector<appsuspend::ProcessRef>& jobMembers,
+                   const std::vector<std::wstring>& allAppKeys,
+                   bool trayMarked) {
     std::vector<DWORD> pids = FindPidsByKey(key);
     if (pids.empty()) {
         Logf(L"关闭 %ls：未在运行", displayName.c_str());
@@ -4777,27 +4974,35 @@ void CloseAppByKey(const std::wstring& key, const std::wstring& displayName) {
         return;
     }
 
-    // 2+3. 后台轮询等待退出，超时强杀 —— 同步等待会让中键后的 Dock
-    //    冻结约 1.5s（窗口不重绘、不响应鼠标），改为后台线程，UI 立即恢复
+    // 2+3. 后台等待退出，超时后走统一的残留清理器（一次完成，不轮询重试）。
+    //    同步等待会让中键后的 Dock 冻结约 1.5s（窗口不重绘、不响应鼠标），
+    //    所以放到后台线程。
     std::thread(
-        [key, displayName]() {
-            // 2. 轮询等待退出（最多 1.5s）
-            for (int i = 0; i < 15; ++i) {
-                Sleep(100);
-                if (FindPidsByKey(key).empty()) {
-                    Logf(L"关闭 %ls：已退出", displayName.c_str());
-                    return;
-                }
-            }
-            // 3. 超时强杀
-            for (DWORD pid : FindPidsByKey(key)) {
-                HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-                if (proc) {
-                    TerminateProcess(proc, 1);
-                    CloseHandle(proc);
-                }
-            }
-            Logf(L"关闭 %ls：超时已强制结束", displayName.c_str());
+        [key, pinKey, displayName, jobMembers, allAppKeys, trayMarked]() {
+            // 2. 有界等待优雅退出（最多 1.5s）。注意不能因为同 exe 已
+            //    退出就提前 return：主进程退出后不同 exe 的 helper 仍可能
+            //    在跑，必须继续走归因清理。
+            for (int i = 0; i < 15; ++i) Sleep(100);
+            // 3. 统一清理：同 exe + Job 成员 + 跨目录 helper + 服务后代；
+            //    有托盘/窗口时清理器会放弃，保留托盘驻留。
+            appcleanup::CleanupRequest request;
+            request.appKey = key;
+            request.pinKey = pinKey;
+            request.displayName = displayName;
+            request.jobMembers = jobMembers;
+            request.allAppKeys = allAppKeys;
+            request.trayMarked = trayMarked;
+            appcleanup::CleanupOptions options;
+            options.stopServices = true;
+            options.minProcessAgeMs = 3000;
+            const appcleanup::CleanupResult result =
+                appcleanup::CleanupOnce(request, options, ResidualTrayProbe);
+            Logf(L"关闭 %ls：清理结果=%d 匹配=%zu 终止=%zu 拒绝=%zu "
+                 L"服务停=%zu 服务拒=%zu %ls",
+                 displayName.c_str(), static_cast<int>(result.verdict),
+                 result.matched, result.terminated, result.denied,
+                 result.servicesStopped, result.servicesDenied,
+                 result.detail.c_str());
         })
         .detach();
 }
@@ -4810,8 +5015,26 @@ void RequestCloseByIndex(AppState& s, size_t idx) {
     if (idx >= s.items.size()) return;
     DockItem& item = s.items[idx];
     const std::wstring key = item.key;
+    const std::wstring pinKey = item.pinKey;
     const std::wstring displayName = item.displayName;
     const bool pinned = item.pinned;
+    const bool trayMarked = item.trayMarked;
+    std::vector<appsuspend::ProcessRef> jobMembers =
+        g_suspender.JobMemberRefs(key);
+    std::vector<std::wstring> allAppKeys;
+    allAppKeys.reserve(s.items.size());
+    for (const DockItem& it : s.items) allAppKeys.push_back(it.key);
+
+    // 应用被用户显式关闭：取消排队中的清理，避免与本次关闭路径并发。
+    // 关闭路径自己会执行一次 CleanupOnce；标记 done 防止 RefreshItems
+    // 在看到同一迁移时再排一次。
+    CancelResidualForApp(s, key);
+    {
+        ResidualTracker& t = s.residualTrackers[key];
+        t.done = true;
+        t.waiting = false;
+        t.running = false;
+    }
 
     // 被挂起的进程不会处理 WM_CLOSE；先恢复再走优雅关闭，失败也没关系，
     // 后面的超时 TerminateProcess 对内核对过创建时间，仍能安全终止。
@@ -4842,7 +5065,8 @@ void RequestCloseByIndex(AppState& s, size_t idx) {
         DrawAndPresent(s);
     }
 
-    CloseAppByKey(key, displayName);
+    CloseAppByKey(key, pinKey, displayName, jobMembers, allAppKeys,
+                  trayMarked);
 }
 
 // ============ 托盘图标触发（Win11 XAML 托盘）============
@@ -5809,6 +6033,559 @@ void TrayIconTriggerAsync(AppState& s, const std::wstring& nameHint,
     }).detach();
 }
 
+// ============================== 关闭后清理 ==============================
+// 事件驱动：RefreshItems 只在「打开 → 可见关闭」迁移时登记一次性宽限；
+// 到点后由单个 worker 执行一次 CleanupOnce。没有周期扫描、没有重试循环。
+// 反复重启的进程由 app_cleanup 停止源头/瞬时 Job 一次处理，失败即 Blocked。
+
+std::mutex g_residualMutex;
+std::condition_variable g_residualCv;
+std::deque<appcleanup::CleanupResult> g_residualOutcomes;
+std::deque<std::wstring> g_residualOutcomeKeys;
+std::deque<std::wstring> g_residualOutcomeNames;
+bool g_residualStop = false;
+HWND g_residualNotifyHwnd = nullptr;
+std::thread g_residualThread;
+
+struct ResidualJob {
+    uint64_t generation = 0;
+    std::wstring key;
+    std::wstring displayName;
+    appcleanup::CleanupRequest request;
+    appcleanup::CleanupOptions options;
+};
+
+std::deque<ResidualJob> g_residualJobs;
+
+const wchar_t* ResidualVerdictName(appcleanup::CleanupVerdict v) {
+    switch (v) {
+        case appcleanup::CleanupVerdict::Cleaned: return L"已清理";
+        case appcleanup::CleanupVerdict::NoProcesses: return L"无进程";
+        case appcleanup::CleanupVerdict::DryRun: return L"dry-run";
+        case appcleanup::CleanupVerdict::AbortedOpenWindow: return L"有窗口";
+        case appcleanup::CleanupVerdict::AbortedTray: return L"有托盘";
+        case appcleanup::CleanupVerdict::AbortedLaunching: return L"启动中";
+        case appcleanup::CleanupVerdict::AbortedDesktop: return L"非Default桌面";
+        case appcleanup::CleanupVerdict::AbortedCancelled: return L"已取消";
+        case appcleanup::CleanupVerdict::NeedsElevation: return L"需要管理员";
+        case appcleanup::CleanupVerdict::BlockedCritical: return L"关键进程";
+        case appcleanup::CleanupVerdict::Failed: return L"失败";
+    }
+    return L"未知";
+}
+
+bool ResidualTrayProbe(const appcleanup::CleanupRequest& request,
+                       const std::vector<DWORD>& pids) {
+    // 注意：request.trayMarked 只是「注册表登记 + 同路径进程存活」，不是
+    // 存活托盘图标。不能直接 return true，否则旧注册表项 + 残留进程会把
+    // 清理永久挡住。UIA 枚举成功时以 UIA 为准；UIA 不可用才回退。
+    const std::wstring key =
+        request.appKey.empty() ? request.pinKey : request.appKey;
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool comOk = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+    if (comOk) {
+        IUIAutomation* uia = nullptr;
+        bool sawRoot = false;
+        bool found = false;
+        if (SUCCEEDED(CoCreateInstance(CLSID_CUIAutomation, nullptr,
+                                       CLSCTX_INPROC_SERVER,
+                                       IID_PPV_ARGS(&uia))) &&
+            uia) {
+            auto inspectRoot = [&](HWND rootHwnd) {
+                if (!rootHwnd || found) return;
+                ComPtr<IUIAutomationElement> root;
+                IUIAutomationElement* raw = nullptr;
+                if (FAILED(uia->ElementFromHandle(rootHwnd, &raw)) || !raw) {
+                    return;
+                }
+                sawRoot = true;
+                root.Attach(raw);
+                auto elements = UiaFindAll(uia, root, TreeScope_Descendants);
+                for (auto& el : elements) {
+                    const int ct = UiaElementControlType(el);
+                    if (ct != UIA_ButtonControlTypeId &&
+                        ct != UIA_ListItemControlTypeId &&
+                        ct != UIA_ImageControlTypeId) {
+                        continue;
+                    }
+                    DockTrayIconInfo info;
+                    if (!ExtractTrayIconInfo(uia, el, 0, info)) continue;
+                    if (TrayIconMatchesApp(info, request.displayName, key,
+                                           pids)) {
+                        found = true;
+                        return;
+                    }
+                }
+            };
+            for (HWND bridge : CollectTrayBridgeWindows()) {
+                inspectRoot(bridge);
+                if (found) break;
+            }
+            HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+            if (!found) {
+                inspectRoot(tray);
+            }
+            if (!found && tray) {
+                inspectRoot(FindWindowExW(tray, nullptr, L"TrayNotifyWnd",
+                                          nullptr));
+            }
+            uia->Release();
+        }
+        if (SUCCEEDED(hr)) CoUninitialize();
+        if (found) return true;
+        if (sawRoot) return false;  // UIA 正常枚举过：没有匹配图标
+    }
+
+    // UIA 不可用时的保守兜底：注册表按同 basename 匹配，且必须仍有
+    // 用户会话进程；只有服务进程时不算托盘（夸克/钉钉的旧目录路径也能命中）。
+    if (request.trayMarked) return true;
+    if (pids.empty()) return false;
+    const std::wstring keyBase = ToLower(PathBasename(key));
+    if (keyBase.empty()) return false;
+    for (const std::wstring& raw : ReadRegisteredTrayRawPaths()) {
+        const std::wstring path =
+            NormalizePath(ExpandKnownFolderPrefix(raw));
+        if (path.empty()) continue;
+        if (path == NormalizePath(request.appKey) ||
+            path == NormalizePath(request.pinKey) ||
+            ToLower(PathBasename(path)) == keyBase) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void StartResidualWorker(HWND hwnd) {
+    if (g_residualThread.joinable()) {
+        g_residualNotifyHwnd = hwnd;
+        return;
+    }
+    g_residualNotifyHwnd = hwnd;
+    g_residualStop = false;
+    g_residualThread = std::thread([] {
+        for (;;) {
+            ResidualJob job;
+            {
+                std::unique_lock<std::mutex> lock(g_residualMutex);
+                g_residualCv.wait(lock, [] {
+                    return g_residualStop || !g_residualJobs.empty();
+                });
+                if (g_residualStop && g_residualJobs.empty()) return;
+                job = std::move(g_residualJobs.front());
+                g_residualJobs.pop_front();
+            }
+            appcleanup::CleanupResult result =
+                appcleanup::CleanupOnce(job.request, job.options,
+                                        ResidualTrayProbe);
+            {
+                std::lock_guard<std::mutex> lock(g_residualMutex);
+                g_residualOutcomes.push_back(std::move(result));
+                g_residualOutcomeKeys.push_back(job.key);
+                g_residualOutcomeNames.push_back(job.displayName);
+            }
+            PostMessageW(g_residualNotifyHwnd, kMsgResidualDone, 0, 0);
+        }
+    });
+}
+
+void StopResidualWorker() {
+    {
+        std::lock_guard<std::mutex> lock(g_residualMutex);
+        g_residualStop = true;
+        g_residualJobs.clear();
+    }
+    g_residualCv.notify_all();
+    if (g_residualThread.joinable()) g_residualThread.join();
+}
+
+void ArmResidualTimer(AppState& s) {
+    if (!s.hwnd) return;
+    const ULONGLONG now = GetTickCount64();
+    ULONGLONG earliest = UINT64_MAX;
+    for (const auto& kv : s.residualTrackers) {
+        const ResidualTracker& t = kv.second;
+        if (!t.waiting || t.running || t.done || t.blocked) continue;
+        const ULONGLONG due = t.closedSince + kResidualGraceMs;
+        earliest = std::min(earliest, due);
+    }
+    if (earliest == UINT64_MAX) {
+        KillTimer(s.hwnd, kResidualTimerId);
+        return;
+    }
+    const ULONGLONG delay =
+        std::clamp<ULONGLONG>(earliest > now ? earliest - now : 50, 50, 5000);
+    SetTimer(s.hwnd, kResidualTimerId, static_cast<UINT>(delay), nullptr);
+}
+
+bool IsResidualThirdParty(const DockItem& item) {
+    if (!item.pinned) return false;
+    if (!IsSuspendAppItem(item)) return false;
+    const std::wstring lower = ToLower(item.key);
+    // Microsoft 系（Edge/Office/VS Code/Terminal 等）不算第三方；
+    // IsSystemComponentPath 只认 "\microsoft\"，这里把 "Microsoft Office"
+    // 这类带空格的目录也一并挡掉。
+    if (lower.find(L"\\microsoft") != std::wstring::npos) return false;
+    if (IsSystemComponentPath(item.key)) return false;
+    if (lower.find(L"\\windowsapps\\") != std::wstring::npos) return false;
+    return true;
+}
+
+void MaybeScheduleResidualForItem(AppState& s, const DockItem& item,
+                                  bool afterOpen) {
+    if (!s.residualCleanup || !s.hwnd || !IsResidualThirdParty(item)) return;
+    if (item.hasWindow || item.trayMarked) return;
+    if (s.closingKeys.count(item.key) != 0) return;  // 关闭动作正在处理
+    if (IsLaunchPending(s, item.key)) return;
+    const ULONGLONG now = GetTickCount64();
+    if (s.residualStartupAt != 0 && now < s.residualStartupAt) return;
+    auto& tracker = s.residualTrackers[item.key];
+    if (tracker.waiting || tracker.running || tracker.done || tracker.blocked) {
+        return;
+    }
+    tracker.closedSince = now;
+    tracker.waiting = true;
+    tracker.afterOpen = afterOpen;
+    tracker.detail.clear();
+    if (!tracker.cancel) {
+        tracker.cancel = std::make_shared<std::atomic<bool>>(false);
+    } else {
+        tracker.cancel->store(false);
+    }
+    Logf(L"[清理] 安排 %ls：可见关闭，5s 后一次性清理",
+         item.displayName.c_str());
+    ArmResidualTimer(s);
+}
+
+void CancelResidualForApp(AppState& s, const std::wstring& key) {
+    auto it = s.residualTrackers.find(key);
+    if (it != s.residualTrackers.end()) {
+        if (it->second.cancel) it->second.cancel->store(true);
+        s.residualTrackers.erase(it);
+        ArmResidualTimer(s);
+    }
+}
+
+void SeedResidualStartupSweep(AppState& s) {
+    s.residualStartupAt = 0;
+    if (!s.residualCleanup) return;
+    for (const DockItem& item : s.items) {
+        if (item.hasWindow || item.trayMarked) continue;
+        MaybeScheduleResidualForItem(s, item);
+    }
+}
+
+void ReconcileResidualDue(AppState& s) {
+    if (!s.residualCleanup) {
+        s.residualTrackers.clear();
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    std::vector<std::wstring> eraseKeys;
+    for (auto& kv : s.residualTrackers) {
+        ResidualTracker& t = kv.second;
+        if (!t.waiting || t.running || t.done || t.blocked) continue;
+        if (now < t.closedSince + kResidualGraceMs) continue;
+        const size_t idx = FindItemByKey(s, kv.first);
+        if (idx == static_cast<size_t>(-1)) {
+            eraseKeys.push_back(kv.first);
+            continue;
+        }
+        const DockItem& item = s.items[idx];
+        if (item.hasWindow || item.trayMarked ||
+            !IsResidualThirdParty(item) || IsLaunchPending(s, item.key)) {
+            eraseKeys.push_back(kv.first);
+            continue;
+        }
+        if (!IsInteractiveDesktopAvailable()) {
+            // 安全桌面期间不顺延多次；等下一个事件/重新打开。
+            t.closedSince = now;
+            continue;
+        }
+        const std::wstring focusKey =
+            AppIdentityKeyForWindow(QueryTopBarTargetHwnd());
+        const std::wstring foregroundKey =
+            AppIdentityKeyForWindow(GetForegroundWindow());
+        if ((!focusKey.empty() && focusKey == item.key) ||
+            (!foregroundKey.empty() && foregroundKey == item.key)) {
+            eraseKeys.push_back(kv.first);
+            continue;
+        }
+
+        ResidualJob job;
+        job.generation = s.residualGeneration;
+        job.key = item.key;
+        job.displayName = item.displayName;
+        job.request.appKey = item.key;
+        job.request.pinKey = item.pinKey;
+        job.request.displayName = item.displayName;
+        job.request.trayMarked = item.trayMarked;
+        job.request.jobMembers = g_suspender.JobMemberRefs(item.key);
+        for (const DockItem& other : s.items) {
+            job.request.allAppKeys.push_back(other.key);
+        }
+        job.options.dryRun = false;
+        job.options.stopServices = true;
+        // 从「有窗口/托盘」迁移过来的关闭：残留 helper 可能刚由主进程
+        // 拉起，放宽进程年龄；启动 sweep 仍保留 15s 保护。
+        job.options.minProcessAgeMs =
+            t.afterOpen ? 0 : kResidualMinProcessAgeMs;
+        job.options.cancel = t.cancel;
+        t.waiting = false;
+        t.running = true;
+        Logf(L"[清理] 执行 %ls：无窗口/无托盘，提交一次性清理",
+             item.displayName.c_str());
+        {
+            std::lock_guard<std::mutex> lock(g_residualMutex);
+            g_residualJobs.push_back(std::move(job));
+        }
+        g_residualCv.notify_one();
+    }
+    for (const std::wstring& key : eraseKeys) {
+        CancelResidualForApp(s, key);
+    }
+    ArmResidualTimer(s);
+}
+
+void DrainResidualResults(AppState& s) {
+    std::deque<appcleanup::CleanupResult> results;
+    std::deque<std::wstring> keys;
+    std::deque<std::wstring> names;
+    {
+        std::lock_guard<std::mutex> lock(g_residualMutex);
+        results.swap(g_residualOutcomes);
+        keys.swap(g_residualOutcomeKeys);
+        names.swap(g_residualOutcomeNames);
+    }
+    while (!results.empty()) {
+        appcleanup::CleanupResult result = std::move(results.front());
+        results.pop_front();
+        const std::wstring key = keys.front();
+        const std::wstring name = names.front();
+        keys.pop_front();
+        names.pop_front();
+        auto it = s.residualTrackers.find(key);
+        if (it == s.residualTrackers.end()) continue;
+        ResidualTracker& t = it->second;
+        t.running = false;
+        t.waiting = false;
+        t.detail = result.detail;
+        const bool blocked =
+            result.verdict == appcleanup::CleanupVerdict::NeedsElevation ||
+            result.verdict == appcleanup::CleanupVerdict::BlockedCritical ||
+            result.verdict == appcleanup::CleanupVerdict::Failed;
+        t.blocked = blocked;
+        t.done = true;
+        Logf(L"[清理] %ls：%ls（匹配 %zu / 终止 %zu / 拒绝 %zu / 服务停 %zu "
+             L"/ 服务拒 %zu）%ls%ls",
+             name.c_str(), ResidualVerdictName(result.verdict),
+             result.matched, result.terminated, result.denied,
+             result.servicesStopped, result.servicesDenied,
+             result.detail.empty() ? L"" : L"：",
+             result.detail.c_str());
+        if (result.needsElevation) {
+            Logf(L"[清理] %ls：存在需要管理员权限的服务/进程，未静默放过",
+                 name.c_str());
+        }
+        // 服务守护：清理结束后把该应用的私有服务停止并临时禁用，
+        // 防止 SCM/失败恢复再拉起后台进程。启动应用时再恢复。
+        const bool closedState =
+            result.verdict == appcleanup::CleanupVerdict::Cleaned ||
+            result.verdict == appcleanup::CleanupVerdict::NoProcesses ||
+            result.verdict == appcleanup::CleanupVerdict::NeedsElevation;
+        if (closedState && s.serviceGuardEnabled && ServiceGuardInstalled()) {
+            const size_t idx = FindItemByKey(s, key);
+            if (idx != static_cast<size_t>(-1)) {
+                const DockItem& item = s.items[idx];
+                if (item.pinned && !item.hasWindow && !item.trayMarked &&
+                    IsResidualThirdParty(item)) {
+                    RequestServiceGuard(s, L"disable", item.key,
+                                        item.pinKey);
+                    s.serviceGuardDisabledApps.insert(item.key);
+                }
+            }
+        }
+    }
+    ArmResidualTimer(s);
+}
+
+// ============================== 应用服务守护 ==============================
+// 关闭后由计划任务 broker 停止并临时禁用应用私有服务；应用重新打开时
+// 恢复原启动类型并视情况 StartService。Dock 只负责写 request + 触发
+// 已安装的任务，不直接持有管理员权限。
+
+std::wstring EnvPath(const wchar_t* name) {
+    wchar_t buf[32768] = {};
+    const DWORD n = GetEnvironmentVariableW(name, buf, 32760);
+    return (n > 0 && n < 32760) ? std::wstring(buf) : std::wstring();
+}
+
+std::wstring ServiceGuardDataDir() {
+    return EnvPath(L"ProgramData") +
+           L"\\DesktopSuite\\ServiceGuard";
+}
+
+std::wstring ServiceGuardLocalDir() {
+    return EnvPath(L"LOCALAPPDATA") +
+           L"\\DesktopSuite\\ServiceGuard";
+}
+
+bool ServiceGuardInstalled() {
+    const std::wstring marker =
+        ServiceGuardLocalDir() + L"\\installed.flag";
+    const std::wstring exe =
+        EnvPath(L"ProgramFiles") +
+        L"\\DesktopSuite\\MyWigetsServiceGuard.exe";
+    return GetFileAttributesW(marker.c_str()) != INVALID_FILE_ATTRIBUTES &&
+           GetFileAttributesW(exe.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+std::wstring ServiceGuardHelperPath() {
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const std::wstring dir = PathDir(exe);
+    const std::wstring direct = dir + L"\\MyWigetsServiceGuard.exe";
+    if (GetFileAttributesW(direct.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return direct;
+    }
+    const std::wstring repo = dir + L"\\clock\\bin\\MyWigetsServiceGuard.exe";
+    if (GetFileAttributesW(repo.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return repo;
+    }
+    return L"";
+}
+
+void RequestServiceGuard(AppState& s, const std::wstring& action,
+                         const std::wstring& appKey,
+                         const std::wstring& pinKey) {
+    if (!ServiceGuardInstalled()) return;
+    if (!s.serviceGuardEnabled && action != L"restore-all") return;
+    if (action != L"restore-all" && appKey.empty()) return;
+    const std::wstring dir = ServiceGuardLocalDir();
+    CreateDirectoryW((EnvPath(L"LOCALAPPDATA") + L"\\DesktopSuite").c_str(),
+                     nullptr);
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring path = dir + L"\\request.txt";
+    FILE* f = _wfsopen(path.c_str(), L"w, ccs=UTF-8", _SH_DENYNO);
+    if (!f) {
+        Logf(L"[服务守护] 写请求失败：%ls", path.c_str());
+        return;
+    }
+    fwprintf(f, L"action=%ls\r\napp=%ls\r\npin=%ls\r\n", action.c_str(),
+             appKey.c_str(), pinKey.c_str());
+    fclose(f);
+
+    wchar_t sys[MAX_PATH] = {};
+    GetSystemDirectoryW(sys, MAX_PATH);
+    const std::wstring exe = std::wstring(sys) + L"\\schtasks.exe";
+    std::wstring cmd = L"\"" + exe +
+                       L"\" /run /tn \"DesktopSuite\\ServiceGuardBroker\"";
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        const DWORD wait = WaitForSingleObject(pi.hProcess, 3000);
+        DWORD code = 1;
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hProcess);
+        if (wait == WAIT_TIMEOUT || code != 0) {
+            // 任务没装/被禁用：不要留一个会在下次登录被 broker 执行的
+            // 半截请求。
+            DeleteFileW(path.c_str());
+            Logf(L"[服务守护] 触发任务失败 code=%lu", code);
+            return;
+        }
+        Logf(L"[服务守护] 请求 %ls：%ls", action.c_str(), appKey.c_str());
+    } else {
+        DeleteFileW(path.c_str());
+        Logf(L"[服务守护] 触发任务失败：%lu", GetLastError());
+    }
+}
+
+void EnsureServiceGuardRestoredForApp(AppState& s, const std::wstring& key,
+                                      const std::wstring& pinKey) {
+    if (!s.serviceGuardEnabled) return;
+    auto it = s.serviceGuardDisabledApps.find(key);
+    if (it == s.serviceGuardDisabledApps.end()) return;
+    RequestServiceGuard(s, L"restore", key, pinKey);
+    s.serviceGuardDisabledApps.erase(it);
+}
+
+bool RunGuardHelper(AppState& s, const std::wstring& parameter) {
+    const std::wstring helper = ServiceGuardHelperPath();
+    if (helper.empty()) {
+        Logf(L"[服务守护] 找不到 MyWigetsServiceGuard.exe");
+        return false;
+    }
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.hwnd = s.hwnd;
+    sei.lpVerb = L"runas";
+    sei.lpFile = helper.c_str();
+    sei.lpParameters = parameter.c_str();
+    sei.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&sei)) {
+        Logf(L"[服务守护] 提权启动失败：%lu", GetLastError());
+        return false;
+    }
+    if (sei.hProcess) {
+        WaitForSingleObject(sei.hProcess, 30000);
+        DWORD code = 1;
+        GetExitCodeProcess(sei.hProcess, &code);
+        CloseHandle(sei.hProcess);
+        if (code != 0) {
+            Logf(L"[服务守护] 助手退出码=%lu", code);
+            return false;
+        }
+    }
+    return true;
+}
+
+void ToggleServiceGuard(AppState& s) {
+    if (!ServiceGuardInstalled()) {
+        if (RunGuardHelper(s, L"--install")) {
+            s.serviceGuardEnabled = true;
+            s.residualCleanup = true;
+            SaveConfig(s);
+            SeedResidualStartupSweep(s);
+            Logf(L"[服务守护] 已安装并开启（同时启用关闭后清理）");
+        }
+        return;
+    }
+    s.serviceGuardEnabled = !s.serviceGuardEnabled;
+    if (s.serviceGuardEnabled) s.residualCleanup = true;
+    SaveConfig(s);
+    if (!s.serviceGuardEnabled) {
+        RequestServiceGuard(s, L"restore-all", L"", L"");
+        s.serviceGuardDisabledApps.clear();
+        Logf(L"[服务守护] 已关闭，恢复全部被禁用服务");
+    } else {
+        SeedResidualStartupSweep(s);
+        Logf(L"[服务守护] 已开启（同时启用关闭后清理）");
+    }
+}
+
+void ManageServiceGuard(AppState& s) {
+    if (ServiceGuardInstalled()) {
+        if (RunGuardHelper(s, L"--uninstall")) {
+            s.serviceGuardEnabled = false;
+            s.serviceGuardDisabledApps.clear();
+            SaveConfig(s);
+            Logf(L"[服务守护] 已卸载");
+        }
+    } else if (RunGuardHelper(s, L"--install")) {
+        s.serviceGuardEnabled = true;
+        s.residualCleanup = true;
+        SaveConfig(s);
+        SeedResidualStartupSweep(s);
+        Logf(L"[服务守护] 已安装并开启（同时启用关闭后清理）");
+    }
+}
+
 // Dock 已收集窗口里没有可打开的“主窗口形态”时（全隐藏/纯托盘/仅剩辅助小窗），
 // 在这里通过进程线程枚举补找隐藏窗口并打开全部；仍区分托盘图标驻留：
 // 纯托盘场景（微信等 Qt 自绘主窗完全隐藏）不能外部 ShowWindow —— 那会得到
@@ -6505,7 +7282,11 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
         AppendMenuW(menu,
                     MF_STRING | (suspendExcluded ? MF_CHECKED : MF_UNCHECKED),
                     kMenuToggleSuspendExclude,
-                    L"不暂停此应用（后台保持运行）");
+                    L"不暂停此应用（仅影响挂起；关闭后仍会清理）");
+    }
+    if (ServiceGuardInstalled() && IsResidualThirdParty(item)) {
+        AppendMenuW(menu, MF_STRING, kMenuRepairServiceStart,
+                    L"修复此应用的服务启动类型（需要管理员）");
     }
 
     // 打开文件位置（固定项有意义：定位到 lnk/exe）
@@ -6526,6 +7307,23 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
                 MF_STRING | (s.suspendInactive ? MF_CHECKED : MF_UNCHECKED),
                 kMenuToggleSuspend,
                 L"后台应用挂起（窗口最小化或无窗口时暂停全部进程，切回恢复）");
+    AppendMenuW(menu,
+                MF_STRING | (s.residualCleanup ? MF_CHECKED : MF_UNCHECKED),
+                kMenuToggleResidualCleanup,
+                L"关闭后清理残留进程（固定第三方应用；无窗口且无托盘）");
+    AppendMenuW(menu,
+                MF_STRING | (s.serviceGuardEnabled ? MF_CHECKED : MF_UNCHECKED),
+                kMenuToggleServiceGuard,
+                ServiceGuardInstalled()
+                    ? L"应用服务守护（关闭后禁用应用私有服务，启动时恢复）"
+                    : L"应用服务守护（未安装，点击安装并开启）");
+    AppendMenuW(menu, MF_STRING, kMenuManageServiceGuard,
+                ServiceGuardInstalled() ? L"卸载应用服务守护"
+                                        : L"安装应用服务守护（需要管理员）");
+    if (ServiceGuardInstalled()) {
+        AppendMenuW(menu, MF_STRING, kMenuRepairServiceGuard,
+                    L"修复应用服务守护（重新创建任务）");
+    }
     AppendMenuW(menu,
                 MF_STRING | (g_logEnabled.load(std::memory_order_relaxed)
                                  ? MF_CHECKED
@@ -6570,6 +7368,43 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
     }
     if (cmd == kMenuToggleSuspend) {
         ToggleSuspend(s);
+        return;
+    }
+    if (cmd == kMenuToggleResidualCleanup) {
+        ToggleResidualCleanup(s);
+        return;
+    }
+    if (cmd == kMenuToggleServiceGuard) {
+        ToggleServiceGuard(s);
+        return;
+    }
+    if (cmd == kMenuManageServiceGuard) {
+        ManageServiceGuard(s);
+        return;
+    }
+    if (cmd == kMenuRepairServiceGuard) {
+        if (RunGuardHelper(s, L"--install")) {
+            s.serviceGuardEnabled = true;
+            s.residualCleanup = true;
+            SaveConfig(s);
+            SeedResidualStartupSweep(s);
+            Logf(L"[服务守护] 任务已重建（电池/空闲限制已关闭）");
+        }
+        return;
+    }
+    if (cmd == kMenuRepairServiceStart) {
+        std::wstring params =
+            L"--install --repair-auto \"" + item.key + L"\"";
+        if (!item.pinKey.empty()) {
+            params += L" --pin \"" + item.pinKey + L"\"";
+        }
+        if (RunGuardHelper(s, params)) {
+            s.serviceGuardEnabled = true;
+            s.residualCleanup = true;
+            SaveConfig(s);
+            Logf(L"[服务守护] 已修复 %ls 的服务启动类型",
+                 item.displayName.c_str());
+        }
         return;
     }
     if (cmd == kMenuToggleSuspendExclude) {
@@ -6651,6 +7486,23 @@ void ShowBlankContextMenu(AppState& s) {
                 kMenuToggleSuspend,
                 L"后台应用挂起（窗口最小化或无窗口时暂停全部进程，切回恢复）");
     AppendMenuW(menu,
+                MF_STRING | (s.residualCleanup ? MF_CHECKED : MF_UNCHECKED),
+                kMenuToggleResidualCleanup,
+                L"关闭后清理残留进程（固定第三方应用；无窗口且无托盘）");
+    AppendMenuW(menu,
+                MF_STRING | (s.serviceGuardEnabled ? MF_CHECKED : MF_UNCHECKED),
+                kMenuToggleServiceGuard,
+                ServiceGuardInstalled()
+                    ? L"应用服务守护（关闭后禁用应用私有服务，启动时恢复）"
+                    : L"应用服务守护（未安装，点击安装并开启）");
+    AppendMenuW(menu, MF_STRING, kMenuManageServiceGuard,
+                ServiceGuardInstalled() ? L"卸载应用服务守护"
+                                        : L"安装应用服务守护（需要管理员）");
+    if (ServiceGuardInstalled()) {
+        AppendMenuW(menu, MF_STRING, kMenuRepairServiceGuard,
+                    L"修复应用服务守护（重新创建任务）");
+    }
+    AppendMenuW(menu,
                 MF_STRING | (g_logEnabled.load(std::memory_order_relaxed)
                                  ? MF_CHECKED
                                  : MF_UNCHECKED),
@@ -6688,6 +7540,20 @@ void ShowBlankContextMenu(AppState& s) {
         ToggleKeepTopFromMenu(s);
     } else if (cmd == kMenuToggleSuspend) {
         ToggleSuspend(s);
+    } else if (cmd == kMenuToggleResidualCleanup) {
+        ToggleResidualCleanup(s);
+    } else if (cmd == kMenuToggleServiceGuard) {
+        ToggleServiceGuard(s);
+    } else if (cmd == kMenuManageServiceGuard) {
+        ManageServiceGuard(s);
+    } else if (cmd == kMenuRepairServiceGuard) {
+        if (RunGuardHelper(s, L"--install")) {
+            s.serviceGuardEnabled = true;
+            s.residualCleanup = true;
+            SaveConfig(s);
+            SeedResidualStartupSweep(s);
+            Logf(L"[服务守护] 任务已重建（电池/空闲限制已关闭）");
+        }
     } else if (cmd == kMenuToggleLog) {
         ToggleLogEnabled();
     } else if (cmd == kMenuExit) {
@@ -6954,6 +7820,11 @@ bool ReloadDockConfigFromRegistry(AppState& s) {
         ReadRegDword(key, L"AutoCollapse", s.autoCollapse ? 1 : 0) != 0;
     const bool suspendInactive =
         ReadRegDword(key, L"SuspendInactive", s.suspendInactive ? 1 : 0) != 0;
+    const bool residualCleanup =
+        ReadRegDword(key, L"ResidualCleanup", s.residualCleanup ? 1 : 0) != 0;
+    const bool serviceGuard =
+        ReadRegDword(key, L"ServiceGuardEnabled",
+                     s.serviceGuardEnabled ? 1 : 0) != 0;
     RegCloseKey(key);
 
     bool changed = false;
@@ -6980,6 +7851,28 @@ bool ReloadDockConfigFromRegistry(AppState& s) {
             s.suspendLogAt.clear();
         }
         Logf(L"[挂起] 配置被外部改为 %d", s.suspendInactive ? 1 : 0);
+        changed = true;
+    }
+    if (residualCleanup != s.residualCleanup) {
+        s.residualCleanup = residualCleanup;
+        if (!s.residualCleanup) {
+            for (auto& kv : s.residualTrackers) {
+                if (kv.second.cancel) kv.second.cancel->store(true);
+            }
+            s.residualTrackers.clear();
+            if (s.hwnd) {
+                KillTimer(s.hwnd, kResidualTimerId);
+                KillTimer(s.hwnd, kResidualStartupTimerId);
+            }
+        } else {
+            SeedResidualStartupSweep(s);
+        }
+        Logf(L"[清理] 配置被外部改为 %d", s.residualCleanup ? 1 : 0);
+        changed = true;
+    }
+    if (serviceGuard != s.serviceGuardEnabled) {
+        s.serviceGuardEnabled = serviceGuard;
+        Logf(L"[服务守护] 配置被外部改为 %d", s.serviceGuardEnabled ? 1 : 0);
         changed = true;
     }
     return changed;
@@ -7056,6 +7949,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     // explorer 重启后重建任务栏的广播：立即重新隐藏（替代周期 FindWindow 轮询）
     if (s->taskbarCreatedMsg && msg == s->taskbarCreatedMsg) {
         EnsureTaskbarHidden(*s);
+        return 0;
+    }
+    if (s->serviceGuardDoneMsg && msg == s->serviceGuardDoneMsg) {
+        Logf(L"[服务守护] broker 完成（%ls）", wParam ? L"OK" : L"FAIL");
         return 0;
     }
 
@@ -7382,6 +8279,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // 宽限期/最小进程年龄的延后重试（一次性）
                 KillTimer(hwnd, kSuspendTimerId);
                 ReconcileAppSuspend(*s);
+            } else if (wParam == kResidualTimerId) {
+                // 关闭后清理：一次性宽限到期；执行后不自动重试。
+                KillTimer(hwnd, kResidualTimerId);
+                ReconcileResidualDue(*s);
+            } else if (wParam == kResidualStartupTimerId) {
+                // 启动 30s 后一次性 sweep（不是周期扫描）。
+                KillTimer(hwnd, kResidualStartupTimerId);
+                SeedResidualStartupSweep(*s);
             } else if (wParam == kCollapseWatchTimerId) {
                 // 2s 保底：全屏应用进出（如 Alt+Enter 原地切全屏、全屏窗口
                 // 原地退出，都不产生前台切换事件）必须在这里兜住
@@ -7425,6 +8330,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 KillTimer(hwnd, kTooltipTimerId);
                 SetFrameCadence(*s, true);
             }
+            return 0;
+
+        // 关闭后清理 worker 完成（一次性；UI 只更新状态/日志）
+        case kMsgResidualDone:
+            DrainResidualResults(*s);
             return 0;
 
         // WinEvent 事件：窗口集合/托盘状态变化 → 合并刷新（事件风暴下限 1s）
@@ -7556,6 +8466,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd, kSafetyTimerId);
             KillTimer(hwnd, kCollapseWatchTimerId);
             KillTimer(hwnd, kSuspendTimerId);
+            KillTimer(hwnd, kResidualTimerId);
+            KillTimer(hwnd, kResidualStartupTimerId);
+            StopResidualWorker();
             // 退出前恢复所有自己挂起的进程。
             g_suspender.ResumeAll();
             UninstallDockWinEventHook();
@@ -7646,9 +8559,9 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
     LogInit();
     if (DedupePins(s)) SaveConfig(s);  // 去重后立即持久化（收敛历史重复固定项）
     Logf(L"配置载入：固定 %zu 项，隐藏 %zu 项，挂起豁免 %zu 项，"
-         L"后台应用挂起=%d",
+         L"后台应用挂起=%d，关闭后清理=%d",
          s.pins.size(), s.hiddenKeys.size(), s.suspendExceptions.size(),
-         s.suspendInactive ? 1 : 0);
+         s.suspendInactive ? 1 : 0, s.residualCleanup ? 1 : 0);
 
     // 挂起控制器初始化（ntdll!NtSuspendProcess/NtResumeProcess，Vista+ 都有）。
     // 取不到函数指针时功能降级为关闭；之后仍尝试恢复上次异常退出留下的
@@ -7711,6 +8624,10 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
     RepositionDock(s, true);
     InstallShowDesktopHook();  // 右下角显示桌面隐形按钮（与 Windows 按钮同尺寸）
 
+    // 关闭后清理：启动 30s 后做一次 sweep；worker 只处理事件登记的任务。
+    s.residualStartupAt = GetTickCount64() + kResidualStartupSettleMs;
+    StartResidualWorker(s.hwnd);
+
     RefreshItems(s);
     s.lastSignature = MakeSignature(s);
     UpdateLayoutOneFrame(s);
@@ -7734,12 +8651,18 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
     UpdateKeepTopWorkArea(s, /*refitMaximized=*/true);
     // 事件驱动接管（替代定时轮询）：空暇零唤醒
     s.taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
+    s.serviceGuardDoneMsg =
+        RegisterWindowMessageW(L"DesktopSuite.ServiceGuardDone");
     InstallDockWinEventHook();   // 窗口集合变化 / Win+D 最小化自愈
     StartTrayRegistryWatch();    // 托盘注册表阻塞式监听（RegNotifyChangeKeyValue）
     SetTimer(s.hwnd, kSafetyTimerId, static_cast<UINT>(kSafetyPollMs),
              nullptr);           // 事件失效保底（1 次/分钟）
     SetTimer(s.hwnd, kCollapseWatchTimerId, kCollapseWatchMs,
              nullptr);           // 诊断：收起状态监视（2s）
+    if (s.residualCleanup) {
+        SetTimer(s.hwnd, kResidualStartupTimerId,
+                 static_cast<UINT>(kResidualStartupSettleMs), nullptr);
+    }
     s.lastPollTick = GetTickCount64();  // 启动后立即首次轮询
     SetTimer(s.hwnd, kFrameTimerId, kFrameIntervalMs, nullptr);
     // 启动时先复核一次（功能关闭时是空操作）。顶栏可能尚未创建窗口，

@@ -113,7 +113,16 @@ struct ProcessEntry {
     DWORD pid = 0;
     DWORD parentPid = 0;
     ULONGLONG creationTime = 0;
+    DWORD sessionId = 0;
     std::wstring imagePath;
+};
+
+// 全量快照选项。清理模块需要看到其它会话的进程（服务宿主/服务派生的
+// helper 常在 session 0）以及系统进程（用于父子链核对），但不能把它们
+// 当作清理候选；默认行为与 SnapshotProcesses() 完全一致。
+struct ProcessSnapshotOptions {
+    bool includeOtherSessions = false;
+    bool includeNeverSuspend = false;
 };
 
 struct ProcessRef {
@@ -153,8 +162,13 @@ bool IsNeverSuspendImage(const std::wstring& imagePath);
 // 窗口全部最小化、或纯托盘驻留（根本没有窗口）时都为 false，可以暂停。
 bool ShouldPauseApp(bool opened, bool hasVisibleWindow, bool userExcluded);
 
-// 全量进程快照（忽略其他登录会话、系统基础设施与自身）。
+// 全量进程快照（默认忽略其他登录会话、系统基础设施与自身）。
 std::vector<ProcessEntry> SnapshotProcesses();
+
+// 可配置快照：清理模块用 includeOtherSessions=true、
+// includeNeverSuspend=true 建立完整父子链；候选过滤在清理模块内完成。
+std::vector<ProcessEntry> SnapshotProcessesEx(
+    const ProcessSnapshotOptions& options);
 
 // 按上面的口径，从快照中选出属于 appKey 的进程。纯函数，便于单元测试。
 //
@@ -238,6 +252,10 @@ public:
 
     // 当前 Job 成员数（仅测试/日志用；未启用或创建失败返回 0）。
     size_t JobMemberCount(const std::wstring& appKey) const;
+
+    // 当前 Job 成员（PID + 创建时间）。仅应由 Dock UI 线程调用；清理
+    // worker 拿到的是调用时的快照副本，不并发访问 Suspender。
+    std::vector<ProcessRef> JobMemberRefs(const std::wstring& appKey) const;
 
     // 恢复该应用被本控制器挂起的全部进程。个别进程已退出视为成功；
     // 仍存活但恢复失败的条目会保留，等待下次重试。

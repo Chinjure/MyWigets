@@ -102,6 +102,14 @@ for ($i = 0; $i -lt 20; $i++) {
     }
 }
 if (-not $copied) { throw "覆盖部署失败（文件可能仍被占用）：$Target" }
+# 同目录部署管理员助手，Dock 菜单/服务守护安装直接按 exe 目录查找。
+$targetDir = Split-Path -Parent $Target
+foreach ($helperName in @('MyWigetsServiceGuard.exe', 'MyWigetsCleanup.exe')) {
+    $helperSource = Join-Path $PSScriptRoot "bin\$helperName"
+    if (Test-Path $helperSource) {
+        Copy-Item $helperSource (Join-Path $targetDir $helperName) -Force
+    }
+}
 Write-Host ("[3/5] 已部署 → {0}" -f $Target)
 
 if ($NoRestart) {

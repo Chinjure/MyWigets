@@ -51,7 +51,8 @@ $sources = @(
     'launcher_main.cpp', # launcher
     'topbar_main.cpp',   # topbar
     'dock_main.cpp',     # dock
-    'app_suspend.cpp'    # inactive app suspend/resume
+    'app_suspend.cpp',   # inactive app suspend/resume
+    'app_cleanup.cpp'    # visible-closed residual cleanup
 ) | ForEach-Object { (Join-Path $srcDir $_) }
 
 $defs = '/DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX'
@@ -68,6 +69,24 @@ $libs = 'gdiplus.lib user32.lib gdi32.lib advapi32.lib shell32.lib ole32.lib ole
 
 $clLine = "cl /nologo /std:c++17 /EHsc $optim /W4 /permissive- /utf-8 $defs /Fe:`"$exe`" $srcList `"$res`" /link /SUBSYSTEM:WINDOWS $libs"
 
+# One-shot elevated cleanup helper (explicit UAC; no polling)
+$cleanupExe = Join-Path $outDir 'MyWigetsCleanup.exe'
+$cleanupLine = "cl /nologo /std:c++17 /EHsc $optim /W4 /permissive- /utf-8 $defs " +
+    "/Fe:`"$cleanupExe`" `"$srcDir\cleanup_admin.cpp`" " +
+    "`"$srcDir\app_cleanup.cpp`" `"$srcDir\app_suspend.cpp`" " +
+    "/link /SUBSYSTEM:CONSOLE /ENTRY:wmainCRTStartup /MANIFEST:EMBED " +
+    "/MANIFESTUAC:`"level='requireAdministrator' uiAccess='false'`" " +
+    "advapi32.lib user32.lib dwmapi.lib"
+
+# On-demand elevated service guard broker (scheduled task, no resident process)
+$guardExe = Join-Path $outDir 'MyWigetsServiceGuard.exe'
+$guardLine = "cl /nologo /std:c++17 /EHsc $optim /W4 /permissive- /utf-8 $defs " +
+    "/Fe:`"$guardExe`" `"$srcDir\service_guard.cpp`" " +
+    "`"$srcDir\app_cleanup.cpp`" `"$srcDir\app_suspend.cpp`" " +
+    "/link /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup /MANIFEST:EMBED " +
+    "/MANIFESTUAC:`"level='requireAdministrator' uiAccess='false'`" " +
+    "advapi32.lib user32.lib dwmapi.lib shell32.lib"
+
 $bat = Join-Path $env:TEMP 'mywigets_build.bat'
 $lines = @('@echo off', 'setlocal')
 if ($vsDevCmd) {
@@ -79,6 +98,10 @@ $lines += "rc /nologo /fo `"$res`" app.rc"
 $lines += 'if errorlevel 1 exit /b 1'
 $lines += "cd /d `"$outDir`""
 $lines += $clLine
+$lines += 'if errorlevel 1 exit /b 1'
+$lines += $cleanupLine
+$lines += 'if errorlevel 1 exit /b 1'
+$lines += $guardLine
 $lines += 'if errorlevel 1 exit /b 1'
 $lines += 'endlocal'
 Set-Content -Path $bat -Value $lines -Encoding Ascii
