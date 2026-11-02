@@ -293,6 +293,10 @@ constexpr char kChromeSyncPongJson[] = "{\"type\":\"pong\"}";
 // 握手阶段读取超时（5s）与请求头上限（8KB）
 constexpr int kChromeSyncHandshakeTimeoutMs = 5000;
 constexpr size_t kChromeSyncMaxHeaderBytes = 8192;
+// 无客户端时 accept 的轮询间隔（微秒）。这条线程常驻，0.5s 一次 select 意味着
+// 每秒 2 次唤醒，即使扩展从未安装过也照旧。放宽到 1s：只影响扩展首次连接/重连
+// 的握手延迟（一次性、用户不可感知），换来常驻唤醒减半。
+constexpr long kChromeSyncAcceptPollUs = 1000 * 1000;
 
 enum ButtonHit {
     kHitNone = -1,
@@ -374,6 +378,9 @@ struct AppState {
     std::wstring clockTimeText;          // 当前时间文本（如 "21:45"）
     std::wstring clockDateText;          // 当前日期文本（如 "2026/8/28"）
     bool clockShowSeconds = false;       // 是否显示秒（跟随系统"显示秒"设置）
+    // 上次格式化的时间戳（分钟精度，编码见 UpdateClock）：不显示秒时同一分钟
+    // 内直接跳过 NLS 格式化。0 = 尚未格式化过。
+    ULONGLONG clockLastStamp = 0;
 
     // 系统「快速设置」面板对齐轮询（见 ToggleQuickSettings/对齐定时器）：
     // quickAlignSeen 区分"面板还没被 shell 拉起来"与"面板已经关掉"——
@@ -633,6 +640,18 @@ bool ReadShowSecondsSetting() {
 bool UpdateClock(AppState& s) {
     SYSTEMTIME st{};
     GetLocalTime(&st);
+
+    // 分钟精度的时间戳：不显示秒时，同一分钟内的重复格式化没有意义。
+    // 这一步把每秒两次 NLS 调用（GetTimeFormatW/GetDateFormatW）降到每分钟
+    // 一次；显示秒时必须逐秒刷新，走原路径。
+    const ULONGLONG stamp =
+        (((static_cast<ULONGLONG>(st.wYear) * 12u + st.wMonth) * 31u + st.wDay) *
+             24u + st.wHour) * 60u + st.wMinute;
+    if (!s.clockShowSeconds && stamp == s.clockLastStamp &&
+        !s.clockTimeText.empty()) {
+        return false;
+    }
+    s.clockLastStamp = stamp;
 
     wchar_t timeBuf[64] = {};
     wchar_t dateBuf[64] = {};
@@ -1783,7 +1802,7 @@ void ChromeSyncServerThread() {
             fd_set rf;
             FD_ZERO(&rf);
             FD_SET(g_chromeServer.listenSock, &rf);
-            timeval tv{0, 500000};
+            timeval tv{0, kChromeSyncAcceptPollUs};
             if (select(0, &rf, nullptr, nullptr, &tv) <= 0) {
                 continue;
             }

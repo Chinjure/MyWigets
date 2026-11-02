@@ -147,6 +147,14 @@ void TestAttribution() {
         appcleanup::BuildPlan(Request(app), ev3, NoTray(), Options());
     Check(p3.abort, L"归因：候选有窗口 -> abort");
 
+    // 显式关闭超时强制退出：关掉窗口边界后同样的证据不再 abort。
+    appcleanup::CleanupOptions forceWindowOptions = Options();
+    forceWindowOptions.ignoreUserWindows = true;
+    appcleanup::Plan p3f =
+        appcleanup::BuildPlan(Request(app), ev3, NoTray(), forceWindowOptions);
+    Check(!p3f.abort && p3f.targets.size() >= 2,
+          L"归因：ignoreUserWindows 强杀正在使用的窗口");
+
     // 托盘是硬边界。
     appcleanup::Plan p4 = appcleanup::BuildPlan(
         Request(app), ev,
@@ -255,11 +263,64 @@ void TestIntegration() {
           L"集成：无窗口进程被一次性清理");
     Check(result.terminated >= 1, L"集成：终止计数 >= 1");
     CloseHandle(pi.hProcess);
+
+    // 有可见窗口的进程：默认窗口边界必须挡住；显式关闭超时（ignoreUserWindows）
+    // 必须照样杀掉。
+    PROCESS_INFORMATION pw{};
+    if (!SpawnSelf(app, L"--window 60000", &pw)) {
+        Check(false, L"集成：启动有窗口的测试 app.exe");
+        return;
+    }
+    CloseHandle(pw.hThread);
+    Sleep(600);
+    const DWORD winWaitBefore = WaitForSingleObject(pw.hProcess, 0);
+    appcleanup::CleanupOptions winOpt = Options();
+    appcleanup::CleanupResult winBlocked =
+        appcleanup::CleanupOnce(req, winOpt, NoTray());
+    const DWORD winWaitAfterBlocked = WaitForSingleObject(pw.hProcess, 0);
+    Check(winBlocked.verdict ==
+                  appcleanup::CleanupVerdict::AbortedOpenWindow &&
+              winWaitBefore == WAIT_TIMEOUT &&
+              winWaitAfterBlocked == WAIT_TIMEOUT,
+          L"集成：有窗口 -> 窗口边界挡住，不杀");
+    winOpt.ignoreUserWindows = true;
+    appcleanup::CleanupResult winForced =
+        appcleanup::CleanupOnce(req, winOpt, NoTray());
+    const DWORD winWaitAfterForce = WaitForSingleObject(pw.hProcess, 4000);
+    Check(winWaitAfterForce == WAIT_OBJECT_0 && winForced.terminated >= 1,
+          L"集成：ignoreUserWindows 强杀正在使用的窗口");
+    CloseHandle(pw.hProcess);
 }
 
 int RunSelfMode(int argc, wchar_t** argv) {
     if (argc >= 3 && _wcsicmp(argv[1], L"--sleep") == 0) {
         Sleep(static_cast<DWORD>(_wtoi(argv[2])));
+        return 0;
+    }
+    if (argc >= 3 && _wcsicmp(argv[1], L"--window") == 0) {
+        // 造一个"可见"顶层窗口（放在屏幕外，避免测试时弹窗干扰），持续存活
+        // 到超时；用于验证窗口边界与 ignoreUserWindows 的强杀行为。
+        const DWORD ms = static_cast<DWORD>(_wtoi(argv[2]));
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"AppCleanupTestWindow";
+        RegisterClassW(&wc);
+        HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"cleanup test",
+                                    WS_OVERLAPPEDWINDOW | WS_VISIBLE, -2000,
+                                    -2000, 320, 200, nullptr, nullptr,
+                                    wc.hInstance, nullptr);
+        if (!hwnd) return 2;
+        const ULONGLONG deadline = GetTickCount64() + ms;
+        MSG msg;
+        while (GetTickCount64() < deadline) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            Sleep(10);
+        }
+        DestroyWindow(hwnd);
         return 0;
     }
     if (argc >= 3 && _wcsicmp(argv[1], L"--services") == 0) {

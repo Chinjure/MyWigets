@@ -74,6 +74,10 @@ struct CleanupOptions {
     bool dryRun = false;
     bool stopServices = true;
     ULONGLONG minProcessAgeMs = 15000;
+    // 显式关闭超时后的强制退出：连"候选仍有可见窗口"的窗口边界也关闭。
+    // 只应由用户显式关闭且已经等过 WM_CLOSE 宽限的路径置 true；自动残骸
+    // 清理必须保持 false，否则会把用户正在使用的窗口杀掉。
+    bool ignoreUserWindows = false;
     // UI 线程在应用重新打开/交互时置 true；worker 在终止前检查。
     std::shared_ptr<std::atomic<bool>> cancel;
 };

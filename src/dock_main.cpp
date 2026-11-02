@@ -186,7 +186,7 @@ constexpr UINT_PTR kRefreshTimerId = 2;        // 事件合并一次性定时器
 constexpr UINT_PTR kSafetyTimerId = 3;         // 事件失效保底（1 次/分钟）
 constexpr ULONGLONG kRefreshMinGapMs = 1000;   // 刷新最小间隔（合并窗口事件风暴）
 constexpr ULONGLONG kSafetyPollMs = 60000;     // 事件失效保底轮询（功耗≈0）
-constexpr ULONGLONG kRunningPathsCacheMs = 3000;  // 运行路径/托盘注册表缓存（进程级枚举较贵）
+constexpr ULONGLONG kRunningPathsCacheMs = 10000;  // 运行路径/托盘注册表缓存（兜底上限）
 constexpr ULONGLONG kTooltipDelayMs = 480;     // 悬停出提示延迟
 constexpr ULONGLONG kLaunchBounceMs = 3600;    // 启动弹跳超时
 constexpr ULONGLONG kTrayTriggerWindowMs = 2200;  // 托盘图标触发：UIA 重试窗口
@@ -212,7 +212,14 @@ constexpr UINT_PTR kResidualStartupTimerId = 8;  // 启动 30s 后一次性 swee
 constexpr ULONGLONG kResidualGraceMs = 5000;    // 可见关闭后等托盘/窗口落定
 constexpr ULONGLONG kResidualStartupSettleMs = 30000;  // 启动 sweep 前的稳定期
 constexpr ULONGLONG kResidualMinProcessAgeMs = 15000;  // 刚启动的 helper 不杀
+// 关闭动作最长抑制时间：超过它还没退出就不再把图标当“关闭中”（防止应用
+// 拒绝退出时永久压住运行圆点/挂起）；正常关闭（含强制退出）约 2s 完成。
+constexpr ULONGLONG kClosingSuppressMs = 15000;
 constexpr UINT kCollapseWatchMs = 2000;        // 监视周期（2s，只记录不干预）
+// 2s 保底里的「工作区 / 配置」档：注册表读取 + SPI_GETWORKAREA 是这一拍的主要
+// 开销，而外部改配置（脚本、旧版本、另一进程）是低频人工操作，5s 的生效延迟
+// 没人能感知。全屏让位与挂起复核仍按 2s（这两项对时效敏感）。
+constexpr ULONGLONG kWorkAreaWatchMs = 5000;
 // 焦点离开应用后先等一小段再挂起：应用切换、启动器拉起主窗、
 // 顶栏目标短暂清空都可能产生一闪而过的“未聚焦”，立即冻结会打断后台任务。
 constexpr ULONGLONG kSuspendGraceMs = 1200;
@@ -445,6 +452,9 @@ struct AppState {
     std::vector<std::wstring> pins;
     std::unordered_set<std::wstring> hiddenKeys;
     std::unordered_set<std::wstring> closingKeys;  // 中键关闭中：立即隐藏运行圆点
+    // 关闭动作开始时刻：关闭期间暂停挂起（被冻结的进程处理不了 WM_CLOSE），
+    // 同时给 closingKeys 一个上限，避免应用拒绝退出时永久压住圆点/挂起。
+    std::unordered_map<std::wstring, ULONGLONG> closingSince;
     int bottomGapBase = kBottomGapBase;
     RECT savedWorkArea{};  // 任务栏存在时的工作区（恢复任务栏时还原）
 
@@ -526,6 +536,13 @@ struct AppState {
     bool keepTopEnabled = false;    // 模式开关（注册表读入，随消息/轮询刷新）
     RECT workAreaApplied{};         // 最近一次写入系统的工作区（幂等去重）
     ULONGLONG lastKeepTopPoll = 0;  // 上次重读注册表开关与顶栏几何的时刻
+    ULONGLONG lastWorkAreaWatchTick = 0;  // 2s 拍里「工作区/配置」档的上次执行时刻
+    // 顶栏目标缓存：顶栏在目标变化时会主动推 kMsgTopBarTargetChanged，2s 保底
+    // 不必每次再跨进程 SendMessageTimeout（那会同步唤醒顶栏线程，是空闲功耗的
+    // 主要来源之一）。缓存绑定「当前顶栏窗口」：顶栏重启换成新窗口即失效重查。
+    HWND topBarTarget = nullptr;
+    HWND topBarTargetFrom = nullptr;
+    bool topBarTargetValid = false;
     int keepTopReserve = 0;         // 本模式下让出的 Dock 高度带（0=不让），
                                     // 供布局日志对账毛玻璃顶边（见 UpdateLayoutOneFrame）
 };
@@ -582,33 +599,53 @@ std::wstring PathBasename(const std::wstring& path) {
 }
 
 std::wstring ExeDisplayName(const std::wstring& fullPathLower) {
-    const DWORD size = GetFileVersionInfoSizeW(fullPathLower.c_str(), nullptr);
-    if (size == 0) return L"";
-    std::vector<BYTE> buf(size);
-    if (!GetFileVersionInfoW(fullPathLower.c_str(), 0, size, buf.data())) {
+    // 版本资源读取是真实文件 I/O（每次约 0.5~3 ms）。Dock 每次刷新都会重建
+    // 全部条目，17 个固定项/运行项各读一次就是十几毫秒 —— 实测这就是刷新
+    // 尖峰（15~30 ms）的主体。结果只与文件内容有关，进程内缓存即可；
+    // 应用升级换了路径（或换了文件内容）时进程重启会重建缓存，风险可忽略。
+    static std::mutex cacheMu;
+    static std::unordered_map<std::wstring, std::wstring> cache;
+    {
+        std::lock_guard<std::mutex> lock(cacheMu);
+        auto it = cache.find(fullPathLower);
+        if (it != cache.end()) return it->second;
+    }
+    auto compute = [&fullPathLower]() -> std::wstring {
+        const DWORD size =
+            GetFileVersionInfoSizeW(fullPathLower.c_str(), nullptr);
+        if (size == 0) return L"";
+        std::vector<BYTE> buf(size);
+        if (!GetFileVersionInfoW(fullPathLower.c_str(), 0, size, buf.data())) {
+            return L"";
+        }
+        struct LangCp {
+            WORD lang;
+            WORD cp;
+        }* lcp = nullptr;
+        UINT bytes = 0;
+        if (!VerQueryValueW(buf.data(), L"\\VarFileInfo\\Translation",
+                            reinterpret_cast<void**>(&lcp), &bytes) ||
+            !lcp || bytes < sizeof(LangCp)) {
+            return L"";
+        }
+        wchar_t sub[128] = {};
+        swprintf_s(sub, L"\\StringFileInfo\\%04x%04x\\FileDescription",
+                   lcp[0].lang, lcp[0].cp);
+        wchar_t* desc = nullptr;
+        UINT descBytes = 0;
+        if (VerQueryValueW(buf.data(), sub, reinterpret_cast<void**>(&desc),
+                           &descBytes) &&
+            desc && descBytes > 2 && desc[0]) {
+            return desc;
+        }
         return L"";
+    };
+    std::wstring name = compute();
+    {
+        std::lock_guard<std::mutex> lock(cacheMu);
+        if (cache.size() < 2048) cache.emplace(fullPathLower, name);
     }
-    struct LangCp {
-        WORD lang;
-        WORD cp;
-    }* lcp = nullptr;
-    UINT bytes = 0;
-    if (!VerQueryValueW(buf.data(), L"\\VarFileInfo\\Translation",
-                        reinterpret_cast<void**>(&lcp), &bytes) ||
-        !lcp || bytes < sizeof(LangCp)) {
-        return L"";
-    }
-    wchar_t sub[128] = {};
-    swprintf_s(sub, L"\\StringFileInfo\\%04x%04x\\FileDescription",
-               lcp[0].lang, lcp[0].cp);
-    wchar_t* desc = nullptr;
-    UINT descBytes = 0;
-    if (VerQueryValueW(buf.data(), sub, reinterpret_cast<void**>(&desc),
-                       &descBytes) &&
-        desc && descBytes > 2 && desc[0]) {
-        return desc;
-    }
-    return L"";
+    return name;
 }
 
 // ============================== 日志 ==============================
@@ -1407,36 +1444,141 @@ bool IsHelperProcessCommandLine(const std::wstring& cmdLine) {
     return cmdLine.find(L"--type=") != std::wstring::npos;
 }
 
+// 进程列表枚举（只为“某个 exe 基名是否还有进程存活”服务）。
+//
+// 为什么不用 Toolhelp:TH32CS_SNAPPROCESS 会给整个进程表拍快照（本机实测
+// 5~7.5 ms，再加 2~3 ms 遍历），是托盘存活判定的固定成本，也是空闲刷新
+// 尖峰的主体。NtQuerySystemInformation(SystemProcessInformation) 一次拷贝
+// 全部条目，实测 2.4~3.9 ms 且不用逐句柄复制，快一半以上。
+//
+// 结构体字段顺序按 x64 的 SYSTEM_PROCESS_INFORMATION 布局（到
+// InheritedFromUniqueProcessId 为止足以取到 ImageName 与 pid）。
+struct SystemProcessInfoEntry {
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    LARGE_INTEGER WorkingSetPrivateSize;
+    ULONG HardFaultCount;
+    ULONG NumberOfThreadsHighWatermark;
+    ULONGLONG CycleTime;
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
+    USHORT ImageNameLength;      // UNICODE_STRING.ImageName
+    USHORT ImageNameMaximum;
+    PWSTR ImageNameBuffer;
+    LONG BasePriority;
+    HANDLE UniqueProcessId;
+    HANDLE InheritedFromUniqueProcessId;
+};
+
+using NtQuerySystemInformationFn = LONG(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
+constexpr ULONG kSystemProcessInformation = 5;
+
+// 对每个“基名命中 wantBase”的进程回调一次（pid）。
+// 返回 false 表示快速路径不可用，调用方应退回 Toolhelp。
+template <typename Fn>
+bool ForEachProcessMatchingBasename(
+    const std::unordered_set<std::wstring>& wantBase, Fn&& onMatch) {
+    static const NtQuerySystemInformationFn query = [] {
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (!ntdll) return static_cast<NtQuerySystemInformationFn>(nullptr);
+        return reinterpret_cast<NtQuerySystemInformationFn>(
+            GetProcAddress(ntdll, "NtQuerySystemInformation"));
+    }();
+    if (!query) return false;
+
+    // 300 个进程的条目约 270 KB；留到 1 MB 覆盖极少数超大机器。
+    std::vector<BYTE> buffer(1u << 20);
+    ULONG returnLength = 0;
+    const LONG status =
+        query(kSystemProcessInformation, buffer.data(),
+              static_cast<ULONG>(buffer.size()), &returnLength);
+    if (status < 0) return false;
+
+    const BYTE* p = buffer.data();
+    const BYTE* end = buffer.data() + buffer.size();
+    while (p + sizeof(SystemProcessInfoEntry) <= end) {
+        const auto* e = reinterpret_cast<const SystemProcessInfoEntry*>(p);
+        const DWORD pid = static_cast<DWORD>(
+            reinterpret_cast<ULONG_PTR>(e->UniqueProcessId));
+        if (pid != 0 && e->ImageNameBuffer && e->ImageNameLength > 0) {
+            const std::wstring name(e->ImageNameBuffer,
+                                    e->ImageNameLength / sizeof(wchar_t));
+            const std::wstring base = ToLower(PathBasename(name));
+            if (wantBase.count(base) != 0) onMatch(pid, base);
+        }
+        if (e->NextEntryOffset == 0) break;
+        p += e->NextEntryOffset;
+    }
+    return true;
+}
+
 // trayCandidates = 托盘注册表里的 exe 路径（归一化）。只有这些路径才需要
 // 读命令行做辅助进程过滤，避免每 3 秒对所有进程都做一次额外查询。
+//
+// 省电要点：
+//   1. 进程列表用 NtQuerySystemInformation（见上），比 Toolhelp 快一半；
+//   2. 基名预筛 —— 只有基名命中候选集合的进程才开句柄确认全路径；
+//   3. 结果只保留候选路径（调用方只用它判断“某个托盘条目是否还活着”）；
+//   4. 同一路径确认存活后，后续同路径进程不再重复读取命令行
+//      （Chromium 应用同 exe 有十几个进程，单次命令行读取约 0.9 ms）。
 std::unordered_set<std::wstring> CollectRunningExePaths(
     const std::unordered_set<std::wstring>& trayCandidates) {
     std::unordered_set<std::wstring> set;
+    if (trayCandidates.empty()) return set;  // 没有候选：不必枚举进程
+
+    std::unordered_set<std::wstring> wantBase;
+    wantBase.reserve(trayCandidates.size());
+    std::unordered_map<std::wstring, int> baseCount;  // 同基名候选路径数
+    for (const std::wstring& path : trayCandidates) {
+        const std::wstring base = ToLower(PathBasename(path));
+        if (base.empty()) continue;
+        wantBase.insert(base);
+        ++baseCount[base];
+    }
+    if (wantBase.empty()) return set;
+
+    std::unordered_set<std::wstring> alive;      // 已确认存活的候选路径
+    std::unordered_set<std::wstring> aliveBase;  // 已确认存活的基名
+    auto consider = [&](DWORD pid, const std::wstring& base) {
+        // 同基名只有一条候选路径、且已确认它有非辅助进程存活：其余同基名进程
+        // （Chromium 的一个应用有十几个）不必再开句柄 —— 每次开句柄+查镜像名
+        // 约 0.22 ms，这里能省掉大部分。
+        if (baseCount[base] == 1 && aliveBase.count(base) != 0) return;
+        HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                  pid);
+        if (!proc) return;
+        wchar_t img[MAX_PATH] = {};
+        DWORD size = MAX_PATH;
+        if (QueryFullProcessImageNameW(proc, 0, img, &size) && size > 0) {
+            const std::wstring key = NormalizePath(img);
+            // 基名可能撞车（多个 python.exe 等）：只有全路径确实在候选里才算
+            if (trayCandidates.find(key) != trayCandidates.end() &&
+                alive.count(key) == 0) {
+                if (!IsHelperProcessCommandLine(
+                        QueryProcessCommandLine(proc))) {
+                    alive.insert(key);
+                    aliveBase.insert(base);
+                    set.insert(key);
+                }
+            }
+        }
+        CloseHandle(proc);
+    };
+
+    if (ForEachProcessMatchingBasename(wantBase, consider)) return set;
+
+    // 保底：NtQuerySystemInformation 不可用（极旧系统/被拦截）时退回 Toolhelp。
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return set;
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
     if (Process32FirstW(snap, &pe)) {
         do {
-            HANDLE proc =
-                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
-                            pe.th32ProcessID);
-            if (!proc) continue;
-            wchar_t img[MAX_PATH] = {};
-            DWORD size = MAX_PATH;
-            if (QueryFullProcessImageNameW(proc, 0, img, &size) && size > 0) {
-                const std::wstring key = NormalizePath(img);
-                // 仅当该路径确实是托盘候选时才查命令行；主进程或查询失败
-                // （空串）都按“存活”处理，保证正常托盘项不被误删。
-                bool helper = false;
-                if (!trayCandidates.empty() &&
-                    trayCandidates.find(key) != trayCandidates.end()) {
-                    helper = IsHelperProcessCommandLine(
-                        QueryProcessCommandLine(proc));
-                }
-                if (!helper) set.insert(key);
-            }
-            CloseHandle(proc);
+            if (pe.th32ProcessID == 0) continue;
+            const std::wstring base = ToLower(pe.szExeFile);
+            if (wantBase.find(base) == wantBase.end()) continue;
+            consider(pe.th32ProcessID, base);
         } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
@@ -1643,13 +1785,16 @@ BOOL CALLBACK EnumAppWindowProc(HWND hwnd, LPARAM lParam) {
     auto* ctx = reinterpret_cast<WindowGroupContext*>(lParam);
     if (!ctx || !IsWindow(hwnd)) return TRUE;
     if (!IsWindowVisible(hwnd)) return TRUE;
-    if (IsCloaked(hwnd)) return TRUE;
     if (IsShellSystemClass(hwnd)) return TRUE;
     if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
     const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     if ((ex & WS_EX_TOOLWINDOW) != 0 && (ex & WS_EX_APPWINDOW) == 0) {
         return TRUE;
     }
+    // DWM 查询是这一轮里最贵的一次调用：放到所有廉价过滤之后，
+    // 让 cloaked 判定只落在“看起来像应用窗口”的少数窗口上。
+    // 语义不变：cloaked 窗口无论何时被排除，结果都一样。
+    if (IsCloaked(hwnd)) return TRUE;
     DWORD pid = PidOf(hwnd);
     if (pid == 0 || pid == ctx->selfPid) return TRUE;
 
@@ -2378,6 +2523,7 @@ void SetFrameCadence(AppState& s, bool fast);
 void SyncTopBarDockState(AppState& s, bool force);  // 顶栏联动：展开/收起态同步（定义在下方）
 void UpdateKeepTopWorkArea(AppState& s, bool refitMaximized);  // 保持顶栏：工作区（定义在下方）
 bool ReloadDockConfigFromRegistry(AppState& s);  // 配置轮询：外部改动拉回（定义在下方）
+uint64_t MakeSignature(const AppState& s);       // 内容签名（定义在下方）
 
 // 关闭后清理：事件路径只安排一次性宽限，不做周期轮询。
 bool IsResidualThirdParty(const DockItem& item);
@@ -2872,6 +3018,11 @@ void UninstallDockWinEventHook() {
     g_taskSwitcherHwnd = nullptr;
 }
 
+// 托盘注册表变化标志：置位后下一次刷新立即重扫“托盘应用是否还活着”，
+// 不必等缓存 TTL 到期（纯托盘应用启动/退出时托盘图标会注册/注销，
+// 这条事件比 TTL 更及时，也让常态刷新可以跳过整轮进程枚举）。
+std::atomic<bool> g_trayRegistryDirty{false};
+
 // 托盘注册表阻塞式监听：RegNotifyChangeKeyValue 阻塞等待变化，
 // 变化时通知主窗口刷新（托盘条目零轮询）
 void TrayRegistryWatchThread() {
@@ -2893,6 +3044,7 @@ void TrayRegistryWatchThread() {
             Sleep(30000);
             continue;
         }
+        g_trayRegistryDirty.store(true, std::memory_order_relaxed);
         PostMessageW(g_dockHwnd.load(), kMsgRefresh, 0, 0);
     }
 }
@@ -2969,6 +3121,19 @@ bool RefreshItems(AppState& s) {
         return cands.back();
     };
 
+    // 诊断：分段计时（只在刷新总耗时 >5ms 时落一条日志；日志关闭时零成本）
+    LARGE_INTEGER qf{};
+    LARGE_INTEGER qt{};
+    QueryPerformanceFrequency(&qf);
+    QueryPerformanceCounter(&qt);
+    auto msMark = [&qf, &qt]() {
+        LARGE_INTEGER n{};
+        QueryPerformanceCounter(&n);
+        return qf.QuadPart ? static_cast<double>(n.QuadPart - qt.QuadPart) *
+                                 1000.0 / static_cast<double>(qf.QuadPart)
+                           : 0.0;
+    };
+
     // ---- 来源 1：固定项（保持注册表顺序）----
     for (const auto& pin : s.pins) {
         PinDescriptor d = DescribePin(pin);
@@ -2979,6 +3144,7 @@ bool RefreshItems(AppState& s) {
         c.item.launchPath = d.launchPath;
         c.item.displayName = d.name;
     }
+    const double tPins = msMark();
 
     // ---- 来源 2：顶层窗口分组 ----
     // 注意：这里不能套用 IsSystemComponentPath —— 商店应用
@@ -2997,6 +3163,7 @@ bool RefreshItems(AppState& s) {
         c.item.hasWindow = true;
         c.item.windows.push_back(kv.second);
     }
+    const double tEnum = msMark();
 
     // ---- 来源 3：托盘驻留第三方 —— 特别需求核心 ----
     // 进程级全量枚举（每个进程 OpenProcess + 查询镜像路径）较耗电，
@@ -3009,6 +3176,7 @@ bool RefreshItems(AppState& s) {
     // Dock 却继续把它当成托盘驻留并显示运行圆点（点击也只会去点不存在的
     // 托盘图标，必然失败）。
     const std::vector<std::wstring> trayRawPaths = ReadRegisteredTrayRawPaths();
+    const double tReg = msMark();
     std::unordered_set<std::wstring> trayCandidates;
     trayCandidates.reserve(trayRawPaths.size());
     for (const auto& raw : trayRawPaths) {
@@ -3017,10 +3185,16 @@ bool RefreshItems(AppState& s) {
     }
 
     const ULONGLONG nowForCache = GetTickCount64();
-    if (nowForCache - s.runningExeCacheAt > kRunningPathsCacheMs) {
+    // 托盘注册表刚变过 → 立刻重扫（纯托盘应用启动/退出时图标会注册/注销）；
+    // 否则走 TTL 兜底，让没有托盘变化的刷新完全跳过整轮进程枚举。
+    const bool trayDirty =
+        g_trayRegistryDirty.exchange(false, std::memory_order_relaxed);
+    if (trayDirty ||
+        nowForCache - s.runningExeCacheAt > kRunningPathsCacheMs) {
         s.runningExeCache = CollectRunningExePaths(trayCandidates);
         s.runningExeCacheAt = nowForCache;
     }
+    const double tProcs = msMark();
     const auto& runningNow = s.runningExeCache;
     for (const auto& raw : trayRawPaths) {
         const std::wstring expanded = ExpandKnownFolderPrefix(raw);
@@ -3134,7 +3308,13 @@ bool RefreshItems(AppState& s) {
                 break;
             }
         }
-        if (!stillRunning) {
+        const ULONGLONG nowTick = GetTickCount64();
+        auto since = s.closingSince.find(*it);
+        const bool expired =
+            since == s.closingSince.end() ||
+            nowTick - since->second > kClosingSuppressMs;
+        if (!stillRunning || expired) {
+            s.closingSince.erase(*it);
             it = s.closingKeys.erase(it);
         } else {
             ++it;
@@ -3293,7 +3473,24 @@ bool RefreshItems(AppState& s) {
         }
     }
 
-    s.needsRedraw = true;
+    // 只有内容真的变了才需要重绘：原来这里无条件置 true，等于每次事件刷新
+    // 都整窗重画一次（实测约 10 ms，ULW 提交 + 17 个图标）。
+    // 用内容签名判定：key、显示名、固定/窗口/托盘标记与数量都参与，
+    // 任何会改变画面的变化都会翻转签名。
+    {
+        const uint64_t sig = MakeSignature(s);
+        if (sig != s.lastSignature) {
+            s.lastSignature = sig;
+            s.needsRedraw = true;
+        }
+    }
+    const double tTotal = msMark();
+    if (tTotal > 4.0) {
+        Logf(L"[条目耗时] 合计=%.1fms 固定项=%.1f 窗口枚举=%.1f 窗口并入=%.1f "
+             L"托盘注册表=%.1f 进程枚举=%.1f 其余=%.1f (cands=%zu items=%zu)",
+             tTotal, tPins, tEnum - tPins, 0.0, tReg - tEnum, tProcs - tReg,
+             tTotal - tProcs, cands.size(), s.items.size());
+    }
     return changed;
 }
 
@@ -3311,6 +3508,10 @@ uint64_t MakeSignature(const AppState& s) {
     };
     for (const auto& it : s.items) {
         mix(it.key.data(), it.key.size() * sizeof(wchar_t));
+        // 显示名也要混入：名称合并（固定项并入运行组）会改显示名而不改 key，
+        // 只比 key 会漏掉这类重绘。
+        mix(it.displayName.data(),
+            it.displayName.size() * sizeof(wchar_t));
         const unsigned char flags =
             static_cast<unsigned char>((it.pinned ? 1 : 0) |
                                        (it.hasWindow ? 2 : 0) |
@@ -4187,6 +4388,32 @@ HWND QueryTopBarTargetHwnd() {
     return reinterpret_cast<HWND>(answer);
 }
 
+// 顶栏目标的带缓存读取。
+//
+// 为什么不再每次都问：SendMessageTimeoutW 是一次**跨进程同步**调用，除了 Dock
+// 自己的开销，还会把顶栏线程从等待里唤醒并让它计算一次目标 —— 2s 保底每拍都问，
+// 等于给两个组件各加了一份常驻唤醒。顶栏本来就实现了“目标变化主动推
+// kMsgTopBarTargetChanged”（见 topbar_main.cpp 的 kDockTargetChangedMsg），
+// 缓存只是把这条已有的事件通道用起来。
+//
+// 失效条件只有两个，都很便宜：
+//   1. 顶栏没运行 / 换了窗口（重启）→ 绑定窗口变了就重查一次；
+//   2. 缓存从未建立（Dock 先于顶栏启动、或顶栏刚重启还没来得及推）。
+HWND TopBarTargetCached(AppState& s) {
+    HWND bar = FindWindowW(L"DesktopTopBarWindow", nullptr);
+    if (!bar || !IsWindow(bar)) {
+        s.topBarTargetValid = false;
+        s.topBarTargetFrom = nullptr;
+        return nullptr;
+    }
+    if (!s.topBarTargetValid || s.topBarTargetFrom != bar) {
+        s.topBarTarget = QueryTopBarTargetHwnd();
+        s.topBarTargetFrom = bar;
+        s.topBarTargetValid = true;
+    }
+    return s.topBarTarget;
+}
+
 // 把一个窗口映射回 Dock 的分组 key：与 EnumAppWindowProc 完全同口径。
 // UWP 穿透 ApplicationFrameHost 取真实 CoreWindow 进程；Steam 等 UI 宿主
 // 辅助进程沿父链归并到宿主应用。返回空 = 该窗口不属于任何可挂起应用。
@@ -4273,6 +4500,9 @@ bool AppWindowsAllMinimized(const DockItem& item) {
 // 最小化表示用户暂时不用，和纯托盘应用一样可以挂起。基础设施/套件除外。
 bool ShouldManageAppSuspend(const AppState& s, const DockItem& item) {
     if (!IsSuspendAppItem(item)) return false;
+    // 正在关闭：绝不能冻结。否则应用无法处理 WM_CLOSE，1.5s 内的优雅退出
+    // 窗口被浪费，最后只能走强制退出；更糟的是「确认退出？」对话框会被冻住。
+    if (s.closingKeys.count(item.key) != 0) return false;
     const bool excluded = IsSuspendExcluded(s, item.key, item.pinKey);
     return appsuspend::ShouldPauseApp(item.hasWindow || item.trayMarked,
                                       !AppWindowsAllMinimized(item),
@@ -4447,6 +4677,20 @@ void ReconcileAppSuspend(AppState& s, HWND focusHint = nullptr,
         return;
     }
 
+    // 已挂起进程数 + 是否真的存在“可挂起候选”：两者都为空时这一拍无事可做，
+    // 不必花一次跨进程 SendMessageTimeout 去问顶栏目标、也不必开输入桌面探针。
+    // （候选判定与下面主循环同口径，只是提前短路，代价是每个条目几次廉价查询。）
+    bool anyCandidate = false;
+    for (const DockItem& item : s.items) {
+        if (!ShouldManageAppSuspend(s, item)) continue;
+        anyCandidate = true;
+        break;
+    }
+    if (!anyCandidate && g_suspender.TrackedProcessCount() == 0) {
+        s.suspendSince.clear();
+        return;
+    }
+
     // 顶栏是“当前焦点”的唯一来源；顶栏被关掉时没有判定依据，恢复全部，
     // 不能把“无顶栏”当成“所有应用都未聚焦”而冻结整个后台。
     if (!FindWindowW(L"DesktopTopBarWindow", nullptr)) {
@@ -4462,7 +4706,7 @@ void ReconcileAppSuspend(AppState& s, HWND focusHint = nullptr,
     // 下一次 2s 保底会继续。
     if (!IsInteractiveDesktopAvailable()) return;
 
-    const HWND focusWnd = useHint ? focusHint : QueryTopBarTargetHwnd();
+    const HWND focusWnd = useHint ? focusHint : TopBarTargetCached(s);
     const HWND foregroundWnd = GetForegroundWindow();
     const std::wstring focusKey = AppIdentityKeyForWindow(focusWnd);
     // 安全兜底：即使顶栏还粘着旧目标，也绝不把系统当前前台应用冻结。
@@ -4909,8 +5153,8 @@ std::vector<DWORD> FindPidsByKey(const std::wstring& key) {
     return pids;
 }
 
-// 关闭应用：给其全部窗口发 WM_CLOSE 优雅退出，轮询约 1.5s
-// 仍存活则 TerminateProcess（与 MyWigets 关闭组件策略一致）。
+// 关闭应用：给其全部窗口发 WM_CLOSE 优雅退出，等待约 1.5s；仍存活则按
+// 归因结果终止（显式关闭路径：托盘驻留也会被强制退出，见下方第 4 步）。
 // 特殊：explorer.exe 是系统 shell（桌面/任务栏/托盘宿主）——“关闭应用”
 // 只能关闭其用户意义上的窗口（文件管理器 CabinetWClass），绝不终止进程，
 // 否则会把整个资源管理器杀掉（桌面/任务栏全部重建）。
@@ -4974,7 +5218,8 @@ void CloseAppByKey(const std::wstring& key, const std::wstring& pinKey,
         return;
     }
 
-    // 2+3. 后台等待退出，超时后走统一的残留清理器（一次完成，不轮询重试）。
+    // 2+3+4. 后台等待退出，超时后走统一的残留清理器（一次完成，不轮询重试），
+    //    被托盘边界挡下且进程仍存活时再强制退出一次。
     //    同步等待会让中键后的 Dock 冻结约 1.5s（窗口不重绘、不响应鼠标），
     //    所以放到后台线程。
     std::thread(
@@ -5003,6 +5248,39 @@ void CloseAppByKey(const std::wstring& key, const std::wstring& pinKey,
                  result.matched, result.terminated, result.denied,
                  result.servicesStopped, result.servicesDenied,
                  result.detail.c_str());
+
+            // 4. 关闭超时强制退出：WM_CLOSE 已经给了应用 1.5s。用户点的是
+            //    「关闭应用」，语义就是退出——不管它以托盘驻留、还是仍开着一张
+            //    正在使用的窗口（含"确认退出"对话框）赖着不退。这里再执行一次
+            //    强制清理：跳过托盘边界（空 TrayProbe）并跳过窗口边界
+            //    （ignoreUserWindows），把该应用的可归因进程一次性终止。
+            //    注意：这是「显式关闭」路径专属；自动残骸清理（5s 宽限、启动
+            //    sweep）仍严格保留窗口/托盘硬边界。
+            const bool timedOut =
+                result.verdict == appcleanup::CleanupVerdict::AbortedTray ||
+                result.verdict == appcleanup::CleanupVerdict::AbortedOpenWindow ||
+                result.verdict == appcleanup::CleanupVerdict::AbortedLaunching;
+            if (timedOut && !FindPidsByKey(key).empty()) {
+                const wchar_t* why =
+                    result.verdict == appcleanup::CleanupVerdict::AbortedTray
+                        ? L"托盘驻留"
+                        : (result.verdict ==
+                                   appcleanup::CleanupVerdict::AbortedOpenWindow
+                               ? L"仍有窗口"
+                               : L"启动中");
+                appcleanup::CleanupOptions forcedOptions = options;
+                forcedOptions.minProcessAgeMs = 0;  // 超时后不再按启动年龄延后
+                forcedOptions.ignoreUserWindows = true;  // 强杀正在使用的窗口
+                const appcleanup::CleanupResult forced =
+                    appcleanup::CleanupOnce(request, forcedOptions, {});
+                Logf(L"关闭 %ls：超时未退出（%ls），强制退出（结果=%d "
+                     L"匹配=%zu 终止=%zu 拒绝=%zu 服务停=%zu 服务拒=%zu）%ls",
+                     displayName.c_str(), why,
+                     static_cast<int>(forced.verdict), forced.matched,
+                     forced.terminated, forced.denied,
+                     forced.servicesStopped, forced.servicesDenied,
+                     forced.detail.c_str());
+            }
         })
         .detach();
 }
@@ -5039,6 +5317,10 @@ void RequestCloseByIndex(AppState& s, size_t idx) {
     // 被挂起的进程不会处理 WM_CLOSE；先恢复再走优雅关闭，失败也没关系，
     // 后面的超时 TerminateProcess 对内核对过创建时间，仍能安全终止。
     EnsureAppResumedForInteraction(s, key);
+
+    // 关闭期间（WM_CLOSE + 1.5s 等待 + 必要时强制退出）不再允许挂起：
+    // 重新冻结会让应用收不到/处理不了 WM_CLOSE，也会冻住“确认退出”对话框。
+    s.closingSince[key] = GetTickCount64();
 
     if (!pinned) {
         // 先移除临时图标，再发送关闭请求：UI 立刻收拢，不阻塞在窗口枚举上。
@@ -6477,32 +6759,39 @@ void RequestServiceGuard(AppState& s, const std::wstring& action,
     wchar_t sys[MAX_PATH] = {};
     GetSystemDirectoryW(sys, MAX_PATH);
     const std::wstring exe = std::wstring(sys) + L"\\schtasks.exe";
-    std::wstring cmd = L"\"" + exe +
-                       L"\" /run /tn \"DesktopSuite\\ServiceGuardBroker\"";
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi{};
-    if (CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
-                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        CloseHandle(pi.hThread);
-        const DWORD wait = WaitForSingleObject(pi.hProcess, 3000);
-        DWORD code = 1;
-        GetExitCodeProcess(pi.hProcess, &code);
-        CloseHandle(pi.hProcess);
-        if (wait == WAIT_TIMEOUT || code != 0) {
-            // 任务没装/被禁用：不要留一个会在下次登录被 broker 执行的
-            // 半截请求。
+    const std::wstring cmd = L"\"" + exe +
+                             L"\" /run /tn \"DesktopSuite\\ServiceGuardBroker\"";
+    {
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(exe.c_str(), const_cast<LPWSTR>(cmd.c_str()),
+                            nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                            nullptr, nullptr, &si, &pi)) {
             DeleteFileW(path.c_str());
-            Logf(L"[服务守护] 触发任务失败 code=%lu", code);
+            Logf(L"[服务守护] 触发任务失败：%lu", GetLastError());
             return;
         }
-        Logf(L"[服务守护] 请求 %ls：%ls", action.c_str(), appKey.c_str());
-    } else {
-        DeleteFileW(path.c_str());
-        Logf(L"[服务守护] 触发任务失败：%lu", GetLastError());
+        CloseHandle(pi.hThread);
+        // schtasks /run 实测 200~300 ms（最坏 3 s 超时）。这一步原来会阻塞
+        // Dock UI 线程：应用关闭那一刻既卡界面，又拉出一段功耗尖峰。
+        // 请求文件已经落盘，等待与失败清理完全可以在后台线程完成。
+        std::thread([process = pi.hProcess, path]() {
+            const DWORD wait = WaitForSingleObject(process, 3000);
+            DWORD code = 1;
+            GetExitCodeProcess(process, &code);
+            CloseHandle(process);
+            if (wait == WAIT_TIMEOUT || code != 0) {
+                // 任务没装/被禁用：不要留一个会在下次登录被 broker 执行的
+                // 半截请求。
+                DeleteFileW(path.c_str());
+                Logf(L"[服务守护] 触发任务失败 code=%lu", code);
+            }
+        }).detach();
     }
+    Logf(L"[服务守护] 请求 %ls：%ls", action.c_str(), appKey.c_str());
 }
 
 void EnsureServiceGuardRestoredForApp(AppState& s, const std::wstring& key,
@@ -7711,7 +8000,23 @@ void UpdateFullscreenState(AppState& s, bool immediate = false) {
 // 全量刷新（事件驱动回调 + 60s 保底）：条目/尺寸/任务栏/组件自愈
 void DoPoll(AppState& s) {
     s.lastPollTick = GetTickCount64();
+    // 诊断：拆段计时，只在总耗时 >5ms 时落一条日志（日志关闭时只多几次 QPC，
+    // 可忽略）。用于回答“30ms 的刷新尖峰到底花在哪一段”。
+    LARGE_INTEGER qpf{};
+    LARGE_INTEGER q0{}, q1{};
+    QueryPerformanceFrequency(&qpf);
+    QueryPerformanceCounter(&q0);
+    auto msSince = [&qpf](const LARGE_INTEGER& a) {
+        LARGE_INTEGER b{};
+        QueryPerformanceCounter(&b);
+        return qpf.QuadPart
+                   ? static_cast<double>(b.QuadPart - a.QuadPart) * 1000.0 /
+                         static_cast<double>(qpf.QuadPart)
+                   : 0.0;
+    };
     RefreshItems(s);
+    const double tItems = msSince(q0);
+    QueryPerformanceCounter(&q1);
     EnsureWindowSize(s);
     EnsureTaskbarHidden(s);        // explorer 重启重建任务栏后再次隐藏
     RefreshSuiteWindowCache();     // 组件可能重启/重建窗口，刷新自愈缓存
@@ -7719,13 +8024,22 @@ void DoPoll(AppState& s) {
     RefreshPrimaryWorkArea();      // 保底刷新工作区缓存（分辨率/任务栏变化）
     UpdateFullscreenState(s);      // 全屏让位保底复核（事件路径之外的兜底）
     ReconcileAppSuspend(s);     // 挂起状态保底复核（事件路径之外的兜底）
+    const double tSys = msSince(q1);
     // 停帧安全网：收起偏移与目标不一致说明事件路径漏踢帧，重启帧驱动
     if (s.collapseOffset != CollapseTargetOf(s)) SetFrameCadence(s, true);
+    const bool willDraw = s.needsRedraw;
     if (s.needsRedraw) {
         const bool animating =
             UpdateLayoutOneFrame(s);  // 帧已停时几何缓存先对齐再画
         DrawAndPresent(s);
         if (animating) SetFrameCadence(s, true);  // 余下缓动交给帧驱动
+    }
+    const double tAll = msSince(q0);
+    if (tAll > 5.0) {
+        Logf(L"[刷新耗时] 合计=%.1fms 条目=%.1f 系统=%.1f 绘制=%.1f "
+             L"(items=%zu 重绘=%d)",
+             tAll, tItems, tSys, tAll - tItems - tSys, s.items.size(),
+             willDraw ? 1 : 0);
     }
 }
 
@@ -8194,6 +8508,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // 计算初始层级/风格），同时按需补投递一次状态消息对齐去重缓存。
         // 返回值：2 = 「保持顶栏」模式（恒置顶）/ 1 = 联动展开 / 0 = 默认策略。
         case kMsgTopBarDockQuery: {
+            // 顶栏（重新）启动：上一轮缓存的目标窗口属于旧顶栏进程，作废重查。
+            s->topBarTargetValid = false;
+            s->topBarTargetFrom = nullptr;
             SyncTopBarDockState(*s, true);
             return TopBarLinkStateOf(*s);
         }
@@ -8291,38 +8608,46 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // 2s 保底：全屏应用进出（如 Alt+Enter 原地切全屏、全屏窗口
                 // 原地退出，都不产生前台切换事件）必须在这里兜住
                 UpdateFullscreenState(*s);
-                // 「保持顶栏」保底：开关被注册表外部改动（脚本/重启前的残留）、
-                // 顶栏进程内重启后高度变化、Dock 高度带变化都要在 2s 内对齐
-                // （ApplyWorkArea 幂等，目标不变时零系统调用）
-                {
-                    // 先把外部改过的 Dock 配置（间隙 / 自动收起）拉回来
-                    const bool cfgChanged = ReloadDockConfigFromRegistry(*s);
-                    if (cfgChanged) {
-                        RepositionDock(*s, true);  // 间隙/收起态变化 → 重新贴底
-                        SetFrameCadence(*s, true);
-                        Logf(L"[保持顶栏] 配置变化后 Dock 屏幕位置=(%d,%d) "
-                             L"间隙=%dpx 自动收起=%d",
-                             s->winX, s->winY, s->bottomGapBase,
-                             s->autoCollapse ? 1 : 0);
-                    } else if (!s->autoCollapse &&
-                               s->collapseOffset != CollapseTargetOf(*s)) {
-                        // 关掉自动收起后 Dock 必须真的升起来：帧驱动若因
-                        // 空闲停摆，这里补一拍（外部改注册表的路径没有
-                        // 鼠标事件来踢帧）
-                        SetFrameCadence(*s, true);
-                    }
-                    const bool regOn = keeptop::IsEnabledFromRegistry();
-                    if (regOn != s->keepTopEnabled) {
-                        ApplyKeepTopEnabled(*s, regOn, /*refitMaximized=*/true);
-                    } else {
-                        // 「保持顶栏」让出的 Dock 高度带依赖间隙/自动收起，
-                        // 这里按新配置重算（幂等：目标不变时零系统调用）
-                        UpdateKeepTopWorkArea(*s, /*refitMaximized=*/true);
+                // 「工作区 / 配置」档按 5s 执行：这一段是这一拍的主要开销
+                // （6 次注册表读取 + SPI_GETWORKAREA 比较 + 可能的窗口重排），
+                // 而它服务的都是“外部改配置”这类低频人工操作，5s 延迟无人能感知。
+                // 全屏让位（上面）与挂起复核（下面）对时效敏感，仍按 2s。
+                const ULONGLONG nowWatch = GetTickCount64();
+                if (nowWatch - s->lastWorkAreaWatchTick >= kWorkAreaWatchMs) {
+                    s->lastWorkAreaWatchTick = nowWatch;
+                    // 「保持顶栏」保底：开关被注册表外部改动（脚本/重启前的残留）、
+                    // 顶栏进程内重启后高度变化、Dock 高度带变化都要在这里对齐
+                    // （ApplyWorkArea 幂等，目标不变时零系统调用）
+                    {
+                        // 先把外部改过的 Dock 配置（间隙 / 自动收起）拉回来
+                        const bool cfgChanged = ReloadDockConfigFromRegistry(*s);
+                        if (cfgChanged) {
+                            RepositionDock(*s, true);  // 间隙/收起态变化 → 重新贴底
+                            SetFrameCadence(*s, true);
+                            Logf(L"[保持顶栏] 配置变化后 Dock 屏幕位置=(%d,%d) "
+                                 L"间隙=%dpx 自动收起=%d",
+                                 s->winX, s->winY, s->bottomGapBase,
+                                 s->autoCollapse ? 1 : 0);
+                        } else if (!s->autoCollapse &&
+                                   s->collapseOffset != CollapseTargetOf(*s)) {
+                            // 关掉自动收起后 Dock 必须真的升起来：帧驱动若因
+                            // 空闲停摆，这里补一拍（外部改注册表的路径没有
+                            // 鼠标事件来踢帧）
+                            SetFrameCadence(*s, true);
+                        }
+                        const bool regOn = keeptop::IsEnabledFromRegistry();
+                        if (regOn != s->keepTopEnabled) {
+                            ApplyKeepTopEnabled(*s, regOn, /*refitMaximized=*/true);
+                        } else {
+                            // 「保持顶栏」让出的 Dock 高度带依赖间隙/自动收起，
+                            // 这里按新配置重算（幂等：目标不变时零系统调用）
+                            UpdateKeepTopWorkArea(*s, /*refitMaximized=*/true);
+                        }
                     }
                 }
-                // 后台应用挂起：放在配置重读之后，外部把开关改掉时
-                // 同一拍就能生效；顶栏目标消息丢失、宽限期到期等
-                // 情况也在这里保底复核（幂等；宽限计时在 Reconcile 内）。
+                // 后台应用挂起：外部把开关改掉时，最迟 5s 后的那一拍配置重读
+                // 会让它生效；顶栏目标消息丢失、宽限期到期等情况仍按 2s 复核
+                // （幂等；宽限计时在 Reconcile 内）。
                 ReconcileAppSuspend(*s);
                 CollapseWatchdog(*s);  // 诊断：2s 校验「应收未收」并自愈
             } else if (wParam == kTooltipTimerId) {
@@ -8374,9 +8699,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         // 顶栏目标变化（lParam = 新目标 HWND）：新目标立即恢复，旧目标
         // 进入宽限期。比等 2s 保底及时得多，也避免在切换瞬间冻结。
-        case kMsgTopBarTargetChanged:
-            ReconcileAppSuspend(*s, reinterpret_cast<HWND>(lParam), true);
+        // 同时刷新 2s 保底用的目标缓存（省掉那一拍的跨进程查询）。
+        case kMsgTopBarTargetChanged: {
+            const HWND target = reinterpret_cast<HWND>(lParam);
+            s->topBarTarget = target;
+            s->topBarTargetFrom = FindWindowW(L"DesktopTopBarWindow", nullptr);
+            s->topBarTargetValid = true;
+            ReconcileAppSuspend(*s, target, true);
             return 0;
+        }
 
         // Alt+Tab / 触摸板切换开始或结束：切换前恢复可能被选中的挂起应用。
         //   0/1/4 = 键盘提前触发 / SWITCHSTART / 任务切换器显示
@@ -8659,6 +8990,9 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
              nullptr);           // 事件失效保底（1 次/分钟）
     SetTimer(s.hwnd, kCollapseWatchTimerId, kCollapseWatchMs,
              nullptr);           // 诊断：收起状态监视（2s）
+    // 启动时刚做过一次配置/工作区对齐，把 5s 档的计时器起点放到现在，
+    // 避免第一拍就重复整段注册表读取。
+    s.lastWorkAreaWatchTick = GetTickCount64();
     if (s.residualCleanup) {
         SetTimer(s.hwnd, kResidualStartupTimerId,
                  static_cast<UINT>(kResidualStartupSettleMs), nullptr);

@@ -71,7 +71,9 @@ constexpr int kFolderRows = 4;
 constexpr float kFolderPanelHeight = 306.0f; // 文件夹面板固定高度（不随组件变高）
 constexpr UINT kDrawTimerId = 1;
 constexpr UINT kDrawIntervalMs = 16; // 约 60fps，保证翻页动画流畅
-constexpr UINT kIdlePollMs = 500;    // 空闲态低频轮询：无动画/交互时降频省电
+constexpr UINT kIdlePollMs = 2000;   // 空闲态心跳：无动画/交互时 2s 一次（省电）
+                                     // 空闲拍只做状态位比较 + 重挂定时器；
+                                     // 任何真实过渡都由事件路径重启快定时器
 constexpr UINT kPageAnimMs = 240;
 constexpr UINT kRenameCommand = WM_APP + 3;
 // 双指左右滑（水平滚轮）翻页消息（经全局钩子转发，wParam = 带符号 delta）

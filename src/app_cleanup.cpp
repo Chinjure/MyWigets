@@ -568,15 +568,18 @@ Plan BuildPlan(const CleanupRequest& request, const Evidence& evidence,
               [](const Target& a, const Target& b) { return a.pid < b.pid; });
 
     // 窗口是硬边界：任何候选拥有可见/最小化/cloaked 窗口 -> 整组放弃。
+    // 例外：显式关闭超时后的强制退出（options.ignoreUserWindows）——用户已经
+    // 点过「关闭应用」并等过 WM_CLOSE 宽限，此时"正在使用的窗口"也要结束。
     for (const Target& t : plan.targets) {
-        if (windowPids.count(t.pid) != 0) {
+        if (!options.ignoreUserWindows && windowPids.count(t.pid) != 0) {
             plan.abort = true;
             plan.abortReason = L"候选 pid " + std::to_wstring(t.pid) +
                                L" 仍有可见/最小化窗口";
             return plan;
         }
         auto it = byPid.find(t.pid);
-        if (it != byPid.end() && it->second && it->second->userWindow) {
+        if (!options.ignoreUserWindows && it != byPid.end() && it->second &&
+            it->second->userWindow) {
             plan.abort = true;
             plan.abortReason = L"候选 pid " + std::to_wstring(t.pid) +
                                L" 仍有用户窗口";

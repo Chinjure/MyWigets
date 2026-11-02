@@ -162,3 +162,61 @@ Dock 线程上另有**常驻阻塞/事件**源，不算轮询：
 6. 启动台 500 ms 心跳：空闲无动效时改 2 s，或改为完全事件驱动（当前它什么都不做）。
 7. 顶栏 1 s 时钟拍：`TargetOverlapsBar` 只在"有目标且目标窗口可见"时算。
 8. 顶栏 10 s 全量 `RefreshTabs`：同样先比签名，没变就不枚举。
+
+## 9. 本轮已实施（2026-10-31）与实测效果
+
+上面 §7/§8 的最贵几项已按"先便宜、后昂贵"的顺序改掉，并在同一台机器、
+同一会话状态下做了改前/改后对照（`QueryThreadCycleTime` 20 ms 采样 60 s，
+TSC 3.068 GHz；两种构建各跑一次，间隔仅数分钟）。
+
+### 9.1 改了什么
+
+| 位置 | 改动 | 目的 |
+|---|---|---|
+| `dock_main.cpp` `ExeDisplayName` | 加进程内缓存（原来每次刷新对 17 个条目各读一次版本资源） | 版本资源是**文件 I/O**，是 `RefreshItems` 15~30 ms 的主体 |
+| `dock_main.cpp` `CollectRunningExePaths` | ① 进程列表改用 `NtQuerySystemInformation(SystemProcessInformation)`（Toolhelp 快照单独就要 5~7.5 ms）；② 基名预筛；③ 同路径确认存活后不再重复读命令行（Chromium 同 exe 十几个进程，单次命令行 ~0.9 ms）；④ 只返回候选路径 | 托盘存活判定从 12 ms 降到 ~7 ms，且只在必要时跑 |
+| `dock_main.cpp` `RefreshItems` 尾部 | `needsRedraw` 由"无条件置真"改为**内容签名变化才置真**（签名补入 `displayName`） | 原来每次事件刷新都整窗重画一次（约 10 ms） |
+| `dock_main.cpp` 托盘注册表监听 | 监听线程置 `g_trayRegistryDirty`，刷新时**按需**重扫进程存活；TTL 3 s → 10 s 仅作兜底 | 无托盘变化时完全跳过整轮进程枚举 |
+| `dock_main.cpp` 2 s 保底 | 拆成两档：全屏让位/挂起复核仍 2 s；注册表读取 + 工作区对齐改 5 s（`kWorkAreaWatchMs`） | 6 次注册表读取 + `SPI_GETWORKAREA` 是那一拍的主要开销，而它服务的都是低频人工操作 |
+| `dock_main.cpp` `ReconcileAppSuspend` | ① 无候选且无挂起进程时直接返回（省掉跨进程查询与输入桌面探针）；② 顶栏目标改为**缓存**（顶栏目标变化本来就主动推消息），仅当顶栏窗口变化/缓存未建立时才 `SendMessageTimeout` | 去掉 2 s 一次的跨进程同步调用（它还会顺带唤醒顶栏线程） |
+| `dock_main.cpp` `EnumAppWindowProc` | DWM `cloaked` 查询移到所有廉价过滤之后 | 减少每轮窗口枚举里的 DWM 调用 |
+| `dock_main.cpp` `RequestServiceGuard` | `schtasks /run` 的等待（实测 200~300 ms，最坏 3 s）挪到后台线程 | 应用关闭那一刻不再卡 UI、也不再有那一段功耗尖峰 |
+| `topbar_main.cpp` `UpdateClock` | 不显示秒时按"分钟戳"跳过 NLS 格式化 | 每秒两次 `GetTimeFormatW`/`GetDateFormatW` → 每分钟一次 |
+| `topbar_main.cpp` Chrome 同步线程 | 无客户端时 `select` 超时 0.5 s → 1 s | 常驻唤醒 2 Hz → 1 Hz |
+| `launcher_main.cpp` | 空闲心跳 `kIdlePollMs` 0.5 s → 2 s | 空转心跳 2 Hz → 0.5 Hz（空闲拍本来什么都不做） |
+
+诊断用的一行日志（`[刷新耗时]`/`[条目耗时]`，总耗时 >4~5 ms 才落）保留：
+日志关闭时只多几次 `QueryPerformanceCounter`，需要排查时把 `LogEnabled`
+打开即可看到分段耗时。
+
+### 9.2 实测（同一会话、各 60 s）
+
+| 指标 | 改前 | 改后 | 变化 |
+|---|---:|---:|---:|
+| 套件进程合计 | 211.5 ms / 0.354% 单核 | **38.6 ms / 0.065%** | **5.5×** |
+| Dock 线程 | 173.5 ms / 0.290% | **17.6 ms / 0.029%** | **9.9×** |
+| 2 s 拍中位耗时 | 0.42 ms | **0.17 ms** | 2.5× |
+| >2 ms 的刷新尖峰 | 7 次 / 合计 153 ms / 最大 32 ms | **1 次 / 9.9 ms** | 尖峰基本消失 |
+| 顶栏线程 | 10.1 ms、94 次唤醒 | 5.8 ms、60 次 | 唤醒减半 |
+| 启动台线程 | 9.3 ms、117 次唤醒 | 4.6 ms、60 次 | 唤醒减半 |
+| Chrome 同步线程 | 11.6 ms、118 次唤醒 | 6.1 ms、60 次 | 唤醒减半 |
+
+分项实测（日志版构建）：`RefreshItems` 26~40 ms → **8~10 ms**（含一次进程
+枚举），不含枚举的刷新 <4 ms；`DrawAndPresent` 整窗重绘只在实际变化时发生
+（约 10 ms 的事件成本，改前每次刷新都有）。
+
+### 9.3 仍然存在的成本（以及为什么保留）
+
+- `CollectRunningExePaths` 单次 ~7 ms：`NtQuerySystemInformation` 本身 3~4 ms，
+  其余是每候选 ~0.22 ms 的 `OpenProcess`+镜像名（这台机器上系统级钩子让单次
+  开进程偏贵）。现在最多 10 s 一次，且托盘没变化就不跑。
+- 60 s 保底 `DoPoll` 仍会做一次完整刷新（含上面那次枚举）。
+- 顶栏 10 s 全量 `RefreshTabs`（`EnumWindows`）未改：需要"事件丢失"兜底，
+  单次 0.3~3 ms，暂不值得动。
+- `escalation`（服务守护）第一次触发仍会拉起 `schtasks.exe`，但不再阻塞 UI。
+
+测量说明：两次采样时桌面处于**锁屏**状态（`IsInteractiveDesktopAvailable`
+为 false，挂起复核会提前返回），因此绝对值低于解锁空闲态；改前/改后同条件，
+比值可比。解锁后的真实空闲值会略高，但 2 s 拍与刷新这两条主要路径的下降
+与锁屏无关（注册表读取、DWM 查询、整窗重绘都按同样的次数被移除）。
+
