@@ -3,3 +3,12 @@ bin/
 *.obj
 *.res
 *.exe
+
+# 运行期日志与截图
+logs/
+*.lnk
+/*.png
+
+# 基准程序的临时目录与产物
+bench/work/
+bench/artifacts/
