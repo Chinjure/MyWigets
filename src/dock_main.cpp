@@ -15,7 +15,9 @@
 //      系统把每个登记过的托盘图标的 ExecutablePath 持久化在此。与当前存活进程
 //      列表求交集：已登记托盘 ∩ 进程存活 − Windows 自带组件 − 本套件自身，
 //      即「现在正以托盘形式驻留的第三方程序」。这类程序即使没有任何可见窗口，
-//      也出现在 Dock 运行区并带运行圆点；纯后台静默项可右键隐藏。
+//      也出现在 Dock 运行区并带运行圆点；纯后台静默项可右键隐藏，隐藏清单
+//      持久化在 %APPDATA%\DesktopSuite\Dock\hidden_apps.txt（右键菜单可打开，
+//      删掉应用名称或整行即恢复显示，保存后立即生效）。
 //      存活判定要排除 Chromium/Electron 应用主进程退出后残留的
 //      --type=renderer/utility 辅助进程（它们与主程序共用 exe 路径），
 //      否则“已经关掉的应用”会一直被显示成仍在运行（网易云音乐实测）。
@@ -203,6 +205,7 @@ constexpr int kMenuToggleServiceGuard = 1008;     // 应用服务守护开关
 constexpr int kMenuManageServiceGuard = 1009;     // 安装/卸载服务守护
 constexpr int kMenuRepairServiceGuard = 1010;     // 重装/修复服务守护任务
 constexpr int kMenuRepairServiceStart = 1011;     // 修复此应用服务的原始启动类型
+constexpr int kMenuEditHiddenApps = 1012;         // 右键菜单：打开隐藏应用清单文件
 constexpr int kDockStripHeightLogical = 2;     // 展开触发条高度（逻辑像素，与 Dock 同宽）
 constexpr UINT_PTR kTooltipTimerId = 4;        // 悬停提示一次性定时器（停帧模式下到期踢帧）
 constexpr UINT_PTR kCollapseWatchTimerId = 5;  // 收起状态监视（诊断专用：本应收起未收起）
@@ -302,6 +305,10 @@ constexpr UINT kMsgTopBarTargetChanged = WM_APP + 20;
 // 保证多按几次 Tab 后的最终目标也不是冻结窗口。纯托盘应用没有窗口，
 // 不在候选集合里。与 topbar_main.cpp 的 kDockAltTabMsg 同值。
 constexpr UINT kMsgAltTab = WM_APP + 21;
+// ← 隐藏应用清单文件变化（ReadDirectoryChangesW 监听线程 → 主窗口）。
+// 保存/删除/重命名 hidden_apps.txt 时投递一次；主窗口重读并刷新 Dock。
+// 零轮询：没有文件变化时监听线程阻塞在内核里，不消耗 CPU。
+constexpr UINT kMsgHiddenConfigChanged = WM_APP + 22;
 
 // 固定区拖拽重排消息子类型（wParam）
 constexpr WPARAM kDockDragMove = 1;  // 按下后仍在按住 → 移动（UI 自行读取物理光标）
@@ -423,6 +430,25 @@ struct GeomSlot {
     float cx = 0;  // 图标中心（下一帧高斯放大参考）
 };
 
+// 「已隐藏的后台应用」清单条目（持久化在 %APPDATA%\DesktopSuite\Dock\hidden_apps.txt）。
+// 名称与路径都可作为匹配依据：名称用于手写/跨版本路径迁移，路径用于精确匹配。
+// 关键语义：用户把某行的「名称」删空（只留路径）或整行删除 → 该应用恢复显示。
+struct HiddenAppEntry {
+    std::wstring name;       // 显示名（配置文件第一列，用户删掉它即恢复）
+    std::wstring nameLower;  // 小写显示名（匹配缓存）
+    std::wstring key;        // 归一化完整路径（可为空：手写文件里只写了名称）
+};
+
+// 隐藏清单文件的修改标记：最后写入时间 + 大小，用于判断监听事件之后
+// 清单是否真的变了（事件可能来自我们自己的写入）。
+struct HiddenFileStamp {
+    DWORD writeLow = 0;
+    DWORD writeHigh = 0;
+    DWORD sizeLow = 0;
+    DWORD sizeHigh = 0;
+    bool valid = false;
+};
+
 struct AppState {
     HWND hwnd = nullptr;
     int dpi = 96;
@@ -450,7 +476,13 @@ struct AppState {
     size_t nextOrdinal = 0;
 
     std::vector<std::wstring> pins;
-    std::unordered_set<std::wstring> hiddenKeys;
+    // 被隐藏的后台应用（右键「从 Dock 隐藏此后台程序」写入配置文件；
+    // 文件是唯一持久化来源，见 hidden_apps.txt）
+    std::vector<HiddenAppEntry> hiddenApps;
+    // 旧版本把隐藏项存在注册表；只在升级后首次找不到配置文件时迁移一次。
+    std::vector<std::wstring> legacyHiddenKeys;
+    std::wstring hiddenConfigPath;             // 隐藏清单文件路径
+    HiddenFileStamp hiddenConfigStamp{};       // 上次读/写后的文件标记
     std::unordered_set<std::wstring> closingKeys;  // 中键关闭中：立即隐藏运行圆点
     // 关闭动作开始时刻：关闭期间暂停挂起（被冻结的进程处理不了 WM_CLOSE），
     // 同时给 closingKeys 一个上限，避免应用拒绝退出时永久压住圆点/挂起。
@@ -716,6 +748,345 @@ void LogClose() {
     g_logFile = nullptr;
 }
 
+// ============================== 隐藏应用清单文件 ==============================
+// 被右键隐藏的后台应用不再只存注册表，而是落到一个人工可直接编辑的文本文件：
+//   %APPDATA%\DesktopSuite\Dock\hidden_apps.txt
+// 每行格式：应用名称<TAB>程序完整路径（只写名称也可，按名称匹配）。
+// 关键语义：删掉某行的「名称」（只留路径）、或者删掉整行 → 该应用恢复显示；
+// Dock 用 ReadDirectoryChangesW 监听本文件，编辑器保存后立即生效，无需重启。
+// 文件不存在时视为“没有隐藏应用”。
+
+std::wstring TrimText(const std::wstring& s) {
+    const size_t first = s.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring::npos) return L"";
+    const size_t last = s.find_last_not_of(L" \t\r\n");
+    return s.substr(first, last - first + 1);
+}
+
+// 配置文件目录优先用 %APPDATA%（可写、不污染桌面）；取不到时退回 exe 同目录。
+std::wstring HiddenAppsConfigPath() {
+    wchar_t appData[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr,
+                                   SHGFP_TYPE_CURRENT, appData)) &&
+        appData[0]) {
+        std::wstring dir = appData;
+        dir += L"\\DesktopSuite\\Dock";
+        SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+        if (GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            return dir + L"\\hidden_apps.txt";
+        }
+    }
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    return PathDir(exe) + L"\\hidden_apps.txt";
+}
+
+std::wstring DisplayNameForKey(const std::wstring& key) {
+    std::wstring name = ExeDisplayName(key);
+    if (name.empty()) name = StripExtension(PathBasename(key));
+    return name;
+}
+
+HiddenFileStamp CaptureHiddenFileStamp(const std::wstring& path) {
+    HiddenFileStamp stamp;
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa)) {
+        stamp.valid = true;
+        stamp.writeLow = fa.ftLastWriteTime.dwLowDateTime;
+        stamp.writeHigh = fa.ftLastWriteTime.dwHighDateTime;
+        stamp.sizeLow = fa.nFileSizeLow;
+        stamp.sizeHigh = fa.nFileSizeHigh;
+    }
+    return stamp;
+}
+
+bool SameHiddenFileStamp(const HiddenFileStamp& a, const HiddenFileStamp& b) {
+    return a.valid == b.valid && a.writeLow == b.writeLow &&
+           a.writeHigh == b.writeHigh && a.sizeLow == b.sizeLow &&
+           a.sizeHigh == b.sizeHigh;
+}
+
+// 共享读写打开：用户可能正把文件开在记事本里。
+bool ReadFileBytesShared(const std::wstring& path, std::vector<char>* out) {
+    FILE* f = _wfsopen(path.c_str(), L"rb", _SH_DENYNO);
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    const long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size < 0 || size > 4 * 1024 * 1024) {
+        fclose(f);
+        return false;
+    }
+    out->resize(static_cast<size_t>(size));
+    const size_t got =
+        out->empty() ? 0 : fread(out->data(), 1, out->size(), f);
+    fclose(f);
+    return got == out->size();
+}
+
+// UTF-8（含 BOM）/ UTF-16LE / UTF-16BE / 本地 ANSI 都能读。
+std::wstring DecodeHiddenAppsBytes(const std::vector<char>& bytes) {
+    if (bytes.empty()) return L"";
+    const unsigned char* p =
+        reinterpret_cast<const unsigned char*>(bytes.data());
+    const size_t n = bytes.size();
+    if (n >= 2 && p[0] == 0xFF && p[1] == 0xFE) {
+        return std::wstring(reinterpret_cast<const wchar_t*>(p + 2),
+                            (n - 2) / sizeof(wchar_t));
+    }
+    if (n >= 2 && p[0] == 0xFE && p[1] == 0xFF) {
+        std::wstring out((n - 2) / 2, L'\0');
+        for (size_t i = 0; i < out.size(); ++i) {
+            out[i] = static_cast<wchar_t>((p[2 + i * 2] << 8) |
+                                          p[3 + i * 2]);
+        }
+        return out;
+    }
+    const size_t offset =
+        (n >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) ? 3 : 0;
+    if (n <= offset) return L"";
+    UINT cp = CP_UTF8;
+    DWORD flags = MB_ERR_INVALID_CHARS;
+    int wideLen = MultiByteToWideChar(cp, flags, bytes.data() + offset,
+                                      static_cast<int>(n - offset), nullptr, 0);
+    if (wideLen <= 0) {
+        cp = CP_ACP;  // 旧记事本另存的 ANSI 文件
+        flags = 0;
+        wideLen = MultiByteToWideChar(cp, flags, bytes.data() + offset,
+                                      static_cast<int>(n - offset), nullptr,
+                                      0);
+    }
+    if (wideLen <= 0) return L"";
+    std::wstring out(static_cast<size_t>(wideLen), L'\0');
+    MultiByteToWideChar(cp, flags, bytes.data() + offset,
+                        static_cast<int>(n - offset), out.data(), wideLen);
+    return out;
+}
+
+std::vector<HiddenAppEntry> ParseHiddenAppsText(const std::wstring& text) {
+    std::vector<HiddenAppEntry> entries;
+    size_t lineStart = 0;
+    while (lineStart <= text.size()) {
+        size_t lineEnd = text.find(L'\n', lineStart);
+        if (lineEnd == std::wstring::npos) lineEnd = text.size();
+        // 先用原始行找 TAB：用户可能把名称删空（行首剩下 TAB + 路径），
+        // 这时 TrimText 会吃掉前导 TAB，让“空名称”退化成“只写路径”的隐藏行。
+        std::wstring rawLine = text.substr(lineStart, lineEnd - lineStart);
+        while (!rawLine.empty() &&
+               (rawLine.back() == L'\r' || rawLine.back() == L'\n')) {
+            rawLine.pop_back();
+        }
+        const std::wstring line = TrimText(rawLine);
+        lineStart = lineEnd + 1;
+        if (line.empty() || line[0] == L'#' || line[0] == L';') continue;
+
+        std::wstring name;
+        std::wstring keyText;
+        bool pathOnly = false;
+        const size_t tab = rawLine.find(L'\t');
+        if (tab != std::wstring::npos) {
+            name = TrimText(rawLine.substr(0, tab));
+            keyText = TrimText(rawLine.substr(tab + 1));
+        } else if (line.find(L'\\') != std::wstring::npos ||
+                   line.find(L'/') != std::wstring::npos ||
+                   line.find(L':') != std::wstring::npos) {
+            keyText = line;  // 兼容整行直接写路径
+            pathOnly = true;
+        } else {
+            name = line;
+        }
+
+        auto unquote = [](std::wstring v) {
+            v = TrimText(v);
+            if (v.size() >= 2 && v.front() == L'"' && v.back() == L'"') {
+                v = TrimText(v.substr(1, v.size() - 2));
+            }
+            return v;
+        };
+        name = unquote(std::move(name));
+        keyText = unquote(std::move(keyText));
+        // 名称被删空（只留着路径）→ 视为“已恢复”，忽略这一行
+        if (name.empty() && !pathOnly) continue;
+
+        HiddenAppEntry entry;
+        entry.key = keyText.empty() ? L"" : NormalizePath(keyText);
+        if (name.empty()) name = DisplayNameForKey(entry.key);
+        if (entry.key.empty() && name.empty()) continue;
+        entry.name = name;
+        entry.nameLower = ToLower(name);
+
+        bool duplicate = false;
+        for (const auto& existing : entries) {
+            if (!entry.key.empty() && existing.key == entry.key) {
+                duplicate = true;
+                break;
+            }
+            if (entry.key.empty() && !entry.nameLower.empty() &&
+                existing.nameLower == entry.nameLower) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) entries.push_back(std::move(entry));
+    }
+    return entries;
+}
+
+bool WriteHiddenAppsFile(const std::wstring& path,
+                         const std::vector<HiddenAppEntry>& entries) {
+    FILE* f = _wfsopen(path.c_str(), L"w, ccs=UTF-8", _SH_DENYNO);
+    if (!f) return false;
+    fwprintf(f, L"# DesktopDock 隐藏的后台应用清单\r\n");
+    fwprintf(f, L"#\r\n");
+    fwprintf(f, L"# 每行一个被隐藏的应用：应用名称<TAB>程序完整路径。\r\n");
+    fwprintf(f, L"# 想让它重新出现在 Dock 上：删掉该行的「应用名称」（或整行），"
+                L"保存即可。\r\n");
+    fwprintf(f, L"#   只删名称、保留路径也生效；名称被删空的行会被忽略。\r\n");
+    fwprintf(f, L"# Dock 会监听本文件，保存后立即生效，不需要重启；以 # 开头的"
+                L"行是注释。\r\n");
+    fwprintf(f, L"#\r\n");
+    for (const auto& entry : entries) {
+        if (entry.name.empty()) continue;  // 没名称 = 已恢复，不写回
+        if (entry.key.empty()) {
+            fwprintf(f, L"%ls\r\n", entry.name.c_str());
+        } else {
+            fwprintf(f, L"%ls\t%ls\r\n", entry.name.c_str(),
+                     entry.key.c_str());
+        }
+    }
+    const bool ok = ferror(f) == 0;
+    fclose(f);
+    return ok;
+}
+
+bool HiddenAppsEqual(const std::vector<HiddenAppEntry>& a,
+                     const std::vector<HiddenAppEntry>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].key != b[i].key || a[i].nameLower != b[i].nameLower) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// key 是归一化路径；displayName 为该条目当前显示名（为空时按路径推导）。
+// 任一条目的路径或名称命中即视为隐藏 —— 名称匹配让“只写名字”的手写文件生效。
+bool IsHiddenApp(const AppState& s, const std::wstring& key,
+                 const std::wstring& displayName = L"") {
+    if (s.hiddenApps.empty() || key.empty()) return false;
+    std::wstring cachedNameLower;
+    for (const auto& entry : s.hiddenApps) {
+        if (!entry.key.empty() && entry.key == key) return true;
+        if (entry.nameLower.empty()) continue;
+        if (cachedNameLower.empty()) {
+            cachedNameLower = ToLower(
+                displayName.empty() ? DisplayNameForKey(key) : displayName);
+        }
+        if (!cachedNameLower.empty() &&
+            cachedNameLower == entry.nameLower) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 迁移后清掉旧版 HideCount/Hidden*，避免“文件里已删除但注册表里还留着”复活。
+void ClearLegacyHiddenRegistry() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegPath, 0, KEY_SET_VALUE, &key) !=
+        ERROR_SUCCESS) {
+        return;
+    }
+    RegDeleteValueW(key, L"HideCount");
+    for (DWORD i = 0; i < 500; ++i) {
+        wchar_t name[32] = {};
+        swprintf_s(name, L"Hidden%02u", i);
+        if (RegDeleteValueW(key, name) != ERROR_SUCCESS) break;
+    }
+    RegCloseKey(key);
+}
+
+// 启动：配置文件存在 → 以文件为准；不存在 → 把旧注册表隐藏项迁成文件内容。
+void LoadHiddenAppsAtStartup(AppState& s) {
+    s.hiddenConfigPath = HiddenAppsConfigPath();
+    HiddenFileStamp stamp = CaptureHiddenFileStamp(s.hiddenConfigPath);
+    bool loaded = false;
+    if (stamp.valid) {
+        std::vector<char> bytes;
+        if (ReadFileBytesShared(s.hiddenConfigPath, &bytes)) {
+            s.hiddenApps =
+                ParseHiddenAppsText(DecodeHiddenAppsBytes(bytes));
+            loaded = true;
+        }
+    } else {
+        for (const auto& key : s.legacyHiddenKeys) {
+            HiddenAppEntry entry;
+            entry.key = NormalizePath(key);
+            if (entry.key.empty()) continue;
+            entry.name = DisplayNameForKey(entry.key);
+            entry.nameLower = ToLower(entry.name);
+            s.hiddenApps.push_back(std::move(entry));
+        }
+        WriteHiddenAppsFile(s.hiddenConfigPath, s.hiddenApps);
+        loaded = CaptureHiddenFileStamp(s.hiddenConfigPath).valid;
+    }
+    s.hiddenConfigStamp =
+        loaded ? CaptureHiddenFileStamp(s.hiddenConfigPath) : HiddenFileStamp{};
+    ClearLegacyHiddenRegistry();
+}
+
+bool WriteHiddenAppsConfig(AppState& s) {
+    const bool ok = WriteHiddenAppsFile(s.hiddenConfigPath, s.hiddenApps);
+    s.hiddenConfigStamp = CaptureHiddenFileStamp(s.hiddenConfigPath);
+    return ok;
+}
+
+// 文件变化事件到达后重读（删名字/删行/改路径立即应用）。返回清单是否变化。
+bool ReloadHiddenAppsConfig(AppState& s) {
+    if (s.hiddenConfigPath.empty()) s.hiddenConfigPath = HiddenAppsConfigPath();
+    const HiddenFileStamp stamp = CaptureHiddenFileStamp(s.hiddenConfigPath);
+    if (stamp.valid && SameHiddenFileStamp(stamp, s.hiddenConfigStamp)) {
+        return false;
+    }
+
+    std::vector<HiddenAppEntry> next;
+    if (stamp.valid) {
+        std::vector<char> bytes;
+        if (!ReadFileBytesShared(s.hiddenConfigPath, &bytes)) {
+            return false;  // 编辑器正占用：下一拍再读
+        }
+        next = ParseHiddenAppsText(DecodeHiddenAppsBytes(bytes));
+        s.hiddenConfigStamp = stamp;
+    } else {
+        // 文件被删除 = 清空清单（全部恢复）；立即重建说明文件
+        WriteHiddenAppsFile(s.hiddenConfigPath, next);
+        s.hiddenConfigStamp = CaptureHiddenFileStamp(s.hiddenConfigPath);
+    }
+    if (HiddenAppsEqual(s.hiddenApps, next)) return false;
+    s.hiddenApps = std::move(next);
+    return true;
+}
+
+// 右键菜单：打开隐藏应用清单（文件不存在就先按当前内存清单创建）。
+void OpenHiddenAppsConfig(AppState& s) {
+    if (s.hiddenConfigPath.empty()) s.hiddenConfigPath = HiddenAppsConfigPath();
+    if (GetFileAttributesW(s.hiddenConfigPath.c_str()) ==
+        INVALID_FILE_ATTRIBUTES) {
+        WriteHiddenAppsConfig(s);
+    }
+    Logf(L"打开隐藏应用清单：%ls", s.hiddenConfigPath.c_str());
+    HINSTANCE result =
+        ShellExecuteW(s.hwnd, L"open", s.hiddenConfigPath.c_str(), nullptr,
+                      nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(result) <= 32) {
+        // .txt 没有默认编辑器时退回记事本
+        const std::wstring params = L"\"" + s.hiddenConfigPath + L"\"";
+        ShellExecuteW(s.hwnd, L"open", L"notepad.exe", params.c_str(),
+                      nullptr, SW_SHOWNORMAL);
+    }
+}
+
 // ============================== 第三方判定 ==============================
 
 bool StartsWithDir(const std::wstring& path, const std::wstring& dir) {
@@ -841,7 +1212,7 @@ void LoadConfig(AppState& s, bool* existed) {
         wchar_t name[32] = {};
         swprintf_s(name, L"Hidden%02u", i);
         std::wstring p = ReadRegString(key, name);
-        if (!p.empty()) s.hiddenKeys.insert(p);
+        if (!p.empty()) s.legacyHiddenKeys.push_back(p);
     }
     s.bottomGapBase =
         static_cast<int>(ReadRegDword(key, L"BottomGap",
@@ -890,18 +1261,8 @@ void SaveConfig(AppState& s) {
                        static_cast<DWORD>((s.pins[i].size() + 1) *
                                           sizeof(wchar_t)));
     }
-    const DWORD hideCount = static_cast<DWORD>(s.hiddenKeys.size());
-    RegSetValueExW(key, L"HideCount", 0, REG_DWORD,
-                   reinterpret_cast<const BYTE*>(&hideCount),
-                   sizeof(hideCount));
-    DWORD i = 0;
-    for (const auto& h : s.hiddenKeys) {
-        wchar_t name[32] = {};
-        swprintf_s(name, L"Hidden%02u", i++);
-        RegSetValueExW(key, name, 0, REG_SZ,
-                       reinterpret_cast<const BYTE*>(h.c_str()),
-                       static_cast<DWORD>((h.size() + 1) * sizeof(wchar_t)));
-    }
+    // 隐藏项已迁移到配置文件 hidden_apps.txt（唯一持久化来源），
+    // 这里不再写 HideCount/Hidden*，旧值由迁移函数清理。
     const DWORD gap = static_cast<DWORD>(s.bottomGapBase);
     RegSetValueExW(key, L"BottomGap", 0, REG_DWORD,
                    reinterpret_cast<const BYTE*>(&gap), sizeof(gap));
@@ -3058,6 +3419,72 @@ void StartTrayRegistryWatch() {
     });
 }
 
+// 隐藏应用清单目录的阻塞式监听：ReadDirectoryChangesW 只在文件系统真正变化
+// 时返回（文件夹句柄在内核里等待，没有轮询），然后通知主窗口重读清单。
+// 只关心 hidden_apps.txt 的通知记录；目录暂时不可用（首次运行前/被删除）时
+// 低频退避重开目录句柄，而不是反复读文件内容。
+void HiddenAppsWatchThread(std::wstring dir) {
+    for (;;) {
+        HANDLE watch = CreateFileW(
+            dir.c_str(), FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (watch == INVALID_HANDLE_VALUE) {
+            Sleep(3000);
+            continue;
+        }
+        std::vector<BYTE> buffer(4096);
+        for (;;) {
+            DWORD bytes = 0;
+            const BOOL ok = ReadDirectoryChangesW(
+                watch, buffer.data(), static_cast<DWORD>(buffer.size()), FALSE,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE |
+                    FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_CREATION,
+                &bytes, nullptr, nullptr);
+            if (!ok) break;  // 目录被删除/移动：重开目录句柄
+            if (bytes == 0) {
+                // 通知缓冲区溢出：保守地当作“有变化”重读一次
+                HWND hwnd = g_dockHwnd.load(std::memory_order_relaxed);
+                if (hwnd) {
+                    PostMessageW(hwnd, kMsgHiddenConfigChanged, 0, 0);
+                }
+                continue;
+            }
+            bool relevant = false;
+            size_t offset = 0;
+            while (offset + sizeof(FILE_NOTIFY_INFORMATION) <= bytes) {
+                const auto* info =
+                    reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(
+                        buffer.data() + offset);
+                const std::wstring name(info->FileName,
+                                        info->FileNameLength / sizeof(wchar_t));
+                if (_wcsicmp(name.c_str(), L"hidden_apps.txt") == 0) {
+                    relevant = true;
+                    break;
+                }
+                if (info->NextEntryOffset == 0) break;
+                offset += info->NextEntryOffset;
+            }
+            if (relevant) {
+                // g_dockHwnd 为 0 表示 Dock 窗口已销毁（组件暂时关闭）
+                HWND hwnd = g_dockHwnd.load(std::memory_order_relaxed);
+                if (hwnd) PostMessageW(hwnd, kMsgHiddenConfigChanged, 0, 0);
+            }
+        }
+        CloseHandle(watch);
+        Sleep(1000);  // 目录被删除/重命名：稍后重开，不是文件内容轮询
+    }
+}
+
+void StartHiddenAppsWatch(const std::wstring& dir) {
+    // 与托盘监听同理：进程内组件可重启，监听线程只建一次，通过 g_dockHwnd
+    // 追踪当前 Dock 窗口（窗口销毁期间投递自然失效）。
+    static std::once_flag once;
+    std::call_once(once, [dir]() {
+        std::thread([dir]() { HiddenAppsWatchThread(dir); }).detach();
+    });
+}
+
 // ============================== 刷新合并 ==============================
 
 DockItem MakeItemFromKey(const std::wstring& key) {
@@ -3208,7 +3635,7 @@ bool RefreshItems(AppState& s) {
             cands[found->second].item.trayMarked = true;
             continue;
         }
-        if (s.hiddenKeys.count(key)) continue;  // 用户手动隐藏的后台项
+        if (IsHiddenApp(s, key)) continue;  // 用户手动隐藏的后台项
         Cand& c = getCand(key);
         c.item.trayMarked = true;
     }
@@ -3279,7 +3706,7 @@ bool RefreshItems(AppState& s) {
             continue;
         }
         if (c.item.trayMarked && !c.item.hasWindow && !c.item.pinned &&
-            s.hiddenKeys.count(c.item.key)) {
+            IsHiddenApp(s, c.item.key, c.item.displayName)) {
             continue;
         }
         if (c.item.pinned || c.item.hasWindow || c.item.trayMarked) {
@@ -7242,9 +7669,31 @@ void TogglePinByKey(AppState& s, const DockItem& item) {
 }
 
 void HideTrayItem(AppState& s, const DockItem& item) {
-    s.hiddenKeys.insert(item.key);
-    SaveConfig(s);
-    Logf(L"隐藏托盘项：%ls", item.displayName.c_str());
+    HiddenAppEntry entry;
+    entry.key = NormalizePath(item.key);
+    entry.name = TrimText(item.displayName.empty() ? DisplayNameForKey(entry.key)
+                                                   : item.displayName);
+    // 名称里的制表符/换行会破坏一行一条的配置文件格式
+    for (auto& ch : entry.name) {
+        if (ch == L'\t' || ch == L'\r' || ch == L'\n') ch = L' ';
+    }
+    entry.nameLower = ToLower(entry.name);
+    bool duplicate = entry.name.empty() && entry.key.empty();
+    for (const auto& existing : s.hiddenApps) {
+        if ((!entry.key.empty() && existing.key == entry.key) ||
+            (!entry.nameLower.empty() &&
+             existing.nameLower == entry.nameLower)) {
+            duplicate = true;
+            break;
+        }
+    }
+    if (!duplicate) s.hiddenApps.push_back(std::move(entry));
+    if (!duplicate && !WriteHiddenAppsConfig(s)) {
+        Logf(L"隐藏应用清单写入失败（隐藏仅本次运行生效）：%ls",
+             s.hiddenConfigPath.c_str());
+    }
+    Logf(L"隐藏托盘项：%ls（清单文件 %ls）", item.displayName.c_str(),
+         s.hiddenConfigPath.c_str());
     RefreshItems(s);
     EnsureWindowSize(s);
     s.needsRedraw = true;
@@ -7618,6 +8067,8 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
                                  ? MF_CHECKED
                                  : MF_UNCHECKED),
                 kMenuToggleLog, L"运行日志（记录展开收起诊断）");
+    AppendMenuW(menu, MF_STRING, kMenuEditHiddenApps,
+                L"编辑隐藏应用清单（删掉名称即可恢复显示）…");
     AppendMenuW(menu,
                 MF_STRING | (s.keepTopEnabled ? MF_CHECKED : MF_UNCHECKED),
                 kMenuToggleKeepTop, L"保持顶栏");
@@ -7702,6 +8153,10 @@ void ShowItemContextMenu(AppState& s, size_t idx) {
     }
     if (cmd == kMenuToggleLog) {
         ToggleLogEnabled();
+        return;
+    }
+    if (cmd == kMenuEditHiddenApps) {
+        OpenHiddenAppsConfig(s);
         return;
     }
     if (cmd == kMenuExit) {
@@ -7796,6 +8251,8 @@ void ShowBlankContextMenu(AppState& s) {
                                  ? MF_CHECKED
                                  : MF_UNCHECKED),
                 kMenuToggleLog, L"运行日志（记录展开收起诊断）");
+    AppendMenuW(menu, MF_STRING, kMenuEditHiddenApps,
+                L"编辑隐藏应用清单（删掉名称即可恢复显示）…");
     AppendMenuW(menu,
                 MF_STRING | (s.keepTopEnabled ? MF_CHECKED : MF_UNCHECKED),
                 kMenuToggleKeepTop, L"保持顶栏");
@@ -7845,6 +8302,8 @@ void ShowBlankContextMenu(AppState& s) {
         }
     } else if (cmd == kMenuToggleLog) {
         ToggleLogEnabled();
+    } else if (cmd == kMenuEditHiddenApps) {
+        OpenHiddenAppsConfig(s);
     } else if (cmd == kMenuExit) {
         Logf(L"用户请求退出");
         DestroyWindow(s.hwnd);
@@ -8662,6 +9121,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             DrainResidualResults(*s);
             return 0;
 
+        // 隐藏应用清单变化（ReadDirectoryChangesW 监听线程 → 这里）：
+        // 记事本保存后立即重读；删掉名称/整行即恢复，文件不存在=全部恢复。
+        // 零轮询：没有变化时监听线程阻塞在内核里，不产生任何唤醒。
+        case kMsgHiddenConfigChanged:
+            if (ReloadHiddenAppsConfig(*s)) {
+                Logf(L"隐藏应用清单已更新：%zu 项（%ls）",
+                     s->hiddenApps.size(), s->hiddenConfigPath.c_str());
+                RefreshItems(*s);
+                EnsureWindowSize(*s);
+                RepositionDock(*s, true);
+                s->needsRedraw = true;
+                SetFrameCadence(*s, true);
+            }
+            return 0;
+
         // WinEvent 事件：窗口集合/托盘状态变化 → 合并刷新（事件风暴下限 1s）
         case kMsgRefresh: {
             if (s->lastPollTick == 0) {
@@ -8881,6 +9355,8 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
 
     bool configExists = false;
     LoadConfig(s, &configExists);  // 先读配置（含持久化的日志开关），再开日志
+    // 隐藏应用清单以文件为准（缺失时把旧注册表隐藏项迁进来并清理旧值）
+    LoadHiddenAppsAtStartup(s);
     // 「保持顶栏」开关（与顶栏共用同一注册表键，见 keep_top.h）
     s.keepTopEnabled = keeptop::IsEnabledFromRegistry();
     if (!configExists) {
@@ -8889,10 +9365,11 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
     }
     LogInit();
     if (DedupePins(s)) SaveConfig(s);  // 去重后立即持久化（收敛历史重复固定项）
-    Logf(L"配置载入：固定 %zu 项，隐藏 %zu 项，挂起豁免 %zu 项，"
+    Logf(L"配置载入：固定 %zu 项，隐藏 %zu 项（%ls），挂起豁免 %zu 项，"
          L"后台应用挂起=%d，关闭后清理=%d",
-         s.pins.size(), s.hiddenKeys.size(), s.suspendExceptions.size(),
-         s.suspendInactive ? 1 : 0, s.residualCleanup ? 1 : 0);
+         s.pins.size(), s.hiddenApps.size(), s.hiddenConfigPath.c_str(),
+         s.suspendExceptions.size(), s.suspendInactive ? 1 : 0,
+         s.residualCleanup ? 1 : 0);
 
     // 挂起控制器初始化（ntdll!NtSuspendProcess/NtResumeProcess，Vista+ 都有）。
     // 取不到函数指针时功能降级为关闭；之后仍尝试恢复上次异常退出留下的
@@ -8941,6 +9418,10 @@ DWORD WINAPI DockThreadProc(LPVOID param) {
     }
 
     g_dockHwnd.store(s.hwnd);  // 先发布窗口句柄，宿主可立即隐藏/关闭
+    // 窗口就绪后再挂文件监听：事件不会因窗口未发布而丢失；
+    // 启动加载到这一刻之间的潜在改动在这里补读一次（无变化只有一次 stat）。
+    StartHiddenAppsWatch(PathDir(s.hiddenConfigPath));
+    ReloadHiddenAppsConfig(s);
 
     DragAcceptFiles(s.hwnd, TRUE);
 
