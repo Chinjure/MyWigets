@@ -1,0 +1,7 @@
+trial,version,scenario,adopt_ok,rapl_ok,first_code,first_matched,first_suspended,first_job_members,first_job_sandbox,review_calls,review_added,driver_cpu_us,victim_cpu_ms_window,victim_cpu_ms_tail,idle_pkg_mw,active_pkg_mw,susp_pkg_mw,idle_pp0_mw,active_pp0_mw,susp_pp0_mw,first_detail
+1,sandbox,control,1,1,Suspended,5,5,5,1,14,0,15625.0,31.2,0.0,393.6,2767.3,414.7,57.6,1965.6,101.0,精确 1 + 辅助 4（根 c:\users\may\desktop\clock\bench\work\t1\app，含跨目录后代）；Job 成员 5 -> 待挂起 5；Job 追加 0；已挂起 5
+2,pulse,control,0,1,Suspended,5,5,0,0,14,0,0.0,0.0,0.0,300.8,2507.1,364.6,29.0,1760.7,83.8,精确 1 + 辅助 4（根 c:\users\may\desktop\clock\bench\work\t2\app）；已挂起 5
+3,sandbox,cross,1,1,Suspended,5,5,5,1,14,0,15625.0,31.2,0.0,370.8,2688.0,381.9,62.3,1957.8,101.0,精确 1 + 辅助 4（根 c:\users\may\desktop\clock\bench\work\t3\app，含跨目录后代）；Job 成员 5 -> 待挂起 5；Job 追加 0；已挂起 5
+4,pulse,cross,0,1,Suspended,3,3,0,0,14,0,0.0,28250.0,1890.6,895.8,3025.6,1599.2,33.2,2309.3,1113.2,精确 1 + 辅助 2（根 c:\users\may\desktop\clock\bench\work\t4\app）；已挂起 3
+5,sandbox,orphan,1,1,Suspended,4,4,4,1,14,0,0.0,0.0,0.0,406.6,2679.8,420.1,66.2,1964.6,89.2,主进程未运行；Job 成员 4 -> 待挂起 4；Job 追加 0；已挂起 4
+6,pulse,orphan,0,1,NoProcesses,0,0,0,0,14,0,62500.0,57125.0,3765.6,254.3,3003.4,4071.5,21.9,2234.7,2759.1,主进程未运行
